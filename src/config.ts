@@ -58,21 +58,35 @@ function raw(env: NodeJS.ProcessEnv, name: string): string | undefined {
   return value === undefined || value === "" ? undefined : value;
 }
 
-/** Non-negative integer parse shared by every numeric setting (R1 + Task 1 review). */
-function parseNonNegativeInt(env: NodeJS.ProcessEnv, name: string, defaultValue: number): number {
+/**
+ * Integer parse shared by every numeric setting (R1 + Task 1 review + R12).
+ * `min` is 0 for settings where 0 is a meaningful value (MAX_ROWS: unlimited)
+ * and 1 for settings where 0 would silently disable the feature it bounds
+ * (body size, rate limit, statement timeout - R12).
+ */
+function parseIntWithMin(env: NodeJS.ProcessEnv, name: string, defaultValue: number, min: 0 | 1): number {
   const value = raw(env, name);
   if (value === undefined) {
     return defaultValue;
   }
+  const description = min === 0 ? "a non-negative integer" : `an integer >= ${min}`;
   if (!/^\d+$/.test(value.trim())) {
-    throw new ConfigError(`${PREFIX}${name} must be a non-negative integer, got ${JSON.stringify(value)}`);
+    throw new ConfigError(`${PREFIX}${name} must be ${description}, got ${JSON.stringify(value)}`);
   }
-  return Number(value);
+  const parsed = Number(value);
+  if (parsed < min) {
+    throw new ConfigError(`${PREFIX}${name} must be ${description}, got ${parsed}`);
+  }
+  return parsed;
+}
+
+function parseNonNegativeInt(env: NodeJS.ProcessEnv, name: string, defaultValue: number): number {
+  return parseIntWithMin(env, name, defaultValue, 0);
 }
 
 function parsePort(env: NodeJS.ProcessEnv, name: string, defaultValue: number): number {
-  const port = parseNonNegativeInt(env, name, defaultValue);
-  if (port < 1 || port > 65535) {
+  const port = parseIntWithMin(env, name, defaultValue, 1);
+  if (port > 65535) {
     throw new ConfigError(`${PREFIX}${name} must be between 1 and 65535, got ${port}`);
   }
   return port;
@@ -124,20 +138,27 @@ function parsePublicUrl(env: NodeJS.ProcessEnv): URL | undefined {
     return undefined;
   }
   // The raw value may carry userinfo (e.g. a password) and must never be
-  // echoed back in an error message; only report the parsed host/protocol.
-  let parsed: URL;
+  // echoed back in an error message. Syntactic validity is checked
+  // regardless of transport (a malformed URL is just a bad setting); the
+  // https-required check is applied separately and only in http mode (R11).
   try {
-    parsed = new URL(value);
+    return new URL(value);
   } catch {
     throw new ConfigError(`${PREFIX}PUBLIC_URL must be a valid URL`);
   }
-  if (parsed.protocol !== "https:" && !isLoopback(parsed.hostname)) {
+}
+
+/** HTTP-only (R11): a non-loopback PUBLIC_URL must use https. */
+function assertPublicUrlIsSecure(publicUrl: URL | undefined): void {
+  if (!publicUrl) {
+    return;
+  }
+  if (publicUrl.protocol !== "https:" && !isLoopback(publicUrl.hostname)) {
     throw new ConfigError(
       `${PREFIX}PUBLIC_URL must use https unless the host is loopback, ` +
-        `got protocol ${JSON.stringify(parsed.protocol)} for host ${JSON.stringify(parsed.hostname)}`,
+        `got protocol ${JSON.stringify(publicUrl.protocol)} for host ${JSON.stringify(publicUrl.hostname)}`,
     );
   }
-  return parsed;
 }
 
 function resolveConnectionString(env: NodeJS.ProcessEnv, argv: string[]): string {
@@ -187,7 +208,9 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   const db = {
     connectionString: resolveConnectionString(env, argv),
     maxRows: resolveMaxRows(env, transport),
-    statementTimeoutMs: parseNonNegativeInt(env, "STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS),
+    // R12: unlike MAX_ROWS, 0 would silently disable the statement timeout,
+    // so the minimum is 1.
+    statementTimeoutMs: parseIntWithMin(env, "STATEMENT_TIMEOUT_MS", DEFAULT_STATEMENT_TIMEOUT_MS, 1),
     poolMax: DEFAULT_POOL_MAX,
   };
 
@@ -201,8 +224,10 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
     publicUrl,
     allowedOrigins: parseCsv(env, "ALLOWED_ORIGINS"),
     allowedHosts: parseCsv(env, "ALLOWED_HOSTS"),
-    maxBodyBytes: parseNonNegativeInt(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
-    rateLimitPerMin: parseNonNegativeInt(env, "RATE_LIMIT_PER_MIN", DEFAULT_RATE_LIMIT_PER_MIN),
+    // R12: 0 would silently accept unbounded bodies / disable rate limiting,
+    // so the minimum is 1.
+    maxBodyBytes: parseIntWithMin(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, 1),
+    rateLimitPerMin: parseIntWithMin(env, "RATE_LIMIT_PER_MIN", DEFAULT_RATE_LIMIT_PER_MIN, 1),
     trustProxy: parseTrustProxy(env),
   };
 
@@ -211,36 +236,43 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   const allowedDomains = parseCsvLower(env, "ALLOWED_DOMAINS");
   const token = raw(env, "AUTH_TOKEN");
   const googleClientId = raw(env, "GOOGLE_CLIENT_ID");
-
-  if (authMode === "token") {
-    if (!token || token.length < MIN_AUTH_TOKEN_LENGTH) {
-      throw new ConfigError(
-        `${PREFIX}AUTH_TOKEN must be set and at least ${MIN_AUTH_TOKEN_LENGTH} characters when ${PREFIX}AUTH_MODE=token`,
-      );
-    }
-  }
-
-  if (authMode === "google") {
-    if (!publicUrl) {
-      throw new ConfigError(`${PREFIX}PUBLIC_URL is required when ${PREFIX}AUTH_MODE=google`);
-    }
-    if (!googleClientId) {
-      throw new ConfigError(`${PREFIX}GOOGLE_CLIENT_ID is required when ${PREFIX}AUTH_MODE=google`);
-    }
-    if (allowedEmails.length === 0 && allowedDomains.length === 0) {
-      throw new ConfigError(
-        `${PREFIX}ALLOWED_EMAILS or ${PREFIX}ALLOWED_DOMAINS must be set when ${PREFIX}AUTH_MODE=google`,
-      );
-    }
-  }
-
   const allowInsecureRemote = parseBool(env, "ALLOW_INSECURE_REMOTE", false);
 
-  if (!isLoopback(httpHost) && authMode === "none" && !allowInsecureRemote) {
-    throw new ConfigError(
-      `Refusing to bind a non-loopback ${PREFIX}HTTP_HOST with ${PREFIX}AUTH_MODE=none; ` +
-        `set ${PREFIX}ALLOW_INSECURE_REMOTE=true to override (not recommended), or enable auth`,
-    );
+  // R11: stdio never binds a port or serves auth/PUBLIC_URL, so none of
+  // these settings can make stdio unsafe or unable to start. Scope all of
+  // them to http mode so a stray HTTP_HOST/AUTH_MODE/PUBLIC_URL left over in
+  // a stdio user's env never blocks startup.
+  if (transport === "http") {
+    assertPublicUrlIsSecure(publicUrl);
+
+    if (authMode === "token") {
+      if (!token || token.length < MIN_AUTH_TOKEN_LENGTH) {
+        throw new ConfigError(
+          `${PREFIX}AUTH_TOKEN must be set and at least ${MIN_AUTH_TOKEN_LENGTH} characters when ${PREFIX}AUTH_MODE=token`,
+        );
+      }
+    }
+
+    if (authMode === "google") {
+      if (!publicUrl) {
+        throw new ConfigError(`${PREFIX}PUBLIC_URL is required when ${PREFIX}AUTH_MODE=google`);
+      }
+      if (!googleClientId) {
+        throw new ConfigError(`${PREFIX}GOOGLE_CLIENT_ID is required when ${PREFIX}AUTH_MODE=google`);
+      }
+      if (allowedEmails.length === 0 && allowedDomains.length === 0) {
+        throw new ConfigError(
+          `${PREFIX}ALLOWED_EMAILS or ${PREFIX}ALLOWED_DOMAINS must be set when ${PREFIX}AUTH_MODE=google`,
+        );
+      }
+    }
+
+    if (!isLoopback(httpHost) && authMode === "none" && !allowInsecureRemote) {
+      throw new ConfigError(
+        `Refusing to bind a non-loopback ${PREFIX}HTTP_HOST with ${PREFIX}AUTH_MODE=none; ` +
+          `set ${PREFIX}ALLOW_INSECURE_REMOTE=true to override (not recommended), or enable auth`,
+      );
+    }
   }
 
   return {
