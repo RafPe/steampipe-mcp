@@ -202,10 +202,11 @@ describe("buildHttpApp: Origin validation", () => {
     expect(res.status).toBe(200);
   });
 
-  it("applies Origin validation to /healthz too", async () => {
+  it("does not apply Origin validation to the static /healthz (R14)", async () => {
     const port = await start(httpConfig());
     const res = await send(port, { method: "GET", path: "/healthz", headers: { Origin: "https://evil.example" } });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({ status: "ok" });
   });
 });
 
@@ -245,6 +246,20 @@ describe("buildHttpApp: Host validation (R2)", () => {
     expect((await rpc(port, TOOLS_LIST, { Host: "mcp.example.com" })).status).toBe(200);
     expect((await rpc(port, TOOLS_LIST, { Host: "evil.example" })).status).toBe(403);
     expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("serves /healthz to probes with a non-allowlisted Host, while /mcp still enforces Host (R14)", async () => {
+    const port = await start(
+      httpConfig({
+        STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0",
+        STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE: "true",
+        STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com",
+      }),
+    );
+    const health = await send(port, { method: "GET", path: "/healthz", headers: { Host: `localhost:${port}` } });
+    expect(health.status).toBe(200);
+    expect(JSON.parse(health.body)).toEqual({ status: "ok" });
+    expect((await rpc(port, TOOLS_LIST, { Host: `localhost:${port}` })).status).toBe(403);
   });
 
   it("non-loopback bind with neither ALLOWED_HOSTS nor PUBLIC_URL skips Host validation and warns once", async () => {
