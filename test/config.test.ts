@@ -127,6 +127,12 @@ describe("loadConfig", () => {
       ["STEAMPIPE_MCP_MAX_BODY_BYTES", "-1"],
       ["STEAMPIPE_MCP_RATE_LIMIT_PER_MIN", "-1"],
       ["STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS", "-1"],
+      // R12: MAX_BODY_BYTES, RATE_LIMIT_PER_MIN, STATEMENT_TIMEOUT_MS must
+      // each be >= 1 (0 is no longer accepted). MAX_ROWS is unaffected (it
+      // still allows 0 - see the "MAX_ROWS (R1)" describe block).
+      ["STEAMPIPE_MCP_MAX_BODY_BYTES", "0"],
+      ["STEAMPIPE_MCP_RATE_LIMIT_PER_MIN", "0"],
+      ["STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS", "0"],
     ])("rejects %s=%s", (name, value) => {
       expect(() => loadConfig(envWith({ [name]: value }), EMPTY_ARGV)).toThrow(ConfigError);
       expect(() => loadConfig(envWith({ [name]: value }), EMPTY_ARGV)).toThrow(
@@ -139,32 +145,40 @@ describe("loadConfig", () => {
       expect(cfg.http.port).toBe(8080);
     });
 
-    it("accepts 0 for MAX_BODY_BYTES/RATE_LIMIT_PER_MIN/STATEMENT_TIMEOUT_MS", () => {
+    it("accepts 1 for MAX_BODY_BYTES/RATE_LIMIT_PER_MIN/STATEMENT_TIMEOUT_MS (R12 minimum)", () => {
       const cfg = loadConfig(
         envWith({
-          STEAMPIPE_MCP_MAX_BODY_BYTES: "0",
-          STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "0",
-          STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS: "0",
+          STEAMPIPE_MCP_MAX_BODY_BYTES: "1",
+          STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1",
+          STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS: "1",
         }),
         EMPTY_ARGV,
       );
-      expect(cfg.http.maxBodyBytes).toBe(0);
-      expect(cfg.http.rateLimitPerMin).toBe(0);
-      expect(cfg.db.statementTimeoutMs).toBe(0);
+      expect(cfg.http.maxBodyBytes).toBe(1);
+      expect(cfg.http.rateLimitPerMin).toBe(1);
+      expect(cfg.db.statementTimeoutMs).toBe(1);
     });
   });
 
   describe("non-loopback HTTP bind (ALLOW_INSECURE_REMOTE)", () => {
-    it("throws when HTTP_HOST is non-loopback and AUTH_MODE is none", () => {
-      expect(() =>
-        loadConfig(envWith({ STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0", STEAMPIPE_MCP_AUTH_MODE: "none" }), EMPTY_ARGV),
-      ).toThrow(/ALLOW_INSECURE_REMOTE/);
-    });
-
-    it("does not throw when ALLOW_INSECURE_REMOTE is true", () => {
+    it("throws when HTTP_HOST is non-loopback and AUTH_MODE is none, in http mode", () => {
       expect(() =>
         loadConfig(
           envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
+            STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0",
+            STEAMPIPE_MCP_AUTH_MODE: "none",
+          }),
+          EMPTY_ARGV,
+        ),
+      ).toThrow(/ALLOW_INSECURE_REMOTE/);
+    });
+
+    it("does not throw when ALLOW_INSECURE_REMOTE is true, in http mode", () => {
+      expect(() =>
+        loadConfig(
+          envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
             STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0",
             STEAMPIPE_MCP_AUTH_MODE: "none",
             STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE: "true",
@@ -174,10 +188,11 @@ describe("loadConfig", () => {
       ).not.toThrow();
     });
 
-    it("does not throw for a non-loopback bind when auth is enabled", () => {
+    it("does not throw for a non-loopback bind when auth is enabled, in http mode", () => {
       expect(() =>
         loadConfig(
           envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
             STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0",
             STEAMPIPE_MCP_AUTH_MODE: "token",
             STEAMPIPE_MCP_AUTH_TOKEN: "a".repeat(32),
@@ -190,29 +205,55 @@ describe("loadConfig", () => {
     it("does not throw for the default loopback bind", () => {
       expect(() => loadConfig(EMPTY_ENV, EMPTY_ARGV)).not.toThrow();
     });
+
+    // R11: the bind guard is HTTP-only. A stdio user is never affected by a
+    // stray HTTP_HOST/AUTH_MODE left over in their env, since stdio never
+    // binds a port or serves auth at all.
+    it("does not throw on stdio even with a non-loopback HTTP_HOST and AUTH_MODE=none", () => {
+      expect(() =>
+        loadConfig(
+          envWith({ STEAMPIPE_MCP_HTTP_HOST: "0.0.0.0", STEAMPIPE_MCP_AUTH_MODE: "none" }),
+          EMPTY_ARGV,
+        ),
+      ).not.toThrow();
+    });
   });
 
   describe("AUTH_MODE=token", () => {
-    it("throws when the token is shorter than 32 chars", () => {
+    it("throws when the token is shorter than 32 chars, in http mode", () => {
       expect(() =>
         loadConfig(
-          envWith({ STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: "short" }),
+          envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
+            STEAMPIPE_MCP_AUTH_MODE: "token",
+            STEAMPIPE_MCP_AUTH_TOKEN: "short",
+          }),
           EMPTY_ARGV,
         ),
       ).toThrow(ConfigError);
     });
 
-    it("throws when no token is set", () => {
-      expect(() => loadConfig(envWith({ STEAMPIPE_MCP_AUTH_MODE: "token" }), EMPTY_ARGV)).toThrow(
-        /AUTH_TOKEN/,
-      );
+    it("throws when no token is set, in http mode", () => {
+      expect(() =>
+        loadConfig(
+          envWith({ STEAMPIPE_MCP_TRANSPORT: "http", STEAMPIPE_MCP_AUTH_MODE: "token" }),
+          EMPTY_ARGV,
+        ),
+      ).toThrow(/AUTH_TOKEN/);
     });
 
     it("never echoes the token value in the error message", () => {
       const secret = "s3cr3t-tok"; // deliberately < 32 chars, so this throws
       let message = "";
       try {
-        loadConfig(envWith({ STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: secret }), EMPTY_ARGV);
+        loadConfig(
+          envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
+            STEAMPIPE_MCP_AUTH_MODE: "token",
+            STEAMPIPE_MCP_AUTH_TOKEN: secret,
+          }),
+          EMPTY_ARGV,
+        );
       } catch (error) {
         message = (error as Error).message;
       }
@@ -220,19 +261,31 @@ describe("loadConfig", () => {
       expect(message).not.toContain(secret);
     });
 
-    it("accepts a 32+ char token", () => {
+    it("accepts a 32+ char token, in http mode", () => {
       const token = "a".repeat(32);
       const cfg = loadConfig(
-        envWith({ STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: token }),
+        envWith({ STEAMPIPE_MCP_TRANSPORT: "http", STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: token }),
         EMPTY_ARGV,
       );
       expect(cfg.auth.mode).toBe("token");
       expect(cfg.auth.token).toBe(token);
     });
+
+    // R11: auth requirements are HTTP-only. stdio never serves auth, so a
+    // short/missing token must not block stdio startup.
+    it("loads fine on stdio with AUTH_MODE=token and a short token", () => {
+      expect(() =>
+        loadConfig(
+          envWith({ STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: "short" }),
+          EMPTY_ARGV,
+        ),
+      ).not.toThrow();
+    });
   });
 
   describe("AUTH_MODE=google", () => {
     const validGoogleEnv = {
+      STEAMPIPE_MCP_TRANSPORT: "http",
       STEAMPIPE_MCP_AUTH_MODE: "google",
       STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com",
       STEAMPIPE_MCP_GOOGLE_CLIENT_ID: "client-id",
@@ -263,33 +316,56 @@ describe("loadConfig", () => {
   });
 
   describe("PUBLIC_URL", () => {
-    it("throws for a non-loopback http URL", () => {
+    it("throws for a non-loopback http URL, in http mode", () => {
       expect(() =>
-        loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "http://mcp.example.com" }), EMPTY_ARGV),
+        loadConfig(
+          envWith({ STEAMPIPE_MCP_TRANSPORT: "http", STEAMPIPE_MCP_PUBLIC_URL: "http://mcp.example.com" }),
+          EMPTY_ARGV,
+        ),
       ).toThrow(/https/);
     });
 
-    it("allows http for a loopback host", () => {
+    it("allows http for a loopback host, in http mode", () => {
       expect(() =>
-        loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "http://localhost:3000" }), EMPTY_ARGV),
+        loadConfig(
+          envWith({ STEAMPIPE_MCP_TRANSPORT: "http", STEAMPIPE_MCP_PUBLIC_URL: "http://localhost:3000" }),
+          EMPTY_ARGV,
+        ),
       ).not.toThrow();
     });
 
     it("allows https for a non-loopback host and parses it as a URL", () => {
-      const cfg = loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com" }), EMPTY_ARGV);
+      const cfg = loadConfig(
+        envWith({ STEAMPIPE_MCP_TRANSPORT: "http", STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com" }),
+        EMPTY_ARGV,
+      );
       expect(cfg.http.publicUrl).toBeInstanceOf(URL);
       expect(cfg.http.publicUrl?.href).toBe("https://mcp.example.com/");
     });
 
-    it("never echoes userinfo (e.g. a password) from an invalid PUBLIC_URL", () => {
+    it("never echoes userinfo (e.g. a password) from an invalid PUBLIC_URL, in http mode", () => {
       let message = "";
       try {
-        loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "http://user:pass@mcp.example.com" }), EMPTY_ARGV);
+        loadConfig(
+          envWith({
+            STEAMPIPE_MCP_TRANSPORT: "http",
+            STEAMPIPE_MCP_PUBLIC_URL: "http://user:pass@mcp.example.com",
+          }),
+          EMPTY_ARGV,
+        );
       } catch (error) {
         message = (error as Error).message;
       }
       expect(message).toMatch(/https/);
       expect(message).not.toContain("pass");
+    });
+
+    // R11: the https-required check is HTTP-only. stdio never serves
+    // publicUrl, so a non-loopback http:// value must not block startup.
+    it("does not throw for a non-loopback http URL on stdio", () => {
+      expect(() =>
+        loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "http://mcp.example.com" }), EMPTY_ARGV),
+      ).not.toThrow();
     });
   });
 
