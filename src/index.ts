@@ -1,17 +1,23 @@
 #!/usr/bin/env node
 
+import type { Server as HttpServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DatabaseService } from "./services/database.js";
 import { configureTypeParser } from "./services/database-config.js";
 import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
 import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
+import { buildHttpApp } from "./http/app.js";
 
 let serverStartTime: Date;
 
-// Handle graceful shutdown
-function setupShutdownHandlers(db: DatabaseService) {
+// Handle graceful shutdown: stop accepting HTTP requests first (when
+// serving HTTP), then close the database pool.
+function setupShutdownHandlers(db: DatabaseService, httpServer?: HttpServer) {
   const gracefulShutdown = async () => {
+    if (httpServer) {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
     if (db) {
       try {
         await db.close();
@@ -46,12 +52,6 @@ export async function startServer() {
     throw error;
   }
 
-  if (cfg.transport === 'http') {
-    // Task 5 replaces this with the real HTTP transport.
-    logger.error('HTTP transport not available in this build');
-    process.exit(1);
-  }
-
   logger.info(`Starting server (transport=${cfg.transport})`);
 
   try {
@@ -69,6 +69,11 @@ export async function startServer() {
       poolMax: cfg.db.poolMax,
       exposeConnectionDetails: cfg.transport === 'stdio',
     });
+
+    if (cfg.transport === 'http') {
+      await startHttp(cfg, db);
+      return;
+    }
 
     // Set up shutdown handlers
     setupShutdownHandlers(db);
@@ -95,5 +100,21 @@ export async function startServer() {
   }
 }
 
+async function startHttp(cfg: ServerConfig, db: DatabaseService) {
+  if (cfg.auth.mode !== 'none') {
+    // Task 6 replaces this with the real auth middleware. Until then, never
+    // serve unauthenticated while the operator believes auth is enforced.
+    logger.error(`STEAMPIPE_MCP_AUTH_MODE=${cfg.auth.mode} is not available in this build`);
+    process.exit(1);
+  }
+  const { host, port, path } = cfg.http;
+  const app = buildHttpApp(cfg, db);
+  const httpServer = await new Promise<HttpServer>((resolve, reject) => {
+    const s = app.listen(port, host, (error?: Error) => (error ? reject(error) : resolve(s)));
+  });
+  setupShutdownHandlers(db, httpServer);
+  logger.info(`Streamable HTTP server listening on http://${host.includes(':') ? `[${host}]` : host}:${port}${path}`);
+}
+
 // Start the server
-startServer();
+startServer().catch(() => process.exit(1));

@@ -145,6 +145,13 @@ describe("buildHttpApp: stateless Streamable HTTP", () => {
     expect(res.status).toBe(200);
   });
 
+  it("answers unknown routes with a JSON 404, not Express's HTML page", async () => {
+    const port = await start(httpConfig());
+    const res = await send(port, { method: "POST", path: "/healthz" });
+    expect(res.status).toBe(404);
+    expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32000 } });
+  });
+
   it("does not advertise Express via X-Powered-By", async () => {
     const port = await start(httpConfig());
     const res = await send(port, { method: "GET", path: "/healthz" });
