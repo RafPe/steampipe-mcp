@@ -249,6 +249,8 @@ HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
 | `STEAMPIPE_MCP_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated exact `Origin` values to accept; any other present `Origin` gets `403` |
 | `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames accepted in the `Host` header on a non-loopback bind (ports and case are ignored) |
 | `STEAMPIPE_MCP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes; larger bodies get `413` |
+| `STEAMPIPE_MCP_RATE_LIMIT_PER_MIN` | `60` | Per-principal (authenticated `sub`, or client IP in `none` mode) requests per rolling 60s window; over-limit requests get `429`. A coarser, IP-only limit at 10x this value also applies ahead of auth, so an unauthenticated flood can't reach the token verifier |
+| `STEAMPIPE_MCP_TRUST_PROXY` | _(unset)_ | Passed to Express's `trust proxy` setting (a hop count, or `true`) so rate limiting sees the real client IP behind a reverse proxy. Only set this when every request actually goes through that trusted proxy: it makes `X-Forwarded-For` authoritative, so setting it without one lets a client spoof its own rate-limit key and bypass the limit |
 | `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE` | `false` | Allow a non-loopback bind without auth (not recommended) |
 | `STEAMPIPE_MCP_AUTH_MODE` | `none` | `none`, `token`, or `google` ([docs/remote-deployment.md](docs/remote-deployment.md)) |
 | `STEAMPIPE_MCP_AUTH_TOKEN` | _(unset)_ | Static bearer token, at least 32 characters (`token` mode) |

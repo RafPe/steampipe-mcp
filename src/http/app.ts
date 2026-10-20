@@ -10,7 +10,7 @@ import type { DatabaseService } from "../services/database.js";
 import { logger } from "../services/logger.js";
 import { isLoopback } from "../services/ssl.js";
 import { auditMiddleware } from "./audit.js";
-import { createRateLimiter, rejectBatch } from "./guards.js";
+import { createPreAuthIpLimiter, createRateLimiter, rejectBatch } from "./guards.js";
 import { originValidation } from "./origin.js";
 
 function jsonRpcError(status: number, code: number, message: string): { status: number; body: object } {
@@ -81,11 +81,14 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * validation, Origin validation, JSON body parsing (capped at
  * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
  * `/.well-known/*` metadata, still Host/Origin-checked), then on
- * `POST {path}` only: `extraMiddleware` (bearer auth), per-principal rate
- * limiting, JSON-RPC batch rejection, and the audit log, in that order, so
- * route guards see the parsed body and the authenticated principal while
- * the metadata and the 405s stay reachable without auth, and a 401/403
- * never reaches the rate limiter, the batch check, or the audit log.
+ * `POST {path}` only, in order: a coarse pre-auth IP rate limit (R18: stops
+ * an unauthenticated-request flood - and, in `google` mode, the uncached
+ * `tokeninfo` call each one costs - before it ever reaches the verifier),
+ * `extraMiddleware` (bearer auth), the per-principal rate limit, JSON-RPC
+ * batch rejection, and the audit log. Route guards see the parsed body and
+ * the authenticated principal while the metadata and the 405s stay
+ * reachable without auth; a 401/403 never reaches the per-principal rate
+ * limiter, the batch check, or the audit log.
  */
 export function buildHttpApp(
   cfg: ServerConfig,
@@ -121,38 +124,46 @@ export function buildHttpApp(
     app.use(router);
   }
 
-  app.post(http.path, ...extraMiddleware, createRateLimiter(http), rejectBatch(), auditMiddleware(), async (req, res) => {
-    // express.json() only parses application/json. Refuse anything it
-    // skipped, so the transport never reads an unparsed (and so uncapped)
-    // body stream itself.
-    if (req.body === undefined) {
-      const reply = jsonRpcError(415, -32000, "Unsupported Media Type: Content-Type must be application/json");
-      res.status(reply.status).json(reply.body);
-      return;
-    }
-
-    const server = createServer(db);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-      maxRequestBodySize: http.maxBodyBytes,
-    });
-    res.on("close", () => {
-      void transport.close();
-      void server.close();
-    });
-
-    try {
-      await server.connect(transport);
-      await transport.handleRequest(req, res, req.body);
-    } catch (error) {
-      logger.error("MCP request failed", error instanceof Error ? error.message : String(error));
-      if (!res.headersSent) {
-        const reply = jsonRpcError(500, -32603, "Internal server error");
+  app.post(
+    http.path,
+    createPreAuthIpLimiter(http),
+    ...extraMiddleware,
+    createRateLimiter(http),
+    rejectBatch(),
+    auditMiddleware(),
+    async (req, res) => {
+      // express.json() only parses application/json. Refuse anything it
+      // skipped, so the transport never reads an unparsed (and so uncapped)
+      // body stream itself.
+      if (req.body === undefined) {
+        const reply = jsonRpcError(415, -32000, "Unsupported Media Type: Content-Type must be application/json");
         res.status(reply.status).json(reply.body);
+        return;
       }
-    }
-  });
+
+      const server = createServer(db);
+      const transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: undefined,
+        enableJsonResponse: true,
+        maxRequestBodySize: http.maxBodyBytes,
+      });
+      res.on("close", () => {
+        void transport.close();
+        void server.close();
+      });
+
+      try {
+        await server.connect(transport);
+        await transport.handleRequest(req, res, req.body);
+      } catch (error) {
+        logger.error("MCP request failed", error instanceof Error ? error.message : String(error));
+        if (!res.headersSent) {
+          const reply = jsonRpcError(500, -32603, "Internal server error");
+          res.status(reply.status).json(reply.body);
+        }
+      }
+    },
+  );
 
   const methodNotAllowed: RequestHandler = (_req, res) => {
     res.set("Allow", "POST");

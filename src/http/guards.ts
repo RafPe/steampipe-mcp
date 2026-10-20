@@ -29,6 +29,12 @@ export function rejectBatch(): RequestHandler {
   };
 }
 
+/** Shared by both limiters below: the same JSON-RPC-shaped 429, rather
+ * than express-rate-limit's default plain text body. */
+const rateLimitExceeded: RequestHandler = (_req, res) => {
+  res.status(429).json(TOO_MANY_REQUESTS);
+};
+
 /**
  * Per-principal rate limiting (`rateLimitPerMin` per rolling 60s window).
  * Keyed by the authenticated `sub` when auth set `req.auth` (token/google
@@ -43,8 +49,27 @@ export function createRateLimiter(http: ServerConfig["http"]): RequestHandler {
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req.auth?.extra?.sub as string | undefined) ?? ipKeyGenerator(req.ip ?? "unknown"),
-    handler: (_req, res) => {
-      res.status(429).json(TOO_MANY_REQUESTS);
-    },
+    handler: rateLimitExceeded,
+  });
+}
+
+/**
+ * Coarse, pre-auth rate limit keyed on IP alone, mounted ahead of bearer
+ * auth (R18). Without it, an unauthenticated flood - each request costing
+ * a real `verifyAccessToken` call, which in `google` mode is an uncached
+ * outbound call to Google's `tokeninfo` for every rejected token - bypasses
+ * the per-principal limiter entirely, since that one only sees `req.auth`
+ * once bearer auth has already run. Set 10x looser than the per-principal
+ * limit so it only trips on a flood, not on normal traffic from many
+ * distinct principals behind the same IP/proxy.
+ */
+export function createPreAuthIpLimiter(http: ServerConfig["http"]): RequestHandler {
+  return rateLimit({
+    windowMs: 60_000,
+    limit: 10 * http.rateLimitPerMin,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? "unknown"),
+    handler: rateLimitExceeded,
   });
 }

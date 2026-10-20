@@ -3,6 +3,9 @@ import { request as httpRequest, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 import type { RequestHandler } from "express";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import type { DatabaseService } from "../src/services/database.js";
 import { buildHttpApp } from "../src/http/app.js";
@@ -166,6 +169,72 @@ describe("buildHttpApp: per-principal rate limiting", () => {
     expect((await rpc(port, TOOLS_LIST, { "X-Sub": "alice" })).status).toBe(429);
     // bob has his own quota: alice being over limit doesn't affect him.
     expect((await rpc(port, TOOLS_LIST, { "X-Sub": "bob" })).status).toBe(200);
+  });
+});
+
+describe("buildHttpApp: pre-auth IP rate limiting (R18)", () => {
+  it("limits an unauthenticated-request flood before it reaches the per-principal limiter: 401 x10 then 429", async () => {
+    const cfg = httpConfig({
+      STEAMPIPE_MCP_AUTH_MODE: "token",
+      STEAMPIPE_MCP_AUTH_TOKEN: STATIC_TOKEN,
+      STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1",
+    });
+    const port = await startWithAuth(cfg);
+
+    for (let i = 0; i < 10; i++) {
+      const res = await rpc(port, TOOLS_LIST);
+      expect(res.status).toBe(401);
+    }
+    const eleventh = await rpc(port, TOOLS_LIST);
+    expect(eleventh.status).toBe(429);
+    expect(JSON.parse(eleventh.body)).toEqual({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Too many requests" },
+    });
+  });
+
+  it("stops a flood before it ever reaches the token verifier", async () => {
+    const cfg = httpConfig({ STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1" });
+    const calls = { count: 0 };
+    const countingVerifier: OAuthTokenVerifier = {
+      async verifyAccessToken(token) {
+        calls.count++;
+        throw new InvalidTokenError(`test: always invalid (saw ${token})`);
+      },
+    };
+    const app = buildHttpApp(cfg, fakeDb(), [requireBearerAuth({ verifier: countingVerifier })]);
+    const server = await new Promise<HttpServer>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    servers.push(server);
+    const port = (server.address() as AddressInfo).port;
+
+    for (let i = 0; i < 10; i++) {
+      const res = await rpc(port, TOOLS_LIST, { Authorization: "Bearer whatever" });
+      expect(res.status).toBe(401);
+    }
+    expect(calls.count).toBe(10);
+
+    const eleventh = await rpc(port, TOOLS_LIST, { Authorization: "Bearer whatever" });
+    expect(eleventh.status).toBe(429);
+    // The verifier was never called for the 11th request: the pre-auth
+    // limiter rejected it before extraMiddleware (bearer) ran.
+    expect(calls.count).toBe(10);
+  });
+
+  it("does not apply the pre-auth limiter's budget to the per-principal limiter (10x headroom)", async () => {
+    // Sanity check on the ratio: with RATE_LIMIT_PER_MIN=1 an authenticated
+    // caller still gets its own (separate, per-principal) budget of 1/min,
+    // not the pre-auth 10/min one.
+    const token = STATIC_TOKEN;
+    const cfg = httpConfig({
+      STEAMPIPE_MCP_AUTH_MODE: "token",
+      STEAMPIPE_MCP_AUTH_TOKEN: token,
+      STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1",
+    });
+    const port = await startWithAuth(cfg);
+    expect((await rpc(port, TOOLS_LIST, { Authorization: `Bearer ${token}` })).status).toBe(200);
+    expect((await rpc(port, TOOLS_LIST, { Authorization: `Bearer ${token}` })).status).toBe(429);
   });
 });
 
