@@ -4,11 +4,13 @@ import type { ServerConfig } from "../config.js";
 
 const BATCH_NOT_SUPPORTED = {
   jsonrpc: "2.0",
+  id: null,
   error: { code: -32600, message: "Batch requests are not supported" },
 };
 
 const TOO_MANY_REQUESTS = {
   jsonrpc: "2.0",
+  id: null,
   error: { code: -32000, message: "Too many requests" },
 };
 

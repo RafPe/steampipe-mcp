@@ -109,6 +109,7 @@ describe("buildHttpApp: JSON-RPC batch rejection (Review Focus 1)", () => {
     expect(res.status).toBe(400);
     expect(JSON.parse(res.body)).toEqual({
       jsonrpc: "2.0",
+      id: null,
       error: { code: -32600, message: "Batch requests are not supported" },
     });
   });
@@ -133,6 +134,7 @@ describe("buildHttpApp: per-principal rate limiting", () => {
     expect(last?.status).toBe(429);
     expect(JSON.parse(last!.body)).toEqual({
       jsonrpc: "2.0",
+      id: null,
       error: { code: -32000, message: "Too many requests" },
     });
   });
@@ -189,6 +191,7 @@ describe("buildHttpApp: pre-auth IP rate limiting (R18)", () => {
     expect(eleventh.status).toBe(429);
     expect(JSON.parse(eleventh.body)).toEqual({
       jsonrpc: "2.0",
+      id: null,
       error: { code: -32000, message: "Too many requests" },
     });
   });
@@ -222,19 +225,25 @@ describe("buildHttpApp: pre-auth IP rate limiting (R18)", () => {
     expect(calls.count).toBe(10);
   });
 
-  it("does not apply the pre-auth limiter's budget to the per-principal limiter (10x headroom)", async () => {
-    // Sanity check on the ratio: with RATE_LIMIT_PER_MIN=1 an authenticated
-    // caller still gets its own (separate, per-principal) budget of 1/min,
-    // not the pre-auth 10/min one.
-    const token = STATIC_TOKEN;
+  it("ignores a spoofed, rotating X-Forwarded-For when TRUST_PROXY is unset: all requests still share one pre-auth bucket", async () => {
+    // TRUST_PROXY is deliberately left unset (the default). Express then
+    // never consults X-Forwarded-For for req.ip, so a client claiming a
+    // different IP on every request must not get itself a fresh pre-auth
+    // bucket per claimed IP - it should still trip the real, single bucket
+    // keyed on the actual (loopback) socket address.
     const cfg = httpConfig({
       STEAMPIPE_MCP_AUTH_MODE: "token",
-      STEAMPIPE_MCP_AUTH_TOKEN: token,
+      STEAMPIPE_MCP_AUTH_TOKEN: STATIC_TOKEN,
       STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1",
     });
     const port = await startWithAuth(cfg);
-    expect((await rpc(port, TOOLS_LIST, { Authorization: `Bearer ${token}` })).status).toBe(200);
-    expect((await rpc(port, TOOLS_LIST, { Authorization: `Bearer ${token}` })).status).toBe(429);
+
+    for (let i = 0; i < 10; i++) {
+      const res = await rpc(port, TOOLS_LIST, { "X-Forwarded-For": `10.0.0.${i}` });
+      expect(res.status).toBe(401);
+    }
+    const eleventh = await rpc(port, TOOLS_LIST, { "X-Forwarded-For": "10.0.0.99" });
+    expect(eleventh.status).toBe(429);
   });
 });
 
