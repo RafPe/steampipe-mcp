@@ -21,7 +21,7 @@ export type SslConfig = false | undefined | { rejectUnauthorized: boolean };
 const OCTET = "(25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)";
 const LOOPBACK_V4 = new RegExp(`^127\\.${OCTET}\\.${OCTET}\\.${OCTET}$`);
 
-function isLoopback(hostname: string): boolean {
+export function isLoopback(hostname: string): boolean {
   const host = hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (host === "localhost" || host === "::1") {
     return true;

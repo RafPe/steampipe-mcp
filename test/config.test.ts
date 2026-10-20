@@ -209,14 +209,15 @@ describe("loadConfig", () => {
     });
 
     it("never echoes the token value in the error message", () => {
-      const secret = "sh0rt-but-sup3r-s3cr3t-t0ken-value";
+      const secret = "s3cr3t-tok"; // deliberately < 32 chars, so this throws
+      let message = "";
       try {
         loadConfig(envWith({ STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: secret }), EMPTY_ARGV);
       } catch (error) {
-        // token above is 35 chars, so this should not actually throw; guard
-        // against a false negative in the test itself.
-        throw new Error(`expected no throw, got: ${error}`);
+        message = (error as Error).message;
       }
+      expect(message).toMatch(/AUTH_TOKEN/);
+      expect(message).not.toContain(secret);
     });
 
     it("accepts a 32+ char token", () => {
@@ -278,6 +279,17 @@ describe("loadConfig", () => {
       const cfg = loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com" }), EMPTY_ARGV);
       expect(cfg.http.publicUrl).toBeInstanceOf(URL);
       expect(cfg.http.publicUrl?.href).toBe("https://mcp.example.com/");
+    });
+
+    it("never echoes userinfo (e.g. a password) from an invalid PUBLIC_URL", () => {
+      let message = "";
+      try {
+        loadConfig(envWith({ STEAMPIPE_MCP_PUBLIC_URL: "http://user:pass@mcp.example.com" }), EMPTY_ARGV);
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toMatch(/https/);
+      expect(message).not.toContain("pass");
     });
   });
 
