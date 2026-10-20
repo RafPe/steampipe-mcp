@@ -54,10 +54,10 @@ Steampipe instances or workspaces.
   or load balancer. `STEAMPIPE_MCP_PUBLIC_URL` must be `https` unless its host
   is loopback.
 - *Revocation latency* (google mode). A successful validation is cached in
-  memory for up to 60 seconds (never past the token's expiry). A revoked token,
-  or a user removed from the allowlist, can keep working for up to 60 seconds,
-  and removing a user from the allowlist needs a restart. Failed validations
-  are never cached.
+  memory for up to 60 seconds (never past the token's expiry), so a token
+  revoked at Google can keep working for up to 60 seconds. Failed validations
+  are never cached. The allowlist is read from the environment, so changing it
+  needs a restart, which also clears the cache.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
 - *Google availability* (google mode). If tokeninfo is unreachable or slower
