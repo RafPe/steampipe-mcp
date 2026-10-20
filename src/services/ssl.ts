@@ -4,8 +4,17 @@
  *  - `false` disables TLS entirely.
  *  - `{ rejectUnauthorized }` enables TLS, optionally skipping certificate
  *    verification.
- *  - `undefined` leaves TLS negotiation to node-postgres/libpq defaults
- *    (used for `sslmode=prefer`/`allow`, where the driver decides).
+ *  - `undefined` sets no `ssl` option at all (used for `sslmode=prefer`/
+ *    `allow`). `buildPoolConfig` also strips `sslmode` from the connection
+ *    string it passes to `pg.Pool`, so in practice this means plaintext
+ *    unless `PGSSLMODE` is set in the environment: node-postgres only reads
+ *    `sslmode` from the connection string it's actually given, and without
+ *    an `ssl` option or an `sslmode` it does not negotiate TLS. This differs
+ *    from pre-hardening behaviour, where `sslmode` stayed in the string and
+ *    the current pg version treats `prefer`/`allow`/`require`/`verify-ca` as
+ *    aliases for `verify-full` (encrypted + verified) - see the pg-connection-
+ *    string deprecation warning for that aliasing. Flagged for a controller
+ *    ruling; see task-2-report.md.
  */
 export type SslConfig = false | undefined | { rejectUnauthorized: boolean };
 

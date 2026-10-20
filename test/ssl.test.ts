@@ -7,6 +7,8 @@ describe("resolveSsl", () => {
   const cases: Array<[string, false | undefined | { rejectUnauthorized: boolean }]> = [
     ["postgresql://u@localhost:9193/d", { rejectUnauthorized: false }],
     ["postgresql://u@127.0.0.1:9193/d", { rejectUnauthorized: false }],
+    ["postgresql://u@127.1.2.3:9193/d", { rejectUnauthorized: false }],
+    ["postgresql://u@[::1]:9193/d", { rejectUnauthorized: false }],
     ["postgresql://u@db.example.com:9193/d", { rejectUnauthorized: true }],
     ["postgresql://u@db.example.com:9193/d?sslmode=disable", false],
     ["postgresql://u@db.example.com:9193/d?sslmode=no-verify", { rejectUnauthorized: false }],
