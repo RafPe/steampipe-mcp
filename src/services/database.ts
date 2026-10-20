@@ -19,12 +19,9 @@ export interface DatabaseOptions {
  * Build the `pg.Pool` config for a given set of database options. TLS is
  * resolved separately (see `resolveSsl`) and `sslmode` is stripped from the
  * connection string: node-postgres lets a URL `sslmode` override the `ssl`
- * object, so leaving it in would bypass the resolved setting. One side
- * effect of always stripping it: for `sslmode=prefer`/`allow`, where
- * `resolveSsl` returns `undefined`, the connection ends up with no TLS
- * signal at all (effectively plaintext) rather than the negotiated TLS
- * those modes produced before this change - see the `SslConfig` doc in
- * `./ssl.ts` for details.
+ * object, so leaving it in would bypass the resolved setting. Per R8,
+ * `resolveSsl` never resolves `prefer`/`allow` to "no ssl option" for this
+ * reason - see the `SslConfig` doc in `./ssl.ts`.
  */
 export function buildPoolConfig(opts: DatabaseOptions): PoolConfig {
   const url = new URL(opts.connectionString);

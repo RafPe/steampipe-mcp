@@ -1,20 +1,19 @@
 /**
  * The TLS behaviour node-postgres should apply for a given connection URL, in
  * the same shape `pg.Pool`/`pg.Client` accept as their `ssl` option:
- *  - `false` disables TLS entirely.
+ *  - `false` disables TLS entirely. Only `sslmode=disable` produces this -
+ *    it is the explicit opt-out.
  *  - `{ rejectUnauthorized }` enables TLS, optionally skipping certificate
  *    verification.
- *  - `undefined` sets no `ssl` option at all (used for `sslmode=prefer`/
- *    `allow`). `buildPoolConfig` also strips `sslmode` from the connection
- *    string it passes to `pg.Pool`, so in practice this means plaintext
- *    unless `PGSSLMODE` is set in the environment: node-postgres only reads
- *    `sslmode` from the connection string it's actually given, and without
- *    an `ssl` option or an `sslmode` it does not negotiate TLS. This differs
- *    from pre-hardening behaviour, where `sslmode` stayed in the string and
- *    the current pg version treats `prefer`/`allow`/`require`/`verify-ca` as
- *    aliases for `verify-full` (encrypted + verified) - see the pg-connection-
- *    string deprecation warning for that aliasing. Flagged for a controller
- *    ruling; see task-2-report.md.
+ *  - `undefined` is part of the type for forward compatibility, but is never
+ *    returned today: per controller ruling R8, `sslmode=prefer`/`allow`
+ *    resolve exactly like no `sslmode` at all (host-based default) instead
+ *    of being left to the driver, because `buildPoolConfig` always strips
+ *    `sslmode` from the connection string it passes to `pg.Pool` - leaving
+ *    these as "no ssl option" would silently resolve to plaintext for a
+ *    remote host, which is the opposite of this module's job. The
+ *    TLS-by-default intent is binding: nothing but `sslmode=disable` may
+ *    resolve to plaintext.
  */
 export type SslConfig = false | undefined | { rejectUnauthorized: boolean };
 
@@ -36,7 +35,10 @@ function isLoopback(hostname: string): boolean {
  * certificate verification skipped, since a local Steampipe/Postgres
  * typically runs with a self-signed cert or no TLS at all. Every other host
  * defaults to full certificate verification unless `sslmode` says otherwise.
- * An explicit `sslmode` always wins, loopback or not.
+ * An explicit `sslmode` always wins, loopback or not - except `prefer`/
+ * `allow` (R8), which fall through to the same host-based default as no
+ * `sslmode`, rather than being left unresolved. Only `sslmode=disable` opts
+ * out of TLS.
  */
 export function resolveSsl(url: URL): SslConfig {
   const sslmode = url.searchParams.get("sslmode");
@@ -51,7 +53,6 @@ export function resolveSsl(url: URL): SslConfig {
       return { rejectUnauthorized: true };
     case "prefer":
     case "allow":
-      return undefined;
     case null:
       break;
     default:

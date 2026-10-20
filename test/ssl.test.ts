@@ -15,8 +15,12 @@ describe("resolveSsl", () => {
     ["postgresql://u@db.example.com:9193/d?sslmode=require", { rejectUnauthorized: true }],
     ["postgresql://u@db.example.com:9193/d?sslmode=verify-ca", { rejectUnauthorized: true }],
     ["postgresql://u@db.example.com:9193/d?sslmode=verify-full", { rejectUnauthorized: true }],
-    ["postgresql://u@db.example.com:9193/d?sslmode=prefer", undefined],
-    ["postgresql://u@db.example.com:9193/d?sslmode=allow", undefined],
+    // R8: prefer/allow resolve exactly like no sslmode at all (host-based
+    // default), never to undefined/plaintext.
+    ["postgresql://u@db.example.com:9193/d?sslmode=prefer", { rejectUnauthorized: true }],
+    ["postgresql://u@db.example.com:9193/d?sslmode=allow", { rejectUnauthorized: true }],
+    ["postgresql://u@localhost:9193/d?sslmode=prefer", { rejectUnauthorized: false }],
+    ["postgresql://u@localhost:9193/d?sslmode=allow", { rejectUnauthorized: false }],
   ];
 
   it.each(cases)("%s -> %j", (raw, expected) => {
