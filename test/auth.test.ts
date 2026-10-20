@@ -323,6 +323,47 @@ describe("authMiddleware: google", () => {
     expect((await toolsList(port, "look")).status).toBe(403);
   });
 
+  it("rejects a token with aud=foreign and azp=ours with 401 (R17)", async () => {
+    const google = await fakeGoogle({ tokens: { mixed: tokeninfo({ aud: OTHER_CLIENT, azp: CLIENT }) } });
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "mixed")).status).toBe(401);
+  });
+
+  for (const email of ["a@corp.com.evil.com", '"a@corp.com"@evil.com']) {
+    it(`rejects ${email} with 403 when only ALLOWED_DOMAINS=corp.com is set`, async () => {
+      const google = await fakeGoogle({ tokens: { t: tokeninfo({ email }) } });
+      const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+      expect((await toolsList(port, "t")).status).toBe(403);
+    });
+  }
+
+  it("rejects a domain-admitted principal whose hd differs from the email domain with 403", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ email: "a@corp.com", hd: "other.com" }) } });
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "t")).status).toBe(403);
+  });
+
+  it("accepts a domain-admitted principal whose hd matches the email domain, case-insensitively", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ email: "a@corp.com", hd: "Corp.COM" }) } });
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
+  it("accepts a domain-admitted principal when tokeninfo omits hd", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ email: "a@corp.com", hd: undefined }) } });
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
+  it("does not apply the hd check to an explicitly allowlisted email", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ email: "bob@partner.example", hd: "other.com" }) } });
+    const port = await startApp(
+      googleConfig({ STEAMPIPE_MCP_ALLOWED_EMAILS: "bob@partner.example" }),
+      `${google.base}/tokeninfo`,
+    );
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
   it("caches a positive result: two calls with the same token hit tokeninfo once", async () => {
     const google = await fakeGoogle({ tokens: { good: tokeninfo() } });
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
@@ -403,9 +444,14 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
   });
 
-  it("accepts azp-only match and reports AuthInfo per the brief", async () => {
+  it("rejects aud=foreign with azp=ours as invalid_token (R17: aud must be our client)", async () => {
+    const v = await verifierFor({ ...(tokeninfo().body as object), aud: OTHER_CLIENT, azp: CLIENT });
+    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
+  });
+
+  it("accepts aud=ours and reports AuthInfo with clientId = aud", async () => {
     const exp = nowSec() + 3600;
-    const v = await verifierFor({ ...(tokeninfo().body as object), aud: OTHER_CLIENT, exp: String(exp) });
+    const v = await verifierFor({ ...(tokeninfo().body as object), azp: OTHER_CLIENT, exp: String(exp) });
     const info = await v.verifyAccessToken("t");
     expect(info).toEqual({
       token: "t",
@@ -415,6 +461,22 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
       resource: new URL(PUBLIC_URL),
       extra: { sub: "1234", email: "a@corp.com" },
     });
+  });
+
+  it("never hands out the shared cached AuthInfo: mutating a result does not affect the next call", async () => {
+    const v = await verifierFor(tokeninfo().body);
+    const first = await v.verifyAccessToken("t");
+    try {
+      first.scopes.push("admin");
+      first.clientId = "tampered";
+      (first.extra as Record<string, unknown>).email = "x@evil.com";
+    } catch {
+      // A frozen result throwing on mutation is equally acceptable.
+    }
+    const second = await v.verifyAccessToken("t");
+    expect(second.clientId).toBe(CLIENT);
+    expect(second.scopes).toEqual(["openid", "https://www.googleapis.com/auth/userinfo.email"]);
+    expect(second.extra).toEqual({ sub: "1234", email: "a@corp.com" });
   });
 
   it("stops serving a cached result once the injected clock passes the TTL", async () => {
