@@ -1,8 +1,10 @@
 import { DatabaseService } from "../services/database.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from "../services/logger.js";
 
-export const tool: Tool = {
+export const tool: Tool & {
+  handler: (db: DatabaseService, args?: { schema?: string; filter?: string }) => Promise<ServerResult>;
+} = {
   name: "steampipe_table_list",
   description: "List all available Steampipe tables. Use schema and filter parameters to narrow down results.",
   inputSchema: {

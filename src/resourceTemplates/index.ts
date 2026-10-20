@@ -11,8 +11,7 @@ export const resourceTemplateCapabilities = {
     resourceTemplates.map(t => [t.name, {
       name: t.name,
       description: t.description,
-      uri: t.uri,
-      type: t.type
+      uriTemplate: t.uriTemplate
     }])
   )
 };

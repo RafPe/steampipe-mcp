@@ -16,7 +16,6 @@ type ResourceHandler = (db: DatabaseService) => Promise<{
 export const resource: Resource & { handler: ResourceHandler } = {
   uri: "steampipe://status",
   name: "status",
-  type: "status",
   description: "Get the current status of the Steampipe connection",
   handler: async (db: DatabaseService) => {
     // Get the current connection state. The connection string is only

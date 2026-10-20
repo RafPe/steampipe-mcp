@@ -1,8 +1,10 @@
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { DatabaseService } from "../services/database.js";
 import { logger } from "../services/logger.js";
 
-export const tool: Tool = {
+export const tool: Tool & {
+  handler: (db: DatabaseService | undefined, args: { sql: string }) => Promise<ServerResult>;
+} = {
   name: "steampipe_query",
   description: `Query cloud infrastructure, SaaS, APIs, code and more with SQL.
   
