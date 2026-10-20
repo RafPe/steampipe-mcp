@@ -116,14 +116,15 @@ echo "Token: $TOKEN"   # save this - you'll need it below
 ```
 
 Or bring your own Steampipe container with
-[`docker-compose.example.yml`](docker-compose.example.yml) (verified
-end-to-end, including the database password Steampipe requires for
-non-loopback connections):
+[`docker-compose.example.yml`](docker-compose.example.yml), which also needs
+a database password (Steampipe requires one for connections from another
+container):
 
 ```sh
 cp docker-compose.example.yml docker-compose.yml
+TOKEN=$(openssl rand -hex 32)
 {
-  echo "STEAMPIPE_MCP_AUTH_TOKEN=$(openssl rand -hex 32)"
+  echo "STEAMPIPE_MCP_AUTH_TOKEN=$TOKEN"
   echo "STEAMPIPE_PASSWORD=$(openssl rand -hex 20)"
 } > .env
 docker compose up -d

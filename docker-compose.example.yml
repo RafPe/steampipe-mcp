@@ -1,9 +1,6 @@
 # Example: steampipe-mcp as a remote MCP server backed by a Steampipe
-# container, both on a private docker network. Verified end-to-end in this
-# session (local mcp build + this steampipe image, `tools/call
-# steampipe_query` with `select 1` succeeded over the connection string
-# below). Copy this file to docker-compose.yml, create a .env file next to
-# it with:
+# container, both on a private docker network. Copy this file to
+# docker-compose.yml, create a .env file next to it with:
 #
 #   STEAMPIPE_MCP_AUTH_TOKEN=<openssl rand -hex 32>
 #   STEAMPIPE_PASSWORD=<openssl rand -hex 20>
@@ -22,8 +19,16 @@ services:
     # --database-password is required: Steampipe's pg_hba.conf only trusts
     # "samehost" connections without a password; "mcp" reaches it over the
     # docker network, so scram-sha-256 auth applies and a password is
-    # mandatory (verified: without --database-password, steampipe_query
-    # fails with "Database connection failed").
+    # mandatory (without --database-password, steampipe_query fails with
+    # "Database connection failed"). Note: this puts the password in the
+    # container's command line, visible to anyone who can run `docker
+    # inspect` against it; an env-var form was not found in `service start
+    # --help` and has not been investigated further.
+    #
+    # This compose file only mounts plugin *config* (./steampipe-config), as
+    # specified; it does not install any plugins, so steampipe_table_list
+    # will show no cloud tables until you install one (see
+    # https://steampipe.io/docs/managing/plugins).
     command:
       [
         "steampipe",
