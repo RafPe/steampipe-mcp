@@ -1,5 +1,6 @@
 import { logger } from "./logger.js";
 import { resolveSsl } from "./ssl.js";
+import { readFileSync } from 'fs';
 import pkg from 'pg';
 const { Pool } = pkg;
 import type { Pool as PoolType, PoolClient, PoolConfig } from 'pg';
@@ -16,17 +17,41 @@ export interface DatabaseOptions {
 }
 
 /**
- * Build the `pg.Pool` config for a given set of database options. TLS is
- * resolved separately (see `resolveSsl`) and `sslmode` is stripped from the
- * connection string: node-postgres lets a URL `sslmode` override the `ssl`
- * object, so leaving it in would bypass the resolved setting. Per R8,
- * `resolveSsl` never resolves `prefer`/`allow` to "no ssl option" for this
- * reason - see the `SslConfig` doc in `./ssl.ts`.
+ * Build the `pg.Pool` config for a given set of database options.
+ *
+ * TLS is resolved separately (see `resolveSsl`), and every query parameter
+ * node-postgres itself inspects to affect TLS or the connection target is
+ * either stripped from the connection string or rejected outright, so that
+ * `resolveSsl`'s decision is the only thing that can apply:
+ *  - `sslmode` and `ssl` are stripped: a URL `sslmode`/`ssl` would otherwise
+ *    override the `ssl` object below.
+ *  - `host`/`hostaddr` are rejected (not stripped): node-postgres lets
+ *    either one silently redirect the actual TCP connection away from the
+ *    URL's authority host, while `resolveSsl`'s loopback check only looks at
+ *    that authority host - so a string like
+ *    `postgresql://u@localhost/d?host=remote.example.com` would be judged
+ *    loopback (TLS verification skipped) while actually connecting,
+ *    unverified, to a remote host.
+ *  - `sslrootcert`/`sslcert`/`sslkey` are stripped and, when TLS is enabled,
+ *    read from disk here and merged into the `ssl` object as `ca`/`cert`/
+ *    `key` - otherwise node-postgres would read them itself and could
+ *    override the resolved ssl object's shape.
  */
 export function buildPoolConfig(opts: DatabaseOptions): PoolConfig {
   const url = new URL(opts.connectionString);
+
+  if (url.searchParams.has('host') || url.searchParams.has('hostaddr')) {
+    throw new Error('connection string must not override the host via query parameters; put the host in the URL authority');
+  }
+
   const ssl = resolveSsl(url);
-  url.searchParams.delete('sslmode');
+  const sslRootCertPath = url.searchParams.get('sslrootcert');
+  const sslCertPath = url.searchParams.get('sslcert');
+  const sslKeyPath = url.searchParams.get('sslkey');
+
+  for (const param of ['sslmode', 'ssl', 'sslrootcert', 'sslcert', 'sslkey']) {
+    url.searchParams.delete(param);
+  }
 
   const poolConfig: PoolConfig = {
     connectionString: url.toString(),
@@ -41,8 +66,16 @@ export function buildPoolConfig(opts: DatabaseOptions): PoolConfig {
     application_name: 'steampipe-mcp',
   };
 
-  if (ssl !== undefined) {
-    poolConfig.ssl = ssl;
+  if (ssl === false) {
+    // TLS is off: the cert/key files (if any) are irrelevant.
+    poolConfig.ssl = false;
+  } else {
+    poolConfig.ssl = {
+      ...ssl,
+      ...(sslRootCertPath ? { ca: readFileSync(sslRootCertPath, 'utf8') } : {}),
+      ...(sslCertPath ? { cert: readFileSync(sslCertPath, 'utf8') } : {}),
+      ...(sslKeyPath ? { key: readFileSync(sslKeyPath, 'utf8') } : {}),
+    };
   }
 
   return poolConfig;
