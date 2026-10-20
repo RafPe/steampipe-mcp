@@ -57,9 +57,30 @@ jobs:
           cache-to: type=gha,mode=max
 
       # Scans the exact pushed manifest by digest (not a tag, which could
-      # later move), so what is scanned is what was published.
-      - name: Scan image with Trivy
+      # later move), so what is scanned is what was published. The digest
+      # output is a manifest-list digest (linux/amd64 + linux/arm64); without
+      # --platform, Trivy's registry puller resolves it to a single
+      # architecture (whichever its own platform-selection default picks),
+      # leaving the other arch unscanned. TRIVY_PLATFORM makes that explicit
+      # instead - it's the env-var form of trivy image's --platform flag
+      # (https://aquasecurity.github.io/trivy/latest/docs/configuration/#environment-variables),
+      # which trivy-action's composite steps pass through unchanged.
+      - name: Scan image with Trivy (linux/amd64)
         uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/amd64
+        with:
+          image-ref: ghcr.io/rafpe/steampipe-mcp@${{ steps.build.outputs.digest }}
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          version: v0.70.0
+
+      - name: Scan image with Trivy (linux/arm64)
+        uses: aquasecurity/trivy-action@v0.36.0
+        env:
+          TRIVY_PLATFORM: linux/arm64
         with:
           image-ref: ghcr.io/rafpe/steampipe-mcp@${{ steps.build.outputs.digest }}
           format: table
