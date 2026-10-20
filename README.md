@@ -81,6 +81,7 @@ Built-in protections:
 - **Origin validation (always on).** A request with an `Origin` header that is not exactly listed in `STEAMPIPE_MCP_ALLOWED_ORIGINS` gets `403`. Requests without an `Origin` header (non-browser clients) pass. `Origin: null` is rejected unless the literal `null` is listed.
 - **Host validation (DNS rebinding).** On a loopback bind only `localhost`, `127.0.0.1` and `[::1]` are accepted as `Host`. On a non-loopback bind the `Host` hostname must be in `STEAMPIPE_MCP_ALLOWED_HOSTS`, or else match the hostname of `STEAMPIPE_MCP_PUBLIC_URL`; if neither is set, Host validation is skipped and a warning is logged at startup.
 - **Body size cap.** Request bodies larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` get `413`; bodies that are not `application/json` get `415`.
+- **Authentication.** `STEAMPIPE_MCP_AUTH_MODE=token` requires a static bearer token; `STEAMPIPE_MCP_AUTH_MODE=google` accepts Google OAuth access tokens for allowlisted users. See [docs/remote-deployment.md](docs/remote-deployment.md).
 
 Quick check with curl (clients must accept both `application/json` and `text/event-stream`):
 
@@ -249,6 +250,11 @@ HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
 | `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames accepted in the `Host` header on a non-loopback bind (ports and case are ignored) |
 | `STEAMPIPE_MCP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes; larger bodies get `413` |
 | `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE` | `false` | Allow a non-loopback bind without auth (not recommended) |
+| `STEAMPIPE_MCP_AUTH_MODE` | `none` | `none`, `token`, or `google` ([docs/remote-deployment.md](docs/remote-deployment.md)) |
+| `STEAMPIPE_MCP_AUTH_TOKEN` | _(unset)_ | Static bearer token, at least 32 characters (`token` mode) |
+| `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` | _(unset)_ | Google OAuth client ID that tokens must be issued to (`google` mode) |
+| `STEAMPIPE_MCP_ALLOWED_EMAILS` | _(empty)_ | Comma-separated emails allowed in `google` mode (case-insensitive) |
+| `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive, exact match) |
 
 ## Open Source & Contributing
 

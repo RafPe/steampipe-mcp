@@ -8,6 +8,7 @@ import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
 import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
 import { buildHttpApp } from "./http/app.js";
+import { authMiddleware, type AuthMiddleware } from "./auth/index.js";
 
 let serverStartTime: Date;
 
@@ -101,14 +102,18 @@ export async function startServer() {
 }
 
 async function startHttp(cfg: ServerConfig, db: DatabaseService) {
-  if (cfg.auth.mode !== 'none') {
-    // Task 6 replaces this with the real auth middleware. Until then, never
-    // serve unauthenticated while the operator believes auth is enforced.
-    logger.error(`STEAMPIPE_MCP_AUTH_MODE=${cfg.auth.mode} is not available in this build`);
+  let auth: AuthMiddleware;
+  try {
+    auth = await authMiddleware(cfg);
+  } catch (error) {
+    // Fail closed: never serve without the configured auth. The message
+    // names the failure (e.g. Google metadata unreachable), never a token.
+    logger.error(`Failed to initialise STEAMPIPE_MCP_AUTH_MODE=${cfg.auth.mode}:`, error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
+  logger.info(`HTTP auth mode: ${cfg.auth.mode}`);
   const { host, port, path } = cfg.http;
-  const app = buildHttpApp(cfg, db);
+  const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters);
   const httpServer = await new Promise<HttpServer>((resolve, reject) => {
     const s = app.listen(port, host, (error?: Error) => (error ? reject(error) : resolve(s)));
   });

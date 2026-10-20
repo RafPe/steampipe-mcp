@@ -77,11 +77,17 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * Middleware order: `GET /healthz` first (R14: static, no DB, so probes
  * that send a pod IP or `localhost` as Host still pass), then Host
  * validation, Origin validation, JSON body parsing (capped at
- * `maxBodyBytes`), then `extraMiddleware` scoped to the MCP route only, so
- * later well-known metadata routes stay reachable without auth, while route
- * guards still see the parsed body.
+ * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
+ * `/.well-known/*` metadata, still Host/Origin-checked), then
+ * `extraMiddleware` scoped to `POST {path}` only, so route guards see the
+ * parsed body while the metadata and the 405s stay reachable without auth.
  */
-export function buildHttpApp(cfg: ServerConfig, db: DatabaseService, extraMiddleware: RequestHandler[] = []): Express {
+export function buildHttpApp(
+  cfg: ServerConfig,
+  db: DatabaseService,
+  extraMiddleware: RequestHandler[] = [],
+  rootRouters: RequestHandler[] = [],
+): Express {
   const { http } = cfg;
   const app = express();
   app.disable("x-powered-by");
@@ -103,6 +109,9 @@ export function buildHttpApp(cfg: ServerConfig, db: DatabaseService, extraMiddle
   }
   app.use(originValidation(http.allowedOrigins));
   app.use(express.json({ limit: http.maxBodyBytes }));
+  for (const router of rootRouters) {
+    app.use(router);
+  }
 
   app.post(http.path, ...extraMiddleware, async (req, res) => {
     // express.json() only parses application/json. Refuse anything it
