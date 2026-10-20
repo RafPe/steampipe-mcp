@@ -33,9 +33,11 @@ export const tool: Tool = {
     }
 
     try {
-      const rows = await db.executeQuery(args.sql);
+      const { rows, truncated } = await db.executeUserQuery(args.sql);
+      // Keep the plain rows array unless truncated, so existing clients keep working
+      const text = truncated ? JSON.stringify({ rows, truncated }) : JSON.stringify(rows);
       return {
-        content: [{ type: "text", text: JSON.stringify(rows) }],
+        content: [{ type: "text", text }],
         isError: false
       };
     } catch (error) {

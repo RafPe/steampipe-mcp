@@ -59,17 +59,20 @@ export async function startServer(port: number = 27123) {
     // Configure global type parsers
     configureTypeParser();
 
-    // Get database service instance (but don't connect yet)
-    const db = DatabaseService.getInstance();
-
-    // Set connection string from command line if provided
-    const connectionString = process.argv[2];
-    if (connectionString) {
-      db.setConfig({
-        connectionString
-      });
+    // Create the database service (it connects lazily on first query)
+    const argConnectionString = process.argv[2];
+    if (argConnectionString) {
       logger.info('Using connection string from command line argument');
     }
+    const db = new DatabaseService({
+      connectionString: argConnectionString
+        || process.env.STEAMPIPE_MCP_WORKSPACE_DATABASE
+        || 'postgresql://steampipe@localhost:9193/steampipe',
+      maxRows: 0,
+      statementTimeoutMs: 120000,
+      poolMax: 20,
+      exposeConnectionDetails: true,
+    });
 
     // Set up shutdown handlers
     setupShutdownHandlers(db);
