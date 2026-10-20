@@ -1,0 +1,17 @@
+.git
+.github
+.codegraph
+.superpowers
+node_modules
+dist
+coverage
+test
+docs
+*.log
+.env
+.env.*
+.dockerignore
+Dockerfile*
+docker-compose*.yml
+README.md
+CHANGELOG.md

@@ -9,15 +9,21 @@ import { logger } from "./services/logger.js";
 import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
 import { buildHttpApp } from "./http/app.js";
 import { authMiddleware, type AuthMiddleware } from "./auth/index.js";
+import { closeHttpServerGracefully } from "./shutdown.js";
 
 let serverStartTime: Date;
 
 // Handle graceful shutdown: stop accepting HTTP requests first (when
-// serving HTTP), then close the database pool.
+// serving HTTP), then close the database pool. `httpServer.close()` alone
+// can hang indefinitely on a connection that never drains (e.g. a client
+// holding the Streamable HTTP response open), so it is bounded by a
+// forced-close timeout (Task 9 / Task 5 review) well under typical
+// orchestrator termination deadlines (docker stop's default 10s, k8s's
+// default terminationGracePeriodSeconds of 30s).
 function setupShutdownHandlers(db: DatabaseService, httpServer?: HttpServer) {
   const gracefulShutdown = async () => {
     if (httpServer) {
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      await closeHttpServerGracefully(httpServer);
     }
     if (db) {
       try {

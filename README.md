@@ -94,6 +94,45 @@ curl -s http://127.0.0.1:27123/mcp \
 
 When connecting from a browser-based client such as the MCP Inspector in direct mode, add its origin to `STEAMPIPE_MCP_ALLOWED_ORIGINS` (or use the Inspector's proxy mode).
 
+### Run as a remote MCP (Docker)
+
+A multi-arch (`linux/amd64`, `linux/arm64`) image is published to
+`ghcr.io/rafpe/steampipe-mcp`. It runs as a non-root user, defaults to
+`STEAMPIPE_MCP_TRANSPORT=http` on `0.0.0.0:27123`, and has a built-in
+`HEALTHCHECK` against `GET /healthz`. Because of the bind guard above, it
+refuses to start unless `STEAMPIPE_MCP_AUTH_MODE` is `token` or `google` (or
+`STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true` is set).
+
+Token mode, pointed at a Turbot Pipes workspace:
+
+```sh
+docker run -d --name steampipe-mcp -p 27123:27123 \
+  -e STEAMPIPE_MCP_AUTH_MODE=token \
+  -e STEAMPIPE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
+  ghcr.io/rafpe/steampipe-mcp:0.2.0
+```
+
+Or bring your own Steampipe container with
+[`docker-compose.example.yml`](docker-compose.example.yml):
+
+```sh
+cp docker-compose.example.yml docker-compose.yml
+echo "STEAMPIPE_MCP_AUTH_TOKEN=$(openssl rand -hex 32)" > .env
+docker compose up -d
+```
+
+Connect Claude Code to either:
+
+```sh
+claude mcp add --transport http steampipe http://localhost:27123/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
+mode, the threat model, and reverse-proxy/TLS guidance (the server itself
+speaks plain HTTP).
+
 ## Prompting Guide
 
 First, run the `best_practices` prompt included in the MCP server to teach your LLM how best to work with Steampipe. Then, ask anything!
