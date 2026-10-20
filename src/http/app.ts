@@ -9,6 +9,8 @@ import { createServer } from "../server.js";
 import type { DatabaseService } from "../services/database.js";
 import { logger } from "../services/logger.js";
 import { isLoopback } from "../services/ssl.js";
+import { auditMiddleware } from "./audit.js";
+import { createRateLimiter, rejectBatch } from "./guards.js";
 import { originValidation } from "./origin.js";
 
 function jsonRpcError(status: number, code: number, message: string): { status: number; body: object } {
@@ -78,9 +80,12 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * that send a pod IP or `localhost` as Host still pass), then Host
  * validation, Origin validation, JSON body parsing (capped at
  * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
- * `/.well-known/*` metadata, still Host/Origin-checked), then
- * `extraMiddleware` scoped to `POST {path}` only, so route guards see the
- * parsed body while the metadata and the 405s stay reachable without auth.
+ * `/.well-known/*` metadata, still Host/Origin-checked), then on
+ * `POST {path}` only: `extraMiddleware` (bearer auth), per-principal rate
+ * limiting, JSON-RPC batch rejection, and the audit log, in that order, so
+ * route guards see the parsed body and the authenticated principal while
+ * the metadata and the 405s stay reachable without auth, and a 401/403
+ * never reaches the rate limiter, the batch check, or the audit log.
  */
 export function buildHttpApp(
   cfg: ServerConfig,
@@ -91,6 +96,9 @@ export function buildHttpApp(
   const { http } = cfg;
   const app = express();
   app.disable("x-powered-by");
+  if (http.trustProxy !== undefined) {
+    app.set("trust proxy", http.trustProxy);
+  }
 
   // Mounted before Host/Origin validation (R14): it returns only static
   // data, so a DNS-rebinding or cross-origin read of it gains nothing.
@@ -113,7 +121,7 @@ export function buildHttpApp(
     app.use(router);
   }
 
-  app.post(http.path, ...extraMiddleware, async (req, res) => {
+  app.post(http.path, ...extraMiddleware, createRateLimiter(http), rejectBatch(), auditMiddleware(), async (req, res) => {
     // express.json() only parses application/json. Refuse anything it
     // skipped, so the transport never reads an unparsed (and so uncapped)
     // body stream itself.
