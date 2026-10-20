@@ -34,14 +34,20 @@ Steampipe instances or workspaces.
 - *Unauthenticated network callers.* `POST /mcp` without a valid
   `Authorization: Bearer` header gets `401` with a `WWW-Authenticate: Bearer`
   challenge. Tokens in the query string (`?access_token=`) are ignored.
-- *Tokens minted for other applications* (google mode). A Google access token
-  is accepted only if Google's tokeninfo reports our client ID as its `aud` or
-  `azp`. A token another app obtained for the same user gets `401`.
-- *Valid Google users who are not allowed* (google mode). An email that is
+- *Tokens minted for other applications* (google mode). Audience binding is
+  `aud` = `STEAMPIPE_MCP_GOOGLE_CLIENT_ID`: a Google access token is accepted
+  only if tokeninfo reports our client ID as its `aud`. A matching `azp` alone
+  is not enough. A token another app obtained for the same user gets `401`.
+  The flip side is that **every** token minted for that client ID is accepted,
+  so use a **dedicated** OAuth client for this server and nothing else.
+- *Google users who are not allowed* (google mode). An email that is
   unverified, or that is neither in `STEAMPIPE_MCP_ALLOWED_EMAILS` nor in a
   domain in `STEAMPIPE_MCP_ALLOWED_DOMAINS`, gets `403 insufficient_scope` and
-  never reaches the tools. Domain matching is exact: `corp.com` does not allow
-  `evilcorp.com` or `sub.corp.com`.
+  never reaches the tools. The domain is the part after the last `@`, compared
+  as a whole string, so `corp.com` does not match `evilcorp.com`,
+  `sub.corp.com` or `a@corp.com.evil.com`. This is a string match on the email
+  address, **not proof of membership** in your organization. See
+  [ALLOWED_DOMAINS is only a boundary with an Internal consent screen](#allowed_domains-is-only-a-boundary-with-an-internal-consent-screen).
 - *Browser-based attacks.* Origin validation (`403` for unknown `Origin`) and
   Host validation (DNS rebinding) still apply in front of auth.
 - *Token leakage through the server.* Tokens are never logged and never
@@ -136,14 +142,20 @@ Two Google constraints shape the setup:
 
 1. **OAuth consent screen** (Google Cloud console, *Google Auth Platform* /
    *APIs & Services → OAuth consent screen*):
-   - If everyone is in your Google Workspace, choose **Internal**. Only
-     accounts in your organization can then sign in at all, which adds a layer
-     in front of the allowlist.
-   - Otherwise choose **External**, and while the app is in *Testing*, add
-     each user as a test user.
+   - **Internal** (requires Google Workspace): only accounts managed by your
+     Workspace organization can sign in. This is the **only** setup in which
+     `STEAMPIPE_MCP_ALLOWED_DOMAINS` is a real membership boundary.
+   - **External**: any Google account can sign in. You **must** list users
+     explicitly in `STEAMPIPE_MCP_ALLOWED_EMAILS` and must not rely on
+     `STEAMPIPE_MCP_ALLOWED_DOMAINS` (see below). While the app is in
+     *Testing*, also add each user as a test user.
    - Scopes: `openid` and `email` only. No sensitive or restricted scopes are
      needed.
 2. **OAuth client** (*Credentials → Create credentials → OAuth client ID*):
+   - Create a **dedicated** client for this server. Do not reuse a client that
+     any other application uses: the server accepts every token whose `aud` is
+     this client ID, so a token issued to another app sharing the client would
+     be accepted too.
    - Application type: **Web application**.
    - **Authorized redirect URIs:** the loopback redirect URI(s) your MCP
      client uses. For Claude Code, pick a fixed port (for example `33418`) and
@@ -167,6 +179,27 @@ STEAMPIPE_MCP_ALLOWED_EMAILS=alice@example.com,bob@partner.example
 
 At least one of `ALLOWED_EMAILS` / `ALLOWED_DOMAINS` is required. Both are
 case-insensitive. The server never needs the client secret.
+
+#### ALLOWED_DOMAINS is only a boundary with an Internal consent screen
+
+Anyone can create a consumer Google account (a "Google Account with an
+existing email address") for an address such as `bob@corp.com`, without
+access to Workspace. This includes an ex-employee whose Workspace account was
+deleted. Google marks that account's email as verified. With an **External**
+consent screen, such an account can sign in, and its email matches
+`ALLOWED_DOMAINS=corp.com`.
+
+- With an **Internal** consent screen on Google Workspace, only accounts your
+  organization manages can sign in, so `ALLOWED_DOMAINS` works as a
+  membership boundary.
+- With an **External** consent screen, use **explicit
+  `STEAMPIPE_MCP_ALLOWED_EMAILS` only**, and leave `ALLOWED_DOMAINS` unset.
+
+As defence in depth, when a user is admitted only by `ALLOWED_DOMAINS` and
+tokeninfo reports a hosted domain (`hd`), the server requires `hd` to equal
+the email's domain and otherwise returns `403`. tokeninfo for access tokens
+often omits `hd`. A missing `hd` is not rejected, so this check is **not** a
+substitute for the Internal consent screen.
 
 At startup the server fetches
 `https://accounts.google.com/.well-known/openid-configuration`, and refuses to
@@ -192,10 +225,11 @@ How each token is validated:
 
 1. POST `access_token=<token>` (form body) to
    `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout.
-2. Any non-200 response, `aud` and `azp` both different from
-   `GOOGLE_CLIENT_ID`, or `exp` missing or in the past → `401 invalid_token`.
-3. `email_verified` not `"true"`, or an email that is neither allowlisted nor
-   in an allowlisted domain → `403 insufficient_scope`.
+2. Any non-200 response, `aud` different from `GOOGLE_CLIENT_ID` (`azp` is
+   not consulted), or `exp` missing or in the past → `401 invalid_token`.
+3. `email_verified` not `"true"`, an email that is neither allowlisted nor in
+   an allowlisted domain, or a domain-only match where `hd` is present and
+   differs from the email's domain → `403 insufficient_scope`.
 4. Otherwise accept. The result is cached for at most 60 seconds, keyed by the
    token's sha256.
 
@@ -235,7 +269,7 @@ MCP clients that follow the 2025-06-18+ authorization spec send the RFC 8707
 and token requests. Google does not document support for `resource`. It
 might:
 
-- ignore it (expected, and fine: the server checks `aud`/`azp` against your
+- ignore it (expected, and fine: the server checks `aud` against your
   client ID, not against `resource`), or
 - reject the request with `invalid_request`.
 

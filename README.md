@@ -254,7 +254,7 @@ HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
 | `STEAMPIPE_MCP_AUTH_TOKEN` | _(unset)_ | Static bearer token, at least 32 characters (`token` mode) |
 | `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` | _(unset)_ | Google OAuth client ID that tokens must be issued to (`google` mode) |
 | `STEAMPIPE_MCP_ALLOWED_EMAILS` | _(empty)_ | Comma-separated emails allowed in `google` mode (case-insensitive) |
-| `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive, exact match) |
+| `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive). Only a membership boundary with an Internal consent screen on Google Workspace; with External, use `ALLOWED_EMAILS` ([details](docs/remote-deployment.md#allowed_domains-is-only-a-boundary-with-an-internal-consent-screen)) |
 
 ## Open Source & Contributing
 

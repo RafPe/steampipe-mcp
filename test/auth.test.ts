@@ -7,6 +7,7 @@ import {
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import { DatabaseService } from "../src/services/database.js";
@@ -465,18 +466,23 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
 
   it("never hands out the shared cached AuthInfo: mutating a result does not affect the next call", async () => {
     const v = await verifierFor(tokeninfo().body);
-    const first = await v.verifyAccessToken("t");
-    try {
-      first.scopes.push("admin");
-      first.clientId = "tampered";
-      (first.extra as Record<string, unknown>).email = "x@evil.com";
-    } catch {
-      // A frozen result throwing on mutation is equally acceptable.
-    }
-    const second = await v.verifyAccessToken("t");
-    expect(second.clientId).toBe(CLIENT);
-    expect(second.scopes).toEqual(["openid", "https://www.googleapis.com/auth/userinfo.email"]);
-    expect(second.extra).toEqual({ sub: "1234", email: "a@corp.com" });
+    const tamper = (info: AuthInfo) => {
+      try {
+        info.scopes.push("admin");
+        info.clientId = "tampered";
+        (info.extra as Record<string, unknown>).email = "x@evil.com";
+      } catch {
+        // A frozen result throwing on mutation is equally acceptable.
+      }
+    };
+    // First call is a cache miss, the later ones are cache hits: tamper
+    // with both kinds of result.
+    tamper(await v.verifyAccessToken("t"));
+    tamper(await v.verifyAccessToken("t"));
+    const third = await v.verifyAccessToken("t");
+    expect(third.clientId).toBe(CLIENT);
+    expect(third.scopes).toEqual(["openid", "https://www.googleapis.com/auth/userinfo.email"]);
+    expect(third.extra).toEqual({ sub: "1234", email: "a@corp.com" });
   });
 
   it("stops serving a cached result once the injected clock passes the TTL", async () => {

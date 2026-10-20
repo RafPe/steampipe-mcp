@@ -31,6 +31,7 @@ interface TokenInfo {
   sub?: string;
   email?: string;
   email_verified?: string;
+  hd?: string;
   scope?: string;
   exp?: string;
 }
@@ -39,15 +40,18 @@ interface TokenInfo {
  * Verifier for Google OAuth access tokens. Google access tokens are opaque,
  * so each one is checked against Google's tokeninfo endpoint:
  *
- * - not a 200, issued to another client (`aud` and `azp` both differ from
- *   `clientId`), or expired: `InvalidTokenError` (401).
- * - email unverified, or neither the email nor its domain allowlisted:
+ * - not a 200, issued to another client (`aud` differs from `clientId`; R17:
+ *   a matching `azp` alone is not enough), or expired: `InvalidTokenError`
+ *   (401).
+ * - email unverified, neither the email nor its domain allowlisted, or
+ *   admitted only by domain while `hd` names a different domain:
  *   `InsufficientScopeError` (403).
  * - tokeninfo unreachable or timed out: `ServerError` (500). Never accepted.
  *
  * Successful results are cached in memory for at most 60s (and never past
  * the token's own expiry), keyed by the token's sha256. Failures are never
- * cached, so a fixed allowlist or revoked token takes effect on the next call.
+ * cached. Every call returns a fresh copy, so a caller mutating its
+ * AuthInfo cannot change what later requests see.
  */
 export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifier {
   const tokeninfoUrl = o.tokeninfoUrl ?? DEFAULT_TOKENINFO_URL;
@@ -84,9 +88,27 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
     }
   }
 
-  function isAllowed(email: string): boolean {
+  function isAllowed(email: string, hd: string | undefined): boolean {
+    if (allowedEmails.has(email)) {
+      return true;
+    }
     const domain = email.slice(email.lastIndexOf("@") + 1);
-    return allowedEmails.has(email) || allowedDomains.has(domain);
+    if (!allowedDomains.has(domain)) {
+      return false;
+    }
+    // Anyone can register a consumer Google account on an address in a
+    // Workspace domain, so a domain match alone does not prove membership.
+    // When Google reports the hosted domain, it must agree. tokeninfo for
+    // access tokens often omits `hd`, so its absence is not a rejection;
+    // the Internal consent screen is what makes domains a real boundary.
+    if (hd === undefined) {
+      return true;
+    }
+    return typeof hd === "string" && hd.toLowerCase() === domain;
+  }
+
+  function copy(info: AuthInfo): AuthInfo {
+    return { ...info, scopes: [...info.scopes], extra: { ...info.extra } };
   }
 
   return {
@@ -94,12 +116,12 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
       const key = createHash("sha256").update(token, "utf8").digest("hex");
       const cached = cache.get(key);
       if (cached && cached.until > now()) {
-        return cached.info;
+        return copy(cached.info);
       }
       cache.delete(key);
 
       const info = await lookup(token);
-      if (info.aud !== o.clientId && info.azp !== o.clientId) {
+      if (info.aud !== o.clientId) {
         throw new InvalidTokenError("Token was not issued to this client");
       }
       const expMs = Number(info.exp) * 1000;
@@ -107,7 +129,7 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
         throw new InvalidTokenError("Token has expired");
       }
       const email = typeof info.email === "string" ? info.email.toLowerCase() : undefined;
-      if (info.email_verified !== "true" || !email || !email.includes("@") || !isAllowed(email)) {
+      if (info.email_verified !== "true" || !email || !email.includes("@") || !isAllowed(email, info.hd)) {
         logger.debug("Google principal not allowed", email ?? "(no email)");
         throw new InsufficientScopeError("principal not allowed");
       }
@@ -115,7 +137,7 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
 
       const authInfo: AuthInfo = {
         token,
-        clientId: info.azp ?? info.aud ?? o.clientId,
+        clientId: info.aud,
         scopes: (info.scope ?? "").split(" ").filter(Boolean),
         expiresAt: Number(info.exp),
         resource: o.publicUrl,
@@ -126,7 +148,7 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
         if (oldest !== undefined) cache.delete(oldest);
       }
       cache.set(key, { info: authInfo, until: now() + Math.min(CACHE_TTL_MS, expMs - now()) });
-      return authInfo;
+      return copy(authInfo);
     },
   };
 }
