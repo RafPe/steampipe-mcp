@@ -1,7 +1,8 @@
 import { logger } from "./logger.js";
+import { resolveSsl } from "./ssl.js";
 import pkg from 'pg';
 const { Pool } = pkg;
-import type { Pool as PoolType, PoolClient } from 'pg';
+import type { Pool as PoolType, PoolClient, PoolConfig } from 'pg';
 import Cursor from 'pg-cursor';
 
 export interface DatabaseOptions {
@@ -12,6 +13,37 @@ export interface DatabaseOptions {
   poolMax: number;
   // Include the (password-masked) connection string in error messages.
   exposeConnectionDetails: boolean;
+}
+
+/**
+ * Build the `pg.Pool` config for a given set of database options. TLS is
+ * resolved separately (see `resolveSsl`) and `sslmode` is stripped from the
+ * connection string: node-postgres lets a URL `sslmode` override the `ssl`
+ * object, so leaving it in would bypass the resolved setting.
+ */
+export function buildPoolConfig(opts: DatabaseOptions): PoolConfig {
+  const url = new URL(opts.connectionString);
+  const ssl = resolveSsl(url);
+  url.searchParams.delete('sslmode');
+
+  const poolConfig: PoolConfig = {
+    connectionString: url.toString(),
+    max: opts.poolMax,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 2000,
+    maxLifetimeSeconds: 300,  // 5 minutes
+    // Sent as startup parameters, so they apply to every pooled connection
+    // and are restored by DISCARD ALL
+    statement_timeout: opts.statementTimeoutMs,
+    idle_in_transaction_session_timeout: opts.statementTimeoutMs,
+    application_name: 'steampipe-mcp',
+  };
+
+  if (ssl !== undefined) {
+    poolConfig.ssl = ssl;
+  }
+
+  return poolConfig;
 }
 
 export interface UserQueryResult {
@@ -51,12 +83,12 @@ export class DatabaseService {
     return this._isConnected;
   }
 
-  get configConnectionString(): string {
-    return this.opts.connectionString;
-  }
-
   get safeConnectionString(): string {
     return this.sanitizeConnectionString(this.opts.connectionString);
+  }
+
+  get exposeConnectionDetails(): boolean {
+    return this.opts.exposeConnectionDetails;
   }
 
   /**
@@ -74,36 +106,9 @@ export class DatabaseService {
       return this.pool;
     }
 
-    logger.debug('Creating database pool for:', this.safeConnectionString);
+    logger.debug('Creating database pool for:', this.target);
 
-    // Parse connection string to handle SSL configuration
-    const url = new URL(this.opts.connectionString);
-    const poolConfig: any = {
-      connectionString: this.opts.connectionString,
-      max: this.opts.poolMax,
-      idleTimeoutMillis: 30000,
-      connectionTimeoutMillis: 2000,
-      maxLifetimeSeconds: 300,  // 5 minutes
-      // Sent as startup parameters, so they apply to every pooled connection
-      // and are restored by DISCARD ALL
-      statement_timeout: this.opts.statementTimeoutMs,
-      idle_in_transaction_session_timeout: this.opts.statementTimeoutMs,
-      application_name: 'steampipe-mcp'
-    };
-
-    // Configure SSL based on URL parameters or use secure defaults
-    if (url.searchParams.has('sslmode')) {
-      const sslMode = url.searchParams.get('sslmode');
-      if (sslMode === 'require' || sslMode === 'verify-ca' || sslMode === 'verify-full') {
-        poolConfig.ssl = { rejectUnauthorized: true };
-      }
-      // For other modes (disable, allow, prefer), let postgres handle it
-    } else {
-      // Default to prefer with self-signed certs allowed
-      poolConfig.ssl = { rejectUnauthorized: false };
-    }
-
-    this.pool = new Pool(poolConfig);
+    this.pool = new Pool(buildPoolConfig(this.opts));
 
     // Errors on idle clients (e.g. backend terminated because Steampipe
     // restarted) are emitted here. The pool drops the broken client itself and

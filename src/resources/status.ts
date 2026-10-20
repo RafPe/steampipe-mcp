@@ -19,8 +19,9 @@ export const resource: Resource & { handler: ResourceHandler } = {
   type: "status",
   description: "Get the current status of the Steampipe connection",
   handler: async (db: DatabaseService) => {
-    // Get the current config and connection state
-    const connectionString = db.configConnectionString;
+    // Get the current connection state. The connection string is only
+    // included (password-masked) when exposeConnectionDetails is set; it is
+    // otherwise omitted so the resource never reveals the DB host/user.
     const isConnected = db.isConnected;
 
     return {
@@ -29,7 +30,7 @@ export const resource: Resource & { handler: ResourceHandler } = {
         mimeType: "application/json",
         text: JSON.stringify({
           version,
-          connection_string: connectionString,
+          ...(db.exposeConnectionDetails ? { connection_string: db.safeConnectionString } : {}),
           status: isConnected ? "connected" : "disconnected"
         })
       }]

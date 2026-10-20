@@ -1,3 +1,10 @@
+## Unreleased
+
+_Breaking / security defaults_
+
+* Remote (non-loopback) databases without an explicit `sslmode` now verify TLS certificates by default, instead of accepting any certificate. Set `?sslmode=no-verify` on the connection string to restore the previous behaviour.
+* The `steampipe://status` resource no longer includes the connection string unless connection details are explicitly exposed, so it never leaks the database password.
+
 ## v0.1.2 [2024-05-19]
 
 _What's new_

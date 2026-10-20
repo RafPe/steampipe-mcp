@@ -3,9 +3,13 @@ import { Client } from "pg";
 import { DatabaseService, type DatabaseOptions } from "../src/services/database.js";
 import { describeDb, testDbUrl } from "./helpers/db.js";
 
-// The local test Postgres has no TLS. Without an explicit sslmode the current
-// pool config insists on TLS, so disable it for these tests.
-function plainUrl(): string {
+// The local test Postgres has no TLS. resolveSsl() defaults loopback hosts
+// (127.0.0.1 here) to attempting TLS with certificate verification skipped,
+// not to plaintext - and node-postgres does not fall back to plaintext the
+// way libpq's `sslmode=prefer` does: it fails the connection outright with
+// "The server does not support SSL connections" when the server refuses the
+// SSL negotiation. So these tests force sslmode=disable explicitly.
+function noTlsUrl(): string {
   const url = new URL(testDbUrl()!);
   if (!url.searchParams.has("sslmode")) {
     url.searchParams.set("sslmode", "disable");
@@ -18,7 +22,7 @@ describeDb("DatabaseService", () => {
 
   function makeDb(overrides: Partial<DatabaseOptions> = {}): DatabaseService {
     const db = new DatabaseService({
-      connectionString: plainUrl(),
+      connectionString: noTlsUrl(),
       maxRows: 0,
       statementTimeoutMs: 120000,
       poolMax: 1,
