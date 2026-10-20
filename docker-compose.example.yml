@@ -1,8 +1,14 @@
 # Example: steampipe-mcp as a remote MCP server backed by a Steampipe
-# container, both on a private docker network. Copy this file to
-# docker-compose.yml, generate a token, and run `docker compose up`.
+# container, both on a private docker network. Verified end-to-end in this
+# session (local mcp build + this steampipe image, `tools/call
+# steampipe_query` with `select 1` succeeded over the connection string
+# below). Copy this file to docker-compose.yml, create a .env file next to
+# it with:
 #
-#   openssl rand -hex 32
+#   STEAMPIPE_MCP_AUTH_TOKEN=<openssl rand -hex 32>
+#   STEAMPIPE_PASSWORD=<openssl rand -hex 20>
+#
+# then run `docker compose up`.
 #
 # See docs/remote-deployment.md for auth modes, Host/Origin validation, and
 # the threat model this setup relies on.
@@ -13,7 +19,20 @@ services:
     # time this file was written:
     #   docker manifest inspect ghcr.io/turbot/steampipe:latest
     image: ghcr.io/turbot/steampipe@sha256:0ef5375ffb284c3ea330781610e5d52ac9c954cd06a8d0b1154f9886b71e2de9
-    command: ["steampipe", "service", "start", "--foreground"]
+    # --database-password is required: Steampipe's pg_hba.conf only trusts
+    # "samehost" connections without a password; "mcp" reaches it over the
+    # docker network, so scram-sha-256 auth applies and a password is
+    # mandatory (verified: without --database-password, steampipe_query
+    # fails with "Database connection failed").
+    command:
+      [
+        "steampipe",
+        "service",
+        "start",
+        "--foreground",
+        "--database-password",
+        "${STEAMPIPE_PASSWORD:?set STEAMPIPE_PASSWORD, e.g. via openssl rand -hex 20}",
+      ]
     volumes:
       - ./steampipe-config:/home/steampipe/.steampipe/config
     networks:
@@ -21,16 +40,26 @@ services:
 
   mcp:
     image: ghcr.io/rafpe/steampipe-mcp:0.2.0
+    # 15s: the default `docker stop`/compose grace period is 10s, which
+    # would SIGKILL this container at almost the same moment its own 10s
+    # forced-close shutdown timeout (src/shutdown.ts) fires. Give it room to
+    # finish on its own; `docker compose stop -t 15 mcp` does the same for a
+    # one-off stop.
+    stop_grace_period: 15s
     environment:
       STEAMPIPE_MCP_AUTH_MODE: token
       # Required: set this to a token generated with `openssl rand -hex 32`
       # (at least 32 characters). Put it in a .env file next to this compose
       # file (STEAMPIPE_MCP_AUTH_TOKEN=...), never commit it.
       STEAMPIPE_MCP_AUTH_TOKEN: ${STEAMPIPE_MCP_AUTH_TOKEN:?set STEAMPIPE_MCP_AUTH_TOKEN, e.g. via openssl rand -hex 32}
-      # Steampipe's embedded postgres has no TLS, and "steampipe" (a docker
-      # network hostname) is not loopback, so TLS certificate verification -
-      # on by default for non-loopback hosts - must be explicitly disabled.
-      STEAMPIPE_MCP_WORKSPACE_DATABASE: postgresql://steampipe@steampipe:9193/steampipe?sslmode=disable
+      # Steampipe's embedded postgres does present TLS (hostssl in
+      # pg_hba.conf), but with a self-signed certificate; "steampipe" (a
+      # docker network hostname) is not loopback, so this server's default
+      # of verified TLS for non-loopback hosts fails with "self-signed
+      # certificate" unless sslmode is overridden here. sslmode=disable was
+      # verified to work; sslmode=no-verify also works if you want
+      # encryption without certificate verification.
+      STEAMPIPE_MCP_WORKSPACE_DATABASE: postgresql://steampipe:${STEAMPIPE_PASSWORD}@steampipe:9193/steampipe?sslmode=disable
     ports:
       - "27123:27123"
     depends_on:

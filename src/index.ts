@@ -16,10 +16,15 @@ let serverStartTime: Date;
 // Handle graceful shutdown: stop accepting HTTP requests first (when
 // serving HTTP), then close the database pool. `httpServer.close()` alone
 // can hang indefinitely on a connection that never drains (e.g. a client
-// holding the Streamable HTTP response open), so it is bounded by a
-// forced-close timeout (Task 9 / Task 5 review) well under typical
-// orchestrator termination deadlines (docker stop's default 10s, k8s's
-// default terminationGracePeriodSeconds of 30s).
+// holding the Streamable HTTP response open), so it is bounded by a 10s
+// forced-close timeout (Task 9 / Task 5 review). That matches - not safely
+// beats - docker's and docker compose's own default 10s stop grace period,
+// so a caller relying on the default would still have SIGKILL land at
+// roughly the same moment this timeout fires, with no guarantee the
+// `db.close()` step below ever runs. Deployments (see
+// docker-compose.example.yml) should raise their own stop timeout past 10s
+// (e.g. `docker stop -t 15`, or compose's `stop_grace_period: 15s`) so this
+// handler has room to finish on its own.
 function setupShutdownHandlers(db: DatabaseService, httpServer?: HttpServer) {
   const gracefulShutdown = async () => {
     if (httpServer) {

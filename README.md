@@ -106,19 +106,26 @@ refuses to start unless `STEAMPIPE_MCP_AUTH_MODE` is `token` or `google` (or
 Token mode, pointed at a Turbot Pipes workspace:
 
 ```sh
+TOKEN=$(openssl rand -hex 32)
 docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_AUTH_MODE=token \
-  -e STEAMPIPE_MCP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  -e STEAMPIPE_MCP_AUTH_TOKEN="$TOKEN" \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
   ghcr.io/rafpe/steampipe-mcp:0.2.0
+echo "Token: $TOKEN"   # save this - you'll need it below
 ```
 
 Or bring your own Steampipe container with
-[`docker-compose.example.yml`](docker-compose.example.yml):
+[`docker-compose.example.yml`](docker-compose.example.yml) (verified
+end-to-end, including the database password Steampipe requires for
+non-loopback connections):
 
 ```sh
 cp docker-compose.example.yml docker-compose.yml
-echo "STEAMPIPE_MCP_AUTH_TOKEN=$(openssl rand -hex 32)" > .env
+{
+  echo "STEAMPIPE_MCP_AUTH_TOKEN=$(openssl rand -hex 32)"
+  echo "STEAMPIPE_PASSWORD=$(openssl rand -hex 20)"
+} > .env
 docker compose up -d
 ```
 
@@ -126,8 +133,13 @@ Connect Claude Code to either:
 
 ```sh
 claude mcp add --transport http steampipe http://localhost:27123/mcp \
-  --header "Authorization: Bearer <token>"
+  --header "Authorization: Bearer $TOKEN"
 ```
+
+Stop the container with a grace period longer than its 10s forced-close
+shutdown timeout, e.g. `docker stop -t 15 steampipe-mcp` (the compose example
+sets `stop_grace_period: 15s` for the same reason; docker/compose's own
+default stop grace period is 10s).
 
 See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
 mode, the threat model, and reverse-proxy/TLS guidance (the server itself

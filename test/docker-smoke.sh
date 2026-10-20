@@ -154,19 +154,22 @@ else
 fi
 
 log "docker stop timing (graceful shutdown)"
+# -t 15: the forced-close shutdown timeout in src/shutdown.ts is itself 10s,
+# so a 10s grace period (docker's default) would SIGKILL at roughly the same
+# moment that timeout fires. `docker stop`'s own exit code is 0 even when it
+# had to SIGKILL, so the real signal is the *container's* exit code: 0 means
+# the process's own SIGTERM handler ran gracefulShutdown() to completion
+# (process.exit(0)); a SIGKILL shows up as 137.
 stop_start=$(date +%s)
-if docker stop --time 20 "$MCP_CONTAINER" >/dev/null; then
-  stop_exit=0
-else
-  stop_exit=$?
-fi
+docker stop -t 15 "$MCP_CONTAINER" >/dev/null
 stop_end=$(date +%s)
 stop_duration=$((stop_end - stop_start))
-echo "docker stop took ${stop_duration}s (exit ${stop_exit})"
-if [ "$stop_exit" = "0" ] && [ "$stop_duration" -lt 15 ]; then
-  ok "docker stop exited 0 in ${stop_duration}s (<15s)"
+container_exit_code="$(docker inspect --format='{{.State.ExitCode}}' "$MCP_CONTAINER")"
+echo "docker stop took ${stop_duration}s, container exit code ${container_exit_code}"
+if [ "$container_exit_code" = "0" ] && [ "$stop_duration" -lt 15 ]; then
+  ok "container exited 0 (graceful) in ${stop_duration}s (<15s)"
 else
-  bad "docker stop exited ${stop_exit} in ${stop_duration}s"
+  bad "container exit code ${container_exit_code} after ${stop_duration}s (expected 0, graceful)"
 fi
 
 log "starting mcp image with AUTH_MODE unset (expect non-zero exit)"
