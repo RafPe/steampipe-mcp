@@ -73,7 +73,7 @@ STEAMPIPE_MCP_TRANSPORT=http npx -y @turbot/steampipe-mcp
 # Streamable HTTP server listening on http://127.0.0.1:27123/mcp
 ```
 
-The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database. In HTTP mode the `steampipe://status` resource never includes the connection string.
+The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string.
 
 Built-in protections:
 

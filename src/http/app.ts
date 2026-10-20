@@ -74,15 +74,23 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * gets its own `Server` and transport, with no session IDs, so nothing is
  * shared between requests except the `db` pool.
  *
- * Middleware order: Host validation, Origin validation, JSON body parsing
- * (capped at `maxBodyBytes`), then `extraMiddleware` scoped to the MCP route
- * only, so `/healthz` (and later well-known metadata routes) stay reachable
- * without auth, while route guards still see the parsed body.
+ * Middleware order: `GET /healthz` first (R14: static, no DB, so probes
+ * that send a pod IP or `localhost` as Host still pass), then Host
+ * validation, Origin validation, JSON body parsing (capped at
+ * `maxBodyBytes`), then `extraMiddleware` scoped to the MCP route only, so
+ * later well-known metadata routes stay reachable without auth, while route
+ * guards still see the parsed body.
  */
 export function buildHttpApp(cfg: ServerConfig, db: DatabaseService, extraMiddleware: RequestHandler[] = []): Express {
   const { http } = cfg;
   const app = express();
   app.disable("x-powered-by");
+
+  // Mounted before Host/Origin validation (R14): it returns only static
+  // data, so a DNS-rebinding or cross-origin read of it gains nothing.
+  app.get("/healthz", (_req, res) => {
+    res.status(200).json({ status: "ok" });
+  });
 
   const hostCheck = hostValidation(http);
   if (hostCheck) {
@@ -95,10 +103,6 @@ export function buildHttpApp(cfg: ServerConfig, db: DatabaseService, extraMiddle
   }
   app.use(originValidation(http.allowedOrigins));
   app.use(express.json({ limit: http.maxBodyBytes }));
-
-  app.get("/healthz", (_req, res) => {
-    res.status(200).json({ status: "ok" });
-  });
 
   app.post(http.path, ...extraMiddleware, async (req, res) => {
     // express.json() only parses application/json. Refuse anything it
