@@ -106,11 +106,14 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * in a backoff (R16). jose retries a cold or stale cache on every request,
  * so without this each request during a JWKS outage would wait for its own
  * failing fetch. After a failure (a throw, a non-200 answer, or a 200 whose
- * body is not a JSON object with a `keys` array of objects) every call is refused with
- * `issuer_unavailable` and no network I/O until a window has passed: 1 s, doubling after each further failure up to 60 s (the retry
+ * body is not a JSON object with a `keys` array of objects) every call is
+ * refused with `issuer_unavailable` and no network I/O until a window has
+ * passed: 1 s, doubling after each further failure up to 60 s (the retry
  * loader's schedule, without jitter). The first call after the window
- * fetches again (jose merges concurrent reloads into that one); a usable 200
- * resets the schedule.
+ * fetches again, and calls made while that fetch is in flight share it (each
+ * gets its own copy of the response), so a burst sends one probe and counts
+ * as at most one failure. A usable 200 resets the schedule. Each issuer has
+ * its own wrapper, so one issuer's outage never gates another's fetches.
  *
  * The gate sits on the fetch, not on the key resolver, so while jose's
  * cached JWKS is fresh (`cacheMaxAge`, 10 minutes by default) tokens whose
@@ -134,10 +137,7 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
       `JWKS fetch for ${origin} failed (${plural(failures, "consecutive failure")}, cause: ${cause}); backing off ${delay}ms`,
     );
   };
-  return async (input, init) => {
-    if (failures > 0 && now() < retryAt) {
-      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
-    }
+  const probe = async (input: Parameters<typeof fetch>[0], init?: RequestInit): Promise<Response> => {
     let res: Response;
     try {
       res = await fetchImpl(input, init);
@@ -167,6 +167,22 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
       failed(res.status === 200 ? "invalid key set" : `HTTP ${res.status}`);
     }
     return res;
+  };
+  // One fetch at a time: concurrent callers share the in-flight one, so a
+  // burst at the end of a window sends a single probe and counts as a single
+  // failure. jose already merges its own reloads; this does not rely on it.
+  let inFlight: Promise<Response> | undefined;
+  return async (input, init) => {
+    if (failures > 0 && now() < retryAt) {
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+    }
+    if (!inFlight) {
+      inFlight = probe(input, init).finally(() => {
+        inFlight = undefined;
+      });
+    }
+    // Each caller reads its own copy of the (buffered) body.
+    return (await inFlight).clone();
   };
 }
 

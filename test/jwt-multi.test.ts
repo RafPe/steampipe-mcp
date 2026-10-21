@@ -68,12 +68,12 @@ interface App {
 async function startMulti(
   entries: unknown[],
   env: Record<string, string> = {},
-  o: { audit?: boolean } = {},
+  o: { audit?: boolean; now?: () => number } = {},
 ): Promise<App> {
   const rejects: RejectEvent[] = [];
   const cfg = loadConfig(multiEnv(entries, env), ["node", "index.js"]);
   const { rootRouters, mcpMiddleware } = await authMiddleware(cfg, {
-    now: () => NOW_MS,
+    now: o.now ?? (() => NOW_MS),
     ...(o.audit ? {} : { onReject: (e: RejectEvent) => rejects.push(e) }),
   });
   const app = buildHttpApp(cfg, fakeDb(), mcpMiddleware, rootRouters);
@@ -334,6 +334,62 @@ describe("jwt multi-issuer: per-issuer fetch policy", () => {
     await expect(start({ STEAMPIPE_MCP_JWT_ALLOWED_HOSTS: "b.example" })).resolves.toBeUndefined();
     // Startup validates jwks_uri without fetching keys (they load on first use).
     expect(fetched.filter((u) => u.startsWith(`${B}/keys`))).toEqual([]);
+  });
+});
+
+describe("jwt multi-issuer: per-issuer JWKS backoff (R16)", () => {
+  it("backs off only the failing issuer: B is served and fetched inside A's window, A recovers on its own", async () => {
+    let clock = NOW_MS;
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer }, { issuer: b.issuer }], {}, { now: () => clock });
+    a.setJwksFailing(true);
+
+    // A's cold-cache fetch fails and opens A's 1 s window.
+    await expectRejected(app, await a.sign(claims(a.issuer)), "issuer_unavailable", 503);
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([1, 0]);
+
+    // Inside A's window: B's cold cache is fetched exactly once and B is served.
+    clock += 500;
+    await expectAccepted(app, await b.sign(claims(b.issuer)));
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([1, 1]);
+    // A still fails fast, with no extra A fetch.
+    await expectRejected(app, await a.sign(claims(a.issuer)), "issuer_unavailable", 503);
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([1, 1]);
+
+    // A's window ends: A recovers with one fetch; B is untouched.
+    a.setJwksFailing(false);
+    clock += 500;
+    await expectAccepted(app, await a.sign(claims(a.issuer)));
+    await expectAccepted(app, await b.sign(claims(b.issuer)));
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([2, 1]);
+  });
+
+  it("keeps B's own window when A recovers", async () => {
+    let clock = NOW_MS;
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer }, { issuer: b.issuer }], {}, { now: () => clock });
+    a.setJwksFailing(true);
+    await expectRejected(app, await a.sign(claims(a.issuer)), "issuer_unavailable", 503);
+
+    // B fails 500 ms later, so its window ends at +1500 ms, after A's.
+    clock += 500;
+    b.setJwksFailing(true);
+    await expectRejected(app, await b.sign(claims(b.issuer)), "issuer_unavailable", 503);
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([1, 1]);
+
+    // At +1000 ms A recovers; B, still inside its own window, is not fetched.
+    a.setJwksFailing(false);
+    b.setJwksFailing(false);
+    clock += 500;
+    await expectAccepted(app, await a.sign(claims(a.issuer)));
+    await expectRejected(app, await b.sign(claims(b.issuer)), "issuer_unavailable", 503);
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([2, 1]);
+
+    clock += 500;
+    await expectAccepted(app, await b.sign(claims(b.issuer)));
+    expect([a.jwksRequests(), b.jwksRequests()]).toEqual([2, 2]);
   });
 });
 

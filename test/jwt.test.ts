@@ -548,6 +548,32 @@ describe("jwt: issuer reachability", () => {
 });
 
 describe("jwt: JWKS backoff during an outage (R16)", () => {
+  it("sends one probe for 10 concurrent requests at the window boundary, and answers them all alike", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    iss.setJwksFailing(true);
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    // Window over, JWKS still down: one probe, ten 503s, and the window doubles.
+    clock += 1000;
+    let replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(503));
+    expect(iss.jwksRequests()).toBe(2);
+    clock += 1999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+
+    // Window over again, JWKS back: one probe, ten 200s.
+    iss.setJwksFailing(false);
+    clock += 1;
+    replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(200));
+    expect(iss.jwksRequests()).toBe(3);
+  });
+
   it("fails fast inside the window, doubles it, and serves again after recovery", async () => {
     let clock = NOW_MS;
     const iss = await issuerFor();
@@ -729,6 +755,48 @@ describe("jwksBackoff", () => {
       expect(await outcome(gated)).toBe(200);
       expect(f.calls()).toBe(2);
     }
+  });
+
+  /** A fetch whose answers the test releases by hand, counting calls. */
+  function heldFetch() {
+    const release: Array<(r: Response) => void> = [];
+    const impl = vi.fn(() => new Promise<Response>((resolve) => release.push(resolve)));
+    return { impl: impl as unknown as typeof fetch, calls: () => impl.mock.calls.length, release };
+  }
+
+  it("shares one in-flight probe between concurrent calls; a failed probe doubles the window once", async () => {
+    let clock = 0;
+    const f = heldFetch();
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
+    const first = outcome(gated);
+    f.release[0](new Response("down", { status: 503 }));
+    expect(await first).toBe(503); // window 1 s
+    clock = 1000;
+    const probes = Array.from({ length: 10 }, () => outcome(gated));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(f.calls()).toBe(2);
+    f.release[1](new Response("down", { status: 503 }));
+    expect(await Promise.all(probes)).toEqual(Array(10).fill(503));
+    // Counted as one failure: the window is 2 s, not 2^10 s capped to 60 s.
+    clock = 2999;
+    expect(await outcome(gated)).toBeInstanceOf(VerifyError);
+    clock = 3000;
+    const last = outcome(gated);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(f.calls()).toBe(3);
+    f.release[2](new Response('{"keys":[]}', { status: 200 }));
+    expect(await last).toBe(200);
+  });
+
+  it("hands every concurrent caller its own readable copy of a successful probe", async () => {
+    const f = heldFetch();
+    const gated = jwksBackoff(f.impl, ORIGIN, () => 0);
+    const calls = Array.from({ length: 10 }, () => gated(new URL("https://idp.example/tenant-x/jwks")));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(f.calls()).toBe(1);
+    f.release[0](new Response('{"keys":[{"kty":"RSA"}]}', { status: 200 }));
+    const bodies = await Promise.all((await Promise.all(calls)).map((r) => r.json()));
+    expect(bodies).toEqual(Array(10).fill({ keys: [{ kty: "RSA" }] }));
   });
 
   it("doubles from 1 s and caps the window at 60 s", async () => {
