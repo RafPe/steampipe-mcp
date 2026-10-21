@@ -1,6 +1,7 @@
 import { isLoopback } from "./services/ssl.js";
 import type { DatabaseOptions } from "./services/database.js";
 import { parsePolicyConfig, type PolicyConfig } from "./config/policy.js";
+import { isEmptyPolicy } from "./auth/policy.js";
 
 const PREFIX = "STEAMPIPE_MCP_";
 
@@ -243,6 +244,29 @@ function parseAuthMode(env: NodeJS.ProcessEnv): "none" | "token" | "google" {
 }
 
 /**
+ * R6: a policy is only worth configuring if something enforces it. Only
+ * google mode does; in none or token mode it would be silently ignored, so
+ * refuse to start instead. Names the variables that are set, never their
+ * values.
+ */
+function assertPolicyEnforceable(policy: PolicyConfig, authMode: ServerConfig["auth"]["mode"]): void {
+  if (isEmptyPolicy(policy) || authMode === "google") {
+    return;
+  }
+  const names = [
+    Object.keys(policy.requiredClaims).length > 0 && "REQUIRED_CLAIMS",
+    policy.allowedSubjects.size > 0 && "ALLOWED_SUBJECTS",
+    policy.subjectPrefixes.length > 0 && "SUBJECT_PREFIXES",
+  ]
+    .filter((name): name is string => name !== false)
+    .map((name) => `${PREFIX}${name}`);
+  throw new ConfigError(
+    `${names.join(", ")} set, but ${PREFIX}AUTH_MODE=${authMode} cannot enforce an identity policy; ` +
+      `use ${PREFIX}AUTH_MODE=google or unset the policy`,
+  );
+}
+
+/**
  * Load and validate the full server configuration from the environment and
  * argv in one place. Defaults are safe-by-default: a non-loopback HTTP bind
  * is refused unless auth is enabled or `ALLOW_INSECURE_REMOTE` is set, and a
@@ -293,6 +317,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   if (transport === "http") {
     assertPublicUrlIsSecure(publicUrl);
     policy = parsePolicyConfig(env);
+    assertPolicyEnforceable(policy, authMode);
 
     if (authMode === "token") {
       if (!token || token.length < MIN_AUTH_TOKEN_LENGTH) {
