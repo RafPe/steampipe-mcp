@@ -1,5 +1,6 @@
 import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from "../services/logger.js";
+import { errorText } from "../services/logbound.js";
 import { DatabaseService } from "../services/database.js";
 
 export const tool: Tool & {
@@ -41,7 +42,7 @@ export const tool: Tool & {
         }]
       };
     } catch (err) {
-      logger.error("Error listing plugins:", err);
+      logger.error("Error listing plugins:", errorText(err));
       return {
         content: [{
           type: "text",

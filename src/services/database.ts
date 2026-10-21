@@ -1,4 +1,4 @@
-import { boundForLog } from "./logbound.js";
+import { errorText } from "./logbound.js";
 import { logger } from "./logger.js";
 import { resolveSsl } from "./ssl.js";
 import { readFileSync } from 'fs';
@@ -89,11 +89,6 @@ export interface UserQueryResult {
 
 // Rows fetched per cursor read when reading without a row cap
 const CURSOR_BATCH_SIZE = 1000;
-
-/** Driver error text can echo server- or query-supplied strings, so bound it before logging. */
-function errorText(error: unknown): string {
-  return boundForLog(error instanceof Error ? error.message : error);
-}
 
 export class DatabaseService {
   private pool: PoolType | null = null;

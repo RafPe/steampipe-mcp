@@ -1,6 +1,7 @@
 import { DatabaseService } from "../services/database.js";
 import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from "../services/logger.js";
+import { errorText } from "../services/logbound.js";
 
 export const tool: Tool & {
   handler: (db: DatabaseService, args: { name: string; schema?: string }) => Promise<ServerResult>;
@@ -123,7 +124,7 @@ export const tool: Tool & {
         }]
       };
     } catch (err) {
-      logger.error("Error showing table details:", err);
+      logger.error("Error showing table details:", errorText(err));
       return {
         content: [{
           type: "text",

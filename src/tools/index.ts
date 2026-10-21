@@ -3,6 +3,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolRequest, ty
 import { DatabaseService } from "../services/database.js";
 import AjvModule, { type ValidateFunction } from "ajv";
 import { logger } from "../services/logger.js";
+import { boundForLog, errorText } from "../services/logbound.js";
 
 // Import tools
 import { tool as queryTool } from './steampipe_query.js';
@@ -65,7 +66,8 @@ export function setupTools(server: Server, db: DatabaseService) {
       const validate = validators[name];
       if (validate) {
         if (!validate(args)) {
-          logger.error(`Invalid arguments for tool ${name}:`, validate.errors);
+          // Diagnostics echo client-chosen argument keys and values, so bound them
+          logger.error(`Invalid arguments for tool ${boundForLog(name)}:`, boundForLog(JSON.stringify(validate.errors), 512));
           
           // Format validation errors in a user-friendly way
           const errors = validate.errors || [];
@@ -98,7 +100,8 @@ export function setupTools(server: Server, db: DatabaseService) {
       // Call the tool handler with database
       return await (tool as DbTool).handler(db, args);
     } catch (error) {
-      logger.error('Error executing tool:', error);
+      // The message can echo the client-supplied tool name, so bound it
+      logger.error('Error executing tool:', errorText(error));
       return {
         content: [{
           type: "text",

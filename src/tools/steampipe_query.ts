@@ -1,6 +1,7 @@
 import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { DatabaseService } from "../services/database.js";
 import { logger } from "../services/logger.js";
+import { errorText } from "../services/logbound.js";
 
 export const tool: Tool & {
   handler: (db: DatabaseService | undefined, args: { sql: string }) => Promise<ServerResult>;
@@ -43,7 +44,7 @@ export const tool: Tool & {
         isError: false
       };
     } catch (error) {
-      logger.error('Error executing query:', error);
+      logger.error('Error executing query:', errorText(error));
       return {
         content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }],
         isError: true
