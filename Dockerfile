@@ -42,7 +42,10 @@ EXPOSE 27123
 # node:22-alpine ships a built-in, unprivileged "node" user (uid 1000).
 USER node
 
+# Follows STEAMPIPE_MCP_HTTP_PORT so overriding the port at run time keeps the
+# container healthy. 127.0.0.1 is fine whatever the bind: /healthz bypasses
+# the Host and Origin checks.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD node -e "fetch('http://127.0.0.1:27123/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "fetch('http://127.0.0.1:'+(process.env.STEAMPIPE_MCP_HTTP_PORT||27123)+'/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
 ENTRYPOINT ["node", "dist/index.js"]

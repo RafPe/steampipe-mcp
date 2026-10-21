@@ -44,6 +44,30 @@ jobs:
           labels: |
             org.opencontainers.image.source=https://github.com/RafPe/steampipe-mcp
 
+      # Pre-push gate (R21): build linux/amd64 into the local Docker daemon
+      # (no push) and Trivy-scan it, so a CRITICAL finding fails the release
+      # before any tag (including "latest") is published. Only amd64 can be
+      # loaded and scanned here; arm64 is scanned after the push below.
+      - name: Build image for pre-push scan (linux/amd64, no push)
+        uses: docker/build-push-action@v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: steampipe-mcp:prepush-scan
+          cache-from: type=gha
+
+      - name: Scan local image with Trivy before push (linux/amd64)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: steampipe-mcp:prepush-scan
+          format: table
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          version: v0.70.0
+
       - name: Build and push
         id: build
         uses: docker/build-push-action@v7.4.0
@@ -56,6 +80,11 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Post-push scans. The arm64 image can only be scanned once pushed, so
+      # a CRITICAL failure here means the git tag and the image tags
+      # (including "latest") are ALREADY PUBLIC: delete the git tag and the
+      # affected GHCR image versions, fix, and re-release.
+      #
       # Scans the exact pushed manifest by digest (not a tag, which could
       # later move), so what is scanned is what was published. The digest
       # output is a manifest-list digest (linux/amd64 + linux/arm64); without
