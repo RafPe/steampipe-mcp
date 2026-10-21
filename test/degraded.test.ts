@@ -16,7 +16,7 @@ import { fetchGoogleMetadata } from "../src/auth/google.js";
 import { buildHttpApp } from "../src/http/app.js";
 import { buildReadiness } from "../src/http/ready.js";
 import { gracefulShutdown } from "../src/shutdown.js";
-import { serveHttp } from "../src/http/compose.js";
+import { composeHttp, serveHttp } from "../src/http/compose.js";
 import { EventEmitter } from "node:events";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
@@ -1038,5 +1038,69 @@ describe("readiness groups outside jwt degraded start", () => {
     auths.push(auth);
     expect(auth.readiness.map((c) => c.name)).toEqual(["auth"]);
     expect(auth.readiness[0]).not.toHaveProperty("group");
+  });
+});
+
+describe("jwt discovery diagnostics never carry an issuer path (Codex I-3)", () => {
+  const SECRET = "tenant-secret";
+
+  /** Every argument of every logger call, joined. */
+  function everythingLogged(): string {
+    return [...warn.mock.calls, ...info.mock.calls, ...error.mock.calls].flat().map(String).join("\n");
+  }
+
+  /** A loopback port nothing listens on, so a request to it is refused. */
+  async function closedPort(): Promise<number> {
+    const s = createNodeServer();
+    await new Promise<void>((resolve) => s.listen(0, "127.0.0.1", () => resolve()));
+    const port = (s.address() as AddressInfo).port;
+    await new Promise((resolve) => s.close(resolve));
+    return port;
+  }
+
+  /** Issuer #2 fails discovery three ways: 404 on both URLs, a mismatched issuer, a refused connection. */
+  async function failingIssuers(): Promise<Array<[string, string]>> {
+    const notFound = await issuerFor();
+    const mismatch = await issuerFor({ path: `/${SECRET}`, discoveryIssuer: (i) => `${i}/other` });
+    return [
+      ["404", `${notFound.issuer}/${SECRET}`],
+      ["issuer mismatch", mismatch.issuer],
+      ["refused", `http://127.0.0.1:${await closedPort()}/${SECRET}`],
+    ];
+  }
+
+  it("names the issuer by position and origin in the startup error and its log line", async () => {
+    const good = await issuerFor();
+    for (const [name, issuer] of await failingIssuers()) {
+      error.mockClear();
+      const cfg = jwtConfig([{ issuer: good.issuer }, { issuer }]);
+      const failure = await composeHttp(cfg, newDb(), { now: () => NOW_MS }).then(
+        () => undefined,
+        (e: unknown) => e as Error,
+      );
+      expect(failure, name).toBeInstanceOf(Error);
+      expect(failure?.message, name).toContain(`JWT issuer #2 (${new URL(issuer).origin})`);
+      expect(failure?.message, name).not.toContain(SECRET);
+      expect(error, name).toHaveBeenCalledTimes(1);
+      expect(everythingLogged(), name).toContain(`JWT issuer #2 (${new URL(issuer).origin})`);
+      expect(everythingLogged(), name).not.toContain(SECRET);
+    }
+  });
+
+  it("keeps the path out of every degraded-start retry line, the cause argument included", async () => {
+    const good = await issuerFor();
+    for (const [name, issuer] of await failingIssuers()) {
+      warn.mockClear();
+      const s = manualSleep();
+      await buildJwt(jwtConfig([{ issuer: good.issuer }, { issuer }], DEGRADED), s);
+      await vi.waitFor(() => expect(s.delays).toHaveLength(1));
+      await s.release();
+      await vi.waitFor(() => expect(s.delays).toHaveLength(2));
+      const lines = warn.mock.calls.filter((c) => String(c[0]).startsWith("JWT issuer #2"));
+      expect(lines, name).toHaveLength(2);
+      expect(lines[0][0], name).toContain(`JWT issuer #2 (${new URL(issuer).origin}) discovery failed (attempt 1)`);
+      expect(String(lines[0][1]), name).toMatch(/discovery failed/);
+      expect(everythingLogged(), name).not.toContain(SECRET);
+    }
   });
 });

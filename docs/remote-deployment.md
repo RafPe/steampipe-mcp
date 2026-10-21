@@ -525,8 +525,9 @@ A token is accepted only if all of these hold:
 
 A rejected token gets `401` with `error="invalid_token"`. If the JWKS cannot
 be fetched, requests get `503` with `Retry-After: 5`. After a failed JWKS fetch
-(a connection error, a timeout, a non-`200` answer, or a `200` that is not a
-JSON key set) the server backs off for that issuer: for 1 s, doubling after each
+(a connection error, a timeout, a non-`200` answer, a `200` that is not a JSON
+key set, or a `200` with a signing key that cannot be used) the server backs off
+for that issuer: for 1 s, doubling after each
 further failure up to 60 s, requests that would need a JWKS fetch get `503` at
 once without contacting the issuer, then the next such request tries again. A
 successful fetch ends the backoff. Tokens whose key is cached are not affected
@@ -535,7 +536,12 @@ once it is stale, every request needs a refetch and gets `503` until the JWKS
 is back. Each backoff window logs one warning with the issuer's origin (never
 its path), the consecutive failure count, the next delay and the cause, and the
 first successful fetch after failures logs one info line (see Logging in the
-README).
+README). A signing key that cannot be used (key data that does not import, such
+as RSA without `n`/`e`, EC without `x`/`y` or an unknown `key_ops` entry, a
+private key, or an RSA modulus under 2048 bits) is treated the same way: tokens that need it get `503`, never
+`500`, and once the backoff window is over the next such request fetches the
+JWKS again, so a repaired JWKS is picked up then rather than when the cache
+expires. Other keys in the same JWKS keep working.
 
 **Key rotation.** The JWKS is cached. A token whose `kid` is not in the cache
 triggers a refetch, at most once per `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S`
@@ -596,7 +602,8 @@ token claiming one issuer but signed by another fails its signature check. A
 token whose `iss` matches no entry is refused (`401`) without any network call.
 Every issuer is discovered at startup, each with its own fetch policy (its own
 host plus `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`), and the server refuses to start if
-any discovery fails, unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`. Then it
+any discovery fails, naming the issuer as `JWT issuer #<n> (<origin>)` (never
+its path), unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`. Then it
 starts anyway and retries each failed issuer's discovery in the background (1 s
 doubling to 60 s, ±20% jitter). Until an issuer has been discovered, its tokens
 get `503` with `Retry-After: 5`, it is left out of `authorization_servers` (the

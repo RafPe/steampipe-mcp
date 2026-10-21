@@ -27,6 +27,8 @@ export interface TestIssuer {
   issuer: string;
   /** Current signing key id. */
   kid(): string;
+  /** The current public key as published in the JWKS (with kid, alg and use). */
+  publicJwk(): JWK;
   /** PEM (SPKI) of the current public key, for algorithm-confusion tests. */
   publicKeyPem(): Promise<string>;
   /**
@@ -42,6 +44,8 @@ export interface TestIssuer {
   setDiscoveryFailing(on: boolean): void;
   /** `true` drops the connection; a number answers with that HTTP status. */
   setJwksFailing(on: boolean | number): void;
+  /** Serve `{"keys": keys}` at /jwks instead of the real keys; `undefined` restores them. */
+  setJwksKeys(keys: object[] | undefined): void;
   close(): Promise<void>;
 }
 
@@ -66,6 +70,7 @@ export async function startTestIssuer(opts: TestIssuerOptions = {}): Promise<Tes
   let jwksCount = 0;
   let discoveryFailing = false;
   let jwksFailing: boolean | number = false;
+  let jwksKeys: object[] | undefined;
 
   async function newKey(): Promise<Key> {
     const { privateKey, publicKey } = await generateKeyPair(alg, { extractable: true });
@@ -110,7 +115,7 @@ export async function startTestIssuer(opts: TestIssuerOptions = {}): Promise<Tes
         json(jwksFailing, { error: "unavailable" });
         return;
       }
-      json(200, { keys: keys.map((k) => k.jwk) });
+      json(200, { keys: jwksKeys ?? keys.map((k) => k.jwk) });
       return;
     }
     json(404, { error: "not_found" });
@@ -122,6 +127,7 @@ export async function startTestIssuer(opts: TestIssuerOptions = {}): Promise<Tes
   return {
     issuer,
     kid: () => current.kid,
+    publicJwk: () => ({ ...current.jwk }),
     async publicKeyPem() {
       return createPublicKey({ key: current.jwk as never, format: "jwk" })
         .export({ type: "spki", format: "pem" })
@@ -155,6 +161,9 @@ export async function startTestIssuer(opts: TestIssuerOptions = {}): Promise<Tes
     },
     setJwksFailing(on) {
       jwksFailing = on;
+    },
+    setJwksKeys(k) {
+      jwksKeys = k;
     },
     async close() {
       server.closeAllConnections();

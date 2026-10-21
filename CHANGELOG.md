@@ -16,6 +16,11 @@ _Behaviour changes_
 * The audit line gains an `iss` field when the principal has an issuer (jwt mode), bounded like the other token-derived fields.
 * Rejected auth attempts (`auth_reject` audit lines) are now also written in `jwt` mode. Once a token has been routed to a configured issuer, the line carries that issuer (the configured string, never an unverified value) as `iss`; a token whose `iss` is missing or unconfigured gets none.
 
+_Fixes_
+
+* `jwt` mode: a JWKS key with the right shape but unusable key material (RSA without `n`/`e` or with an `n` that is not a string, EC without `x`/`y` or off the curve, OKP without `x`, an unknown `key_ops` entry, a private key, or an RSA modulus under 2048 bits) answered `500` for every token that selected it, and kept doing so after the issuer repaired its JWKS until jose's 10-minute cache expired. Such a key now answers `503` (`issuer_unavailable`) with `Retry-After: 5`, the JWKS counts as a failed fetch for the backoff (cause `invalid key material`), and once the window is over the next such request fetches the JWKS again, so a repaired JWKS is served within one retry. Other keys in the same JWKS keep working from the cache.
+* `jwt` mode: discovery diagnostics no longer contain issuer or discovery URL paths, which can carry a tenant ID or reveal an unadvertised issuer. The startup error (and its log line) now names the failing issuer as `JWT issuer #<n> (<origin>)`, like the degraded-start retry lines, and the discovery error itself names each metadata document by kind (`OpenID Connect metadata`, `RFC 8414 metadata`) with an HTTP status, a restricted-fetch refusal cause, `names a different issuer` or a fixed phrase as the cause.
+
 ## 0.3.1 [2026-10-21]
 
 _Fixes_

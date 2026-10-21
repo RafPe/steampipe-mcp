@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { generateKeyPairSync } from "node:crypto";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
-import { createLocalJWKSet, createRemoteJWKSet, errors, generateKeyPair, type JWTVerifyGetKey } from "jose";
+import { createLocalJWKSet, createRemoteJWKSet, errors, exportJWK, generateKeyPair, type JWTVerifyGetKey } from "jose";
 import { authMiddleware } from "../src/auth/index.js";
 import type { RejectEvent } from "../src/auth/bearer.js";
 import { VerifyError, type Reason } from "../src/auth/errors.js";
-import { createJwtVerifier, jwksBackoff, type IssuerConfig } from "../src/auth/jwt.js";
+import { createJwtVerifier, jwksBackoff, reloadOnUnusableKeys, type IssuerConfig, type JwksFetch, type RemoteKeySet } from "../src/auth/jwt.js";
 import { discoverJwks } from "../src/auth/discovery.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, FetchRefused, type FetchPolicy } from "../src/auth/fetch-guard.js";
 import { ConfigError, loadConfig, type ServerConfig } from "../src/config.js";
@@ -623,6 +624,188 @@ describe("jwt: JWKS backoff during an outage (R16)", () => {
   });
 });
 
+// A JWKS entry of the right shape whose key cannot be used: missing or
+// invalid key data, a private key, or an RSA modulus under 2048 bits. Each
+// keeps the issuer's kid and alg, so the token selects it.
+const ZERO_COORD = Buffer.alloc(32).toString("base64url");
+
+async function brokenRsaKeys(iss: TestIssuer): Promise<Array<[string, object]>> {
+  const { kid, alg } = iss.publicJwk();
+  const { privateKey } = await generateKeyPair("RS256", { extractable: true });
+  const small = generateKeyPairSync("rsa", { modulusLength: 1024 }).publicKey.export({ format: "jwk" });
+  return [
+    ["RSA without n and e", { kty: "RSA", kid, alg, use: "sig" }],
+    ["a private RSA key", { ...(await exportJWK(privateKey)), kid, alg, use: "sig" }],
+    ["a 1024-bit RSA key", { ...small, kid, alg, use: "sig" }],
+    // Both fail in Web Crypto with a TypeError, not a DOMException (Codex round 2).
+    ["RSA with an unknown key_ops entry", { ...iss.publicJwk(), key_ops: ["verify", "bogus"] }],
+    ["RSA with an n that cannot become a string", { ...iss.publicJwk(), n: { toString: null } }],
+  ];
+}
+
+function brokenEcKeys(iss: TestIssuer): Array<[string, object]> {
+  const { kid, alg, crv } = iss.publicJwk();
+  return [
+    ["EC without x and y", { kty: "EC", crv, kid, alg, use: "sig" }],
+    ["EC with a point off the curve", { kty: "EC", crv, x: ZERO_COORD, y: ZERO_COORD, kid, alg, use: "sig" }],
+  ];
+}
+
+describe("jwt: unusable JWKS key material (Codex I-1)", () => {
+  function collected(pattern: RegExp): string[] {
+    return logger.getCollectedLogs().filter((line) => pattern.test(line));
+  }
+
+  it("answers 503 issuer_unavailable, never 500, and backs off: no refetch inside the window", async () => {
+    for (const alg of ["RS256", "ES256"] as const) {
+      const probe = await issuerFor({ alg });
+      const variants = alg === "RS256" ? await brokenRsaKeys(probe) : brokenEcKeys(probe);
+      for (const [name, jwk] of variants) {
+        let clock = NOW_MS;
+        const iss = await issuerFor({ alg });
+        iss.setJwksKeys([{ ...jwk, kid: iss.kid() }]);
+        const app = await startJwt(iss, {}, () => clock);
+        const token = await iss.sign(claims(iss));
+        const res = await toolsList(app.port, token);
+        expect(res.status, name).toBe(503);
+        expect(res.headers["retry-after"], name).toBe("5");
+        expect(app.rejects.map((e) => e.reason), name).toEqual(["issuer_unavailable"]);
+        expect(iss.jwksRequests(), name).toBe(1);
+        clock += 999;
+        await expectRejected(app, token, "issuer_unavailable", 503);
+        expect(iss.jwksRequests(), name).toBe(1);
+      }
+    }
+  });
+
+  it("picks up a repaired JWKS within one retry after the window, not after jose's 10-minute cache", async () => {
+    // Only the injected backoff clock moves: jose's cache, which reads the
+    // real Date, stays fresh throughout, so recovery cannot come from it.
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    iss.setJwksKeys([{ kty: "RSA", kid: iss.kid(), alg: "RS256", use: "sig" }]);
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    iss.setJwksKeys(undefined);
+    clock += 999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+    clock += 1;
+    await expectAccepted(app, token);
+    expect(iss.jwksRequests()).toBe(2);
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(2);
+  });
+
+  it("recovers from every unusable RSA shape once the issuer repairs its JWKS and the window is over", async () => {
+    const probe = await issuerFor();
+    for (const [name] of await brokenRsaKeys(probe)) {
+      let clock = NOW_MS;
+      const iss = await issuerFor();
+      const jwk = new Map(await brokenRsaKeys(iss)).get(name);
+      iss.setJwksKeys([jwk as object]);
+      const app = await startJwt(iss, {}, () => clock);
+      const token = await iss.sign(claims(iss));
+      const res = await toolsList(app.port, token);
+      expect(res.status, name).toBe(503);
+      expect(app.rejects.map((e) => e.reason), name).toEqual(["issuer_unavailable"]);
+      iss.setJwksKeys(undefined);
+      clock += 1000;
+      const healed = await toolsList(app.port, token);
+      expect(healed.status, name).toBe(200);
+      expect(iss.jwksRequests(), name).toBe(2);
+    }
+  });
+
+  it("counts a still-broken JWKS as a failed fetch: the window doubles, warns with a fixed cause, and only a usable set logs recovery", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor({ alg: "ES256" });
+    // Passes a shape check (crv, x and y present) and fails only on import.
+    const [, offCurve] = brokenEcKeys(iss)[1];
+    iss.setJwksKeys([offCurve]);
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    clock += 1000;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+    clock += 1999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+    clock += 1;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(3);
+
+    const origin = new URL(iss.issuer).origin;
+    expect(collected(/JWKS fetch/).map((l) => l.replace(/^\[[^\]]+\] /, ""))).toEqual([
+      `[WARN] JWKS fetch for ${origin} failed (1 consecutive failure, cause: invalid key material); backing off 1000ms`,
+      `[WARN] JWKS fetch for ${origin} failed (2 consecutive failures, cause: invalid key material); backing off 2000ms`,
+      `[WARN] JWKS fetch for ${origin} failed (3 consecutive failures, cause: invalid key material); backing off 4000ms`,
+    ]);
+
+    iss.setJwksKeys(undefined);
+    clock += 4000;
+    await expectAccepted(app, token);
+    expect(iss.jwksRequests()).toBe(4);
+    expect(collected(/recovered/)).toHaveLength(1);
+    expect(collected(/recovered/)[0]).toContain(`JWKS fetch for ${origin} recovered after 3 consecutive failures`);
+  });
+
+  it("sends one probe for 10 concurrent requests that hit unusable key material after the window", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    iss.setJwksKeys([{ kty: "RSA", kid: iss.kid(), alg: "RS256", use: "sig" }]);
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    clock += 1000;
+    let replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(503));
+    expect(iss.jwksRequests()).toBe(2);
+
+    iss.setJwksKeys(undefined);
+    clock += 2000;
+    replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(200));
+    expect(iss.jwksRequests()).toBe(3);
+  });
+
+  it("keeps serving a good key from a set where another key is unusable", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    iss.setJwksKeys([iss.publicJwk(), { kty: "RSA", kid: "broken", alg: "RS256", use: "sig" }]);
+    const app = await startJwt(iss, {}, () => clock);
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(1);
+    // A token naming the broken key cannot be checked: 503, not 500.
+    await expectRejected(app, await iss.sign(claims(iss), { kid: "broken" }), "issuer_unavailable", 503);
+    // Inside the window the good key still works from jose's cache.
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(1);
+  });
+
+  it("never lets a token header turn a healthy JWKS into a key-material failure", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, { STEAMPIPE_MCP_JWT_ALGORITHMS: "RS256,PS256,ES256" });
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    const { privateKey } = await generateKeyPair("PS256");
+    // The RSA kid with another RSA algorithm, and with an EC algorithm.
+    await expectRejected(app, await iss.sign(claims(iss), { alg: "PS256", key: privateKey }), "signature");
+    const ec = await generateKeyPair("ES256");
+    await expectRejected(app, await iss.sign(claims(iss), { alg: "ES256", key: ec.privateKey }), "signature");
+    expect(iss.jwksRequests()).toBe(1);
+    expect(collected(/JWKS fetch/)).toEqual([]);
+    await expectAccepted(app, await iss.sign(claims(iss)));
+  });
+});
+
 describe("jwksBackoff", () => {
   const ORIGIN = "https://idp.example";
 
@@ -757,6 +940,58 @@ describe("jwksBackoff", () => {
     }
   });
 
+  it("treats a 200 with a signing key jose cannot import as a failure (invalid key material)", async () => {
+    const rsa = await exportJWK((await generateKeyPair("RS256", { extractable: true })).publicKey);
+    const rsaPrivate = await exportJWK((await generateKeyPair("RS256", { extractable: true })).privateKey);
+    const ec = await exportJWK((await generateKeyPair("ES256", { extractable: true })).publicKey);
+    const ed = await exportJWK((await generateKeyPair("EdDSA", { crv: "Ed25519", extractable: true })).publicKey);
+    const small = generateKeyPairSync("rsa", { modulusLength: 1024 }).publicKey.export({ format: "jwk" });
+    const broken: Array<[string, object]> = [
+      ["RSA without n", { kty: "RSA", e: rsa.e }],
+      ["RSA without e", { kty: "RSA", n: rsa.n }],
+      ["a private RSA key", rsaPrivate],
+      ["a 1024-bit RSA key", small],
+      ["EC without x", { kty: "EC", crv: ec.crv, y: ec.y }],
+      ["EC without y", { kty: "EC", crv: ec.crv, x: ec.x }],
+      ["EC off the curve", { kty: "EC", crv: ec.crv, x: ZERO_COORD, y: ZERO_COORD }],
+      ["OKP without x", { kty: "OKP", crv: "Ed25519" }],
+      ["RSA with an unknown key_ops entry", { ...rsa, key_ops: ["verify", "bogus"] }],
+      ["RSA with an n that cannot become a string", { ...rsa, n: { toString: null } }],
+    ];
+    for (const [name, jwk] of broken) {
+      const warn = vi.spyOn(logger, "warn");
+      let clock = 0;
+      const f = fakeFetch([{ body: JSON.stringify({ keys: [rsa, { ...jwk, kid: "bad" }] }) }, 200]);
+      const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
+      expect(await outcome(gated), name).toBe(200); // handed to jose all the same
+      expect(warn.mock.calls.map((c) => c[0]), name).toEqual([
+        "JWKS fetch for https://idp.example failed (1 consecutive failure, cause: invalid key material); backing off 1000ms",
+      ]);
+      clock = 999;
+      expect(await outcome(gated), name).toBeInstanceOf(VerifyError);
+      expect(f.calls(), name).toBe(1);
+      warn.mockRestore();
+    }
+
+    // Keys jose never picks for a signature are not checked, and a set of
+    // good RSA, EC and Ed25519 keys is usable.
+    const ignored = [
+      { kty: "RSA", use: "enc" },
+      { kty: "RSA", key_ops: ["encrypt"] },
+      { kty: "RSA", alg: "RSA-OAEP" },
+      { kty: "oct", k: "c2VjcmV0" },
+      { kty: "unknown" },
+      { kid: "no-kty" },
+    ];
+    for (const keys of [[], [rsa, ec, ed], [rsa, ...ignored]]) {
+      const warn = vi.spyOn(logger, "warn");
+      const f = fakeFetch([{ body: JSON.stringify({ keys }) }]);
+      expect(await outcome(jwksBackoff(f.impl, ORIGIN, () => 0))).toBe(200);
+      expect(warn).not.toHaveBeenCalled();
+      warn.mockRestore();
+    }
+  });
+
   /** A fetch whose answers the test releases by hand, counting calls. */
   function heldFetch() {
     const release: Array<(r: Response) => void> = [];
@@ -794,9 +1029,9 @@ describe("jwksBackoff", () => {
     const calls = Array.from({ length: 10 }, () => gated(new URL("https://idp.example/tenant-x/jwks")));
     await new Promise((resolve) => setImmediate(resolve));
     expect(f.calls()).toBe(1);
-    f.release[0](new Response('{"keys":[{"kty":"RSA"}]}', { status: 200 }));
+    f.release[0](new Response('{"keys":[{"kid":"k1"}]}', { status: 200 }));
     const bodies = await Promise.all((await Promise.all(calls)).map((r) => r.json()));
-    expect(bodies).toEqual(Array(10).fill({ keys: [{ kty: "RSA" }] }));
+    expect(bodies).toEqual(Array(10).fill({ keys: [{ kid: "k1" }] }));
   });
 
   it("doubles from 1 s and caps the window at 60 s", async () => {
@@ -813,6 +1048,86 @@ describe("jwksBackoff", () => {
       expect(await outcome(gated)).toBe(503);
       expect(f.calls()).toBe(before + 1);
     }
+  });
+});
+
+describe("reloadOnUnusableKeys", () => {
+  const HEADER = { alg: "RS256", kid: "k" };
+
+  function fakes(results: Array<"bad" | "typeerror" | "nomatch" | "outage" | "ok">) {
+    const key = { type: "public" } as unknown as CryptoKey;
+    let calls = 0;
+    const keySet = Object.assign(
+      vi.fn(async () => {
+        const next = results[calls++];
+        if (next === "bad") throw new DOMException("Invalid keyData", "DataError");
+        if (next === "typeerror") throw new TypeError("Cannot convert object to primitive value");
+        if (next === "nomatch") throw new errors.JWKSNoMatchingKey();
+        if (next === "outage") throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+        return key;
+      }),
+      { reload: vi.fn(async () => {}) },
+    );
+    const gate = Object.assign(vi.fn(), { unusableKeys: vi.fn() });
+    const getKey = reloadOnUnusableKeys(keySet as unknown as RemoteKeySet, gate as unknown as JwksFetch);
+    return { key, keySet, gate, getKey };
+  }
+
+  it("reports unusable key material, reloads, and serves the same request from the reloaded set", async () => {
+    const f = fakes(["bad", "ok"]);
+    await expect(f.getKey(HEADER, undefined as never)).resolves.toBe(f.key);
+    expect(f.gate.unusableKeys).toHaveBeenCalledTimes(1);
+    expect(f.keySet.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports again and rethrows when the reloaded set is still unusable", async () => {
+    const f = fakes(["bad", "bad"]);
+    await expect(f.getKey(HEADER, undefined as never)).rejects.toBeInstanceOf(DOMException);
+    expect(f.gate.unusableKeys).toHaveBeenCalledTimes(2);
+    expect(f.keySet.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a TypeError from key import like any other unusable key material", async () => {
+    const f = fakes(["typeerror", "ok"]);
+    await expect(f.getKey(HEADER, undefined as never)).resolves.toBe(f.key);
+    expect(f.gate.unusableKeys).toHaveBeenCalledTimes(1);
+    expect(f.keySet.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes a token-caused refusal or a fetch failure straight through without a reload", async () => {
+    for (const [result, type] of [
+      ["nomatch", errors.JWKSNoMatchingKey],
+      ["outage", VerifyError],
+    ] as const) {
+      const f = fakes([result]);
+      await expect(f.getKey(HEADER, undefined as never)).rejects.toBeInstanceOf(type);
+      expect(f.gate.unusableKeys).not.toHaveBeenCalled();
+      expect(f.keySet.reload).not.toHaveBeenCalled();
+    }
+  });
+});
+
+describe("jwksBackoff: unusableKeys()", () => {
+  it("counts a failure for a set that looked usable, but never twice for one already counted", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    let clock = 0;
+    let body = '{"keys":[]}';
+    const gated = jwksBackoff((async () => new Response(body, { status: 200 })) as typeof fetch, "https://idp.example", () => clock);
+    await gated("https://idp.example/jwks");
+    gated.unusableKeys();
+    gated.unusableKeys();
+    expect(warn.mock.calls.map((c) => c[0])).toEqual([
+      "JWKS fetch for https://idp.example failed (1 consecutive failure, cause: invalid key material); backing off 1000ms",
+    ]);
+    await expect(gated("https://idp.example/jwks")).rejects.toBeInstanceOf(VerifyError);
+
+    body = '{"keys":[{"kty":"RSA","kid":"k"}]}';
+    clock = 1000;
+    await gated("https://idp.example/jwks"); // counted by the fetch: window 2 s
+    gated.unusableKeys();
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1][0]).toContain("2 consecutive failures, cause: invalid key material); backing off 2000ms");
+    warn.mockRestore();
   });
 });
 
@@ -1002,6 +1317,38 @@ describe("discoverJwks", () => {
     expect(Object.keys(d).sort()).toEqual(["issuer", "jwksUri"]);
   });
 
+  it("names neither discovery URL's path nor query in its errors: status, refusal cause or mismatch only (Codex I-3)", async () => {
+    const issuer = "https://idp.example.com/tenant-secret";
+    const answering = (res: () => Response) => (async () => res()) as unknown as typeof fetch;
+    const cases: Array<[typeof fetch, RegExp]> = [
+      [answering(() => new Response("nope", { status: 404 })), /OpenID Connect metadata answered 404; RFC 8414 metadata answered 404/],
+      [answering(() => new Response("<html>", { status: 200 })), /did not return JSON/],
+      [answering(() => Response.json({ issuer: `${issuer}/other`, jwks_uri: "https://idp.example.com/jwks" })), /names a different issuer/],
+      [
+        (async () => {
+          throw new FetchRefused("network", "request to https://idp.example.com failed");
+        }) as unknown as typeof fetch,
+        /OpenID Connect metadata refused \(network\); RFC 8414 metadata refused \(network\)/,
+      ],
+    ];
+    for (const [fetchImpl, expected] of cases) {
+      const failure = await discoverJwks(issuer, fetchImpl, policyFor(issuer)).catch((e: Error) => e);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/^Issuer discovery failed: /);
+      expect((failure as Error).message).toMatch(expected);
+      expect((failure as Error).message).not.toContain("tenant-secret");
+      expect((failure as Error).message).not.toContain("/.well-known");
+    }
+    // A jwks_uri refusal names its host at most, never the path.
+    const refused = await discoverJwks(
+      issuer,
+      answering(() => Response.json({ issuer, jwks_uri: "https://evil.example/tenant-secret/jwks" })),
+      policyFor(issuer),
+    ).catch((e: Error) => e);
+    expect(refused).toBeInstanceOf(FetchRefused);
+    expect((refused as Error).message).not.toContain("tenant-secret");
+  });
+
   it("rejects when neither discovery document is served", async () => {
     const iss = await issuerFor();
     iss.setDiscoveryFailing(true);
@@ -1054,6 +1401,17 @@ describe("createJwtVerifier", () => {
         claims: claims(iss, { scope: "mcp.read  mcp.write", client_id: "c-1", jti: "j-1" }),
       },
     });
+  });
+
+  it("refuses a token whose key cannot be imported or used as issuer_unavailable, never a 500 (Codex I-1)", async () => {
+    for (const alg of ["RS256", "ES256"] as const) {
+      const iss = await issuerFor({ alg });
+      const variants = alg === "RS256" ? await brokenRsaKeys(iss) : brokenEcKeys(iss);
+      for (const [name, jwk] of variants) {
+        const verifier = await verifierFor(iss, createLocalJWKSet({ keys: [jwk as never] }));
+        expect(await reasonOf(verifier.verify(await iss.sign(claims(iss)))), name).toBe("issuer_unavailable");
+      }
+    }
   });
 
   it("matches the token iss to the configured issuer as an exact string", async () => {
@@ -1110,13 +1468,21 @@ describe("createJwtVerifier", () => {
     }
   });
 
-  it("rethrows anything unexpected so it becomes a 500", async () => {
+  it("rethrows anything unexpected after the key lookup so it becomes a 500", async () => {
     const iss = await issuerFor();
-    const bug = new TypeError("bug");
-    const verifier = await verifierFor(iss, async () => {
-      throw bug;
-    });
-    expect(await reasonOf(verifier.verify(await iss.sign(claims(iss))))).toBe(bug);
+    // A resolver bug: jose refuses the returned value with a TypeError.
+    const verifier = await verifierFor(iss, (async () => "not a key") as unknown as JWTVerifyGetKey);
+    expect(await reasonOf(verifier.verify(await iss.sign(claims(iss))))).toBeInstanceOf(TypeError);
+  });
+
+  it("treats anything the key lookup throws, other than a token-caused refusal, as issuer_unavailable", async () => {
+    const iss = await issuerFor();
+    for (const thrown of [new TypeError("key import"), new Error("other"), new DOMException("x", "DataError")]) {
+      const verifier = await verifierFor(iss, async () => {
+        throw thrown;
+      });
+      expect(await reasonOf(verifier.verify(await iss.sign(claims(iss)))), String(thrown)).toBe("issuer_unavailable");
+    }
   });
 
   it("uses fixed error messages that never quote claim values", async () => {
