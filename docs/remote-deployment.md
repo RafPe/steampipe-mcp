@@ -42,7 +42,8 @@ Steampipe instances or workspaces.
   so use a **dedicated** OAuth client for this server and nothing else.
 - *Google users who are not allowed* (google mode). An email that is
   unverified, or that is neither in `STEAMPIPE_MCP_ALLOWED_EMAILS` nor in a
-  domain in `STEAMPIPE_MCP_ALLOWED_DOMAINS`, gets `403 insufficient_scope` and
+  domain in `STEAMPIPE_MCP_ALLOWED_DOMAINS`, gets `403 access_denied` (with no
+  `WWW-Authenticate` challenge, so clients do not retry with more scopes) and
   never reaches the tools. The domain is the part after the last `@`, compared
   as a whole string, so `corp.com` does not match `evilcorp.com`,
   `sub.corp.com` or `a@corp.com.evil.com`. This is a string match on the email
@@ -66,8 +67,9 @@ Steampipe instances or workspaces.
   needs a restart, which also clears the cache.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
-- *Google availability* (google mode). If tokeninfo is unreachable or slower
-  than 5 seconds, requests fail closed with `500`. They are never accepted.
+- *Google availability* (google mode). If tokeninfo is unreachable, slower
+  than 5 seconds, or answers `429`/`5xx`, requests fail closed with `503`
+  `temporarily_unavailable` and `Retry-After: 5`. They are never accepted.
   The server also refuses to start if it cannot fetch Google's discovery
   document.
 
@@ -114,10 +116,12 @@ claude mcp add --transport http steampipe https://<host>/mcp \
 ```
 
 The token is compared in constant time over sha256 digests, so response timing
-does not reveal its content or length. In token mode a `401` carries
-`WWW-Authenticate: Bearer error="invalid_token"` with no `resource_metadata`
-parameter: there is no OAuth server to discover, so the client simply needs the
-header above.
+does not reveal its content or length. In token mode a request with no
+`Authorization: Bearer` header gets `401` with a bare `WWW-Authenticate: Bearer`
+(RFC 6750 §3.1: no error code when no credentials were sent), and a wrong token
+gets `WWW-Authenticate: Bearer error="invalid_token", error_description="Invalid token"`.
+Neither carries `resource_metadata` or `scope`: there is no OAuth server to
+discover, so the client simply needs the header above.
 
 This is also the fallback if google mode does not work with your client (see
 [Known unknown](#known-unknown-rfc-8707-resource-and-google) below).
@@ -218,19 +222,28 @@ unauthenticated `POST /mcp` gets:
 
 ```
 HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer error="invalid_token", error_description="Missing Authorization header", resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+WWW-Authenticate: Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource/mcp", scope="openid email"
 ```
+
+A rejected token gets the same challenge with `error="invalid_token"` and an
+`error_description` in front. Challenge values are reduced to the RFC 6750
+character set (no quotes, backslashes, control characters or non-ASCII) and
+`error_description` is capped at 200 characters.
 
 How each token is validated:
 
 1. POST `access_token=<token>` (form body) to
    `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout.
-2. Any non-200 response, `aud` different from `GOOGLE_CLIENT_ID` (`azp` is
-   not consulted), or `exp` missing or in the past → `401 invalid_token`.
-3. `email_verified` not `"true"`, an email that is neither allowlisted nor in
+2. A network error, a timeout, or a `429`/`5xx` answer → `503
+   temporarily_unavailable` with `Retry-After: 5`.
+3. Any other non-200 response, a body that is not a JSON object, `aud`
+   different from `GOOGLE_CLIENT_ID` (`azp` is not consulted), or `exp`
+   missing or in the past → `401 invalid_token`.
+4. `email_verified` not `"true"`, an email that is neither allowlisted nor in
    an allowlisted domain, or a domain-only match where `hd` is present and
-   differs from the email's domain → `403 insufficient_scope`.
-4. Otherwise accept. The result is cached for at most 60 seconds, keyed by the
+   differs from the email's domain → `403 access_denied`, with no
+   `WWW-Authenticate` challenge.
+5. Otherwise accept. The result is cached for at most 60 seconds, keyed by the
    token's sha256.
 
 At `STEAMPIPE_MCP_LOG_LEVEL=debug` the server logs the authenticated (or
