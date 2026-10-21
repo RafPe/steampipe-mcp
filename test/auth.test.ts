@@ -557,6 +557,44 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     expect(Date.now() - started).toBeLessThan(2000);
   });
 
+  /** A tokeninfo that sends 200 headers and part of a JSON body, then stalls or drops the connection. */
+  async function partialBodyTokeninfo(then: "stall" | "reset"): Promise<string> {
+    const server = createNodeServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "500" });
+        res.write('{"aud":"');
+        if (then === "reset") setTimeout(() => res.socket?.destroy(), 10);
+      });
+    });
+    return `http://127.0.0.1:${await listen(server)}/tokeninfo`;
+  }
+
+  for (const then of ["stall", "reset"] as const) {
+    it(`classifies a 200 whose body read fails (${then}) as issuer_unavailable, not malformed`, async () => {
+      const v = createGoogleVerifier({
+        clientId: CLIENT,
+        allowedEmails: [],
+        allowedDomains: ["corp.com"],
+        publicUrl: new URL(PUBLIC_URL),
+        tokeninfoUrl: await partialBodyTokeninfo(then),
+        timeoutMs: 50,
+      });
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("issuer_unavailable");
+    });
+  }
+
+  it("answers 503 issuer_unavailable at the app when tokeninfo stalls mid-body", async () => {
+    const port = await startApp(googleConfig(), await partialBodyTokeninfo("stall"), 50);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Token validation unavailable",
+    });
+  });
+
   it("accepts aud=ours and reports AuthInfo with clientId = aud", async () => {
     const exp = nowSec() + 3600;
     const v = await verifierFor({ ...(tokeninfo().body as object), azp: OTHER_CLIENT, exp: String(exp) });

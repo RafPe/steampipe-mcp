@@ -3,9 +3,8 @@ import { request as httpRequest, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHash } from "node:crypto";
 import type { RequestHandler } from "express";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
-import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import { bearerAuth, type TokenVerifier } from "../src/auth/bearer.js";
+import { VerifyError } from "../src/auth/errors.js";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import type { DatabaseService } from "../src/services/database.js";
 import { buildHttpApp } from "../src/http/app.js";
@@ -199,13 +198,13 @@ describe("buildHttpApp: pre-auth IP rate limiting (R18)", () => {
   it("stops a flood before it ever reaches the token verifier", async () => {
     const cfg = httpConfig({ STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1" });
     const calls = { count: 0 };
-    const countingVerifier: OAuthTokenVerifier = {
-      async verifyAccessToken(token) {
+    const countingVerifier: TokenVerifier = {
+      async verify() {
         calls.count++;
-        throw new InvalidTokenError(`test: always invalid (saw ${token})`);
+        throw new VerifyError("invalid", "test: always invalid");
       },
     };
-    const app = buildHttpApp(cfg, fakeDb(), [requireBearerAuth({ verifier: countingVerifier })]);
+    const app = buildHttpApp(cfg, fakeDb(), [bearerAuth({ verifier: countingVerifier })]);
     const server = await new Promise<HttpServer>((resolve) => {
       const s = app.listen(0, "127.0.0.1", () => resolve(s));
     });

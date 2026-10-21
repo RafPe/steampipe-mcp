@@ -39,10 +39,11 @@ interface TokenInfo {
  * Verifier for Google OAuth access tokens. Google access tokens are opaque,
  * so each one is checked against Google's tokeninfo endpoint:
  *
- * - tokeninfo unreachable, timed out, or answering 429/5xx:
- *   `issuer_unavailable` (503). Never accepted.
+ * - tokeninfo unreachable, timed out (headers or body), dropping the
+ *   connection mid-body, or answering 429/5xx: `issuer_unavailable` (503).
+ *   Never accepted.
  * - any other non-200 (400/401 for a bad token): `invalid`.
- * - a 200 whose body is not a JSON object: `malformed`.
+ * - a 200 whose complete body is not a JSON object: `malformed`.
  * - issued to another client (`aud` differs from `clientId`; R17: a matching
  *   `azp` alone is not enough): `audience`.
  * - `exp` absent, non-numeric or past: `expired`.
@@ -84,9 +85,19 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
     if (res.status !== 200) {
       throw new VerifyError("invalid", "Invalid token");
     }
+    // Read and parse separately: the timeout signal also covers the body,
+    // and a stall or dropped connection mid-body is an outage, not a
+    // malformed answer.
+    let text: string;
+    try {
+      text = await res.text();
+    } catch (error) {
+      logger.error("Google tokeninfo body read failed", error instanceof Error ? error.name : "unknown error");
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+    }
     let body: unknown;
     try {
-      body = await res.json();
+      body = JSON.parse(text);
     } catch {
       throw new VerifyError("malformed", "Invalid token");
     }

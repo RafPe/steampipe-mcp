@@ -257,6 +257,17 @@ describe("bearerAuth: presented token", () => {
     expect(verifier.calls).toEqual(["good"]);
   });
 
+  it("measures maxTokenBytes in UTF-8 bytes: 5 characters / 10 bytes exceeds a limit of 8", async () => {
+    const verifier = stubVerifier();
+    const { base, events } = await start({ verifier, maxTokenBytes: 8 });
+    // Node decodes header bytes as latin1, so each 0xE9 byte arrives as "é",
+    // which is 2 bytes in UTF-8.
+    const res = await post(base, "Bearer \u00e9\u00e9\u00e9\u00e9\u00e9");
+    expect(res.status).toBe(401);
+    expect(events[0].reason).toBe("malformed");
+    expect(verifier.calls).toHaveLength(0);
+  });
+
   it("never puts the token into a RejectEvent", async () => {
     const secret = "super-secret-token-value";
     const events: RejectEvent[] = [];
@@ -272,14 +283,17 @@ describe("bearerAuth: presented token", () => {
     expect(JSON.stringify(events)).not.toContain(secret);
   });
 
-  it("still answers when onReject throws", async () => {
+  it("still answers when onReject throws, logging only the hook's error name", async () => {
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
     const { base } = await start({
       verifier: stubVerifier(),
       onReject: () => {
-        throw new Error("hook failed");
+        throw new RangeError("hook failed: Bearer bad");
       },
     });
     expect((await post(base, "Bearer bad")).status).toBe(401);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalledWith("bearerAuth onReject hook failed", "RangeError");
   });
 });
 
