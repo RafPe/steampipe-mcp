@@ -1,3 +1,15 @@
+## Unreleased
+
+_What's new_
+
+* `STEAMPIPE_MCP_AUTH_MODE=jwt`: accept RFC 9068 JWT access tokens from one OAuth/OIDC issuer (`STEAMPIPE_MCP_JWT_ISSUER`), verified locally against the issuer's JWKS. At startup the server discovers the JWKS from the issuer's OIDC or RFC 8414 metadata (the document's `issuer` must match exactly, and `jwks_uri` must be on the issuer's host or `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`) and refuses to start if that fails. Tokens must carry `typ: at+jwt` (configurable with `STEAMPIPE_MCP_JWT_ACCEPTED_TYP`), an allowed asymmetric `alg` (`none` and `HS*` are refused at startup), the exact issuer, an accepted audience (default: `PUBLIC_URL`), and the RFC 9068 claims `exp`, `iat`, `jti`, `client_id` and `sub`. Clock skew (default 0), maximum token age (default off) and the JWKS refetch cooldown (default 30 s) are configurable. A JWKS outage answers `503` with `Retry-After: 5`. The PRM document names the issuer as the authorization server.
+
+_Behaviour changes_
+
+* The per-principal rate limit keys on the token's issuer-qualified principal (`iss|sub`) when one is present (jwt mode), so the same `sub` from two issuers never shares a quota. Token and Google mode still key on `sub`.
+* The audit line gains an `iss` field when the principal has an issuer (jwt mode), bounded like the other token-derived fields.
+* Rejected auth attempts (`auth_reject` audit lines) are now also written in `jwt` mode.
+
 ## 0.3.0 [2026-10-21]
 
 _What's new_

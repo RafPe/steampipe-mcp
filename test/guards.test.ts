@@ -171,6 +171,32 @@ describe("buildHttpApp: per-principal rate limiting", () => {
     // bob has his own quota: alice being over limit doesn't affect him.
     expect((await rpc(port, TOOLS_LIST, { "X-Sub": "bob" })).status).toBe(200);
   });
+
+  // Like fakeAuth, plus an issuer-qualified principal (JWT mode) from X-Principal.
+  const fakeJwtAuth: RequestHandler = (req, _res, next) => {
+    const sub = req.headers["x-sub"];
+    const principal = req.headers["x-principal"];
+    if (typeof sub === "string") {
+      req.auth = { token: "t", clientId: "c", scopes: [], extra: { sub, ...(principal ? { principal } : {}) } };
+    }
+    next();
+  };
+
+  it("keys the limit by principal when set, so the same sub from two issuers gets two quotas", async () => {
+    const cfg = httpConfig({ STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1" });
+    const app = buildHttpApp(cfg, fakeDb(), [fakeJwtAuth]);
+    const server = await new Promise<HttpServer>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    servers.push(server);
+    const port = (server.address() as AddressInfo).port;
+
+    const a = { "X-Sub": "svc", "X-Principal": "https://a.example|svc" };
+    const b = { "X-Sub": "svc", "X-Principal": "https://b.example|svc" };
+    expect((await rpc(port, TOOLS_LIST, a)).status).toBe(200);
+    expect((await rpc(port, TOOLS_LIST, a)).status).toBe(429);
+    expect((await rpc(port, TOOLS_LIST, b)).status).toBe(200);
+  });
 });
 
 describe("buildHttpApp: pre-auth IP rate limiting (R18)", () => {
@@ -306,6 +332,36 @@ describe("buildHttpApp: audit log", () => {
     expect(auditLine).toBeDefined();
     expect(auditLine).toContain('"sub":"anonymous"');
     expect(auditLine).toContain('"clientId":"none"');
+  });
+
+  it("adds iss to the audit line when the principal has one, bounded for logging", async () => {
+    const withIss: RequestHandler = (req, _res, next) => {
+      req.auth = { token: "t", clientId: "c", scopes: [], extra: { sub: "svc", iss: "https://idp.example\u0007/t" } };
+      next();
+    };
+    const plain: RequestHandler = (req, _res, next) => {
+      req.auth = { token: "t", clientId: "c", scopes: [], extra: { sub: "svc" } };
+      next();
+    };
+    for (const [auth, expected] of [
+      [withIss, '"iss":"https://idp.example/t"'],
+      [plain, undefined],
+    ] as const) {
+      logger.clearLogs();
+      const app = buildHttpApp(httpConfig(), fakeDb(), [auth]);
+      const server = await new Promise<HttpServer>((resolve) => {
+        const s = app.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      servers.push(server);
+      await rpc((server.address() as AddressInfo).port, TOOLS_LIST);
+      const auditLine = logger.getCollectedLogs().find((line) => line.includes('"method":"tools/list"'));
+      expect(auditLine).toBeDefined();
+      if (expected) {
+        expect(auditLine).toContain(expected);
+      } else {
+        expect(auditLine).not.toContain('"iss"');
+      }
+    }
   });
 
   it("does not write an audit line for a 401 (no token)", async () => {

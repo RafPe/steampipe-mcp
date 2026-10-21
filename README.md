@@ -88,7 +88,7 @@ Built-in protections:
 - **Origin validation (always on).** A request with an `Origin` header that is not exactly listed in `STEAMPIPE_MCP_ALLOWED_ORIGINS` gets `403`. Requests without an `Origin` header (non-browser clients) pass. `Origin: null` is rejected unless the literal `null` is listed.
 - **Host validation (DNS rebinding).** On a loopback bind only `localhost`, `127.0.0.1` and `[::1]` are accepted as `Host`. On a non-loopback bind the `Host` hostname must be in `STEAMPIPE_MCP_ALLOWED_HOSTS`, or else match the hostname of `STEAMPIPE_MCP_PUBLIC_URL`; if neither is set, Host validation is skipped and a warning is logged at startup.
 - **Body size cap.** Request bodies larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` get `413`; bodies that are not `application/json` get `415`, and an empty `application/json` body gets `400`.
-- **Authentication.** `STEAMPIPE_MCP_AUTH_MODE=token` requires a static bearer token; `STEAMPIPE_MCP_AUTH_MODE=google` accepts Google OAuth access tokens for allowlisted users. See [docs/remote-deployment.md](docs/remote-deployment.md).
+- **Authentication.** `STEAMPIPE_MCP_AUTH_MODE=token` requires a static bearer token; `STEAMPIPE_MCP_AUTH_MODE=google` accepts Google OAuth access tokens for allowlisted users; `STEAMPIPE_MCP_AUTH_MODE=jwt` accepts RFC 9068 JWT access tokens from one OAuth/OIDC issuer, verified against its JWKS. See [docs/remote-deployment.md](docs/remote-deployment.md).
 
 Quick check with curl (clients must accept both `application/json` and `text/event-stream`):
 
@@ -107,7 +107,7 @@ A multi-arch (`linux/amd64`, `linux/arm64`) image is published to
 `ghcr.io/rafpe/steampipe-mcp`. It runs as a non-root user, defaults to
 `STEAMPIPE_MCP_TRANSPORT=http` on `0.0.0.0:27123`, and has a built-in
 `HEALTHCHECK` against `GET /healthz`. Because of the bind guard above, it
-refuses to start unless `STEAMPIPE_MCP_AUTH_MODE` is `token` or `google` (or
+refuses to start unless `STEAMPIPE_MCP_AUTH_MODE` is `token`, `google` or `jwt` (or
 `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true` is set).
 
 Token mode, pointed at a Turbot Pipes workspace:
@@ -329,7 +329,7 @@ Query limits (both transports):
 | `STEAMPIPE_MCP_MAX_ROWS` | `0` on stdio, `10000` on http | Maximum rows `steampipe_query` returns; `0` means unlimited. When the cap cuts a result short, the tool returns `{"rows": [...], "truncated": true}` instead of a plain array |
 | `STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS` | `120000` | Per-connection Postgres `statement_timeout` (and `idle_in_transaction_session_timeout`) in milliseconds; minimum `1` |
 
-HTTP transport settings. Some are validated in every mode, so a malformed value fails startup even on stdio: the numeric settings, `TRANSPORT`, `AUTH_MODE`, `ALLOW_INSECURE_REMOTE`, `TRUST_PROXY`, and the syntax of `PUBLIC_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS`. The policy checks (the non-loopback bind guard, the `token`/`google` auth requirements, and `https` for a non-loopback `PUBLIC_URL`) apply only when `STEAMPIPE_MCP_TRANSPORT=http`:
+HTTP transport settings. Some are validated in every mode, so a malformed value fails startup even on stdio: the numeric settings, `TRANSPORT`, `AUTH_MODE`, `ALLOW_INSECURE_REMOTE`, `TRUST_PROXY`, and the syntax of `PUBLIC_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS`. The policy checks (the non-loopback bind guard, the `token`/`google`/`jwt` auth requirements, and `https` for a non-loopback `PUBLIC_URL`) apply only when `STEAMPIPE_MCP_TRANSPORT=http`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -341,15 +341,25 @@ HTTP transport settings. Some are validated in every mode, so a malformed value 
 | `STEAMPIPE_MCP_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated origins to accept (e.g. `https://app.example.com`); each entry is normalised to its origin, so case, a trailing slash, or a default port don't matter. The literal `null` allows `Origin: null`. Any other present `Origin` gets `403` |
 | `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames (optionally `host:port`) accepted in the `Host` header on a non-loopback bind; ports and case are ignored. Entries with a scheme or path (e.g. `https://x`) are rejected at startup |
 | `STEAMPIPE_MCP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes; larger bodies get `413` |
-| `STEAMPIPE_MCP_RATE_LIMIT_PER_MIN` | `60` | Per-principal (authenticated `sub`, or client IP in `none` mode) requests per rolling 60s window; over-limit requests get `429`. A coarser, IP-only limit at 10x this value also applies ahead of auth, so an unauthenticated flood can't reach the token verifier |
+| `STEAMPIPE_MCP_RATE_LIMIT_PER_MIN` | `60` | Per-principal (`iss|sub` in `jwt` mode, authenticated `sub` in `token`/`google` mode, or client IP in `none` mode) requests per rolling 60s window; over-limit requests get `429`. A coarser, IP-only limit at 10x this value also applies ahead of auth, so an unauthenticated flood can't reach the token verifier |
 | `STEAMPIPE_MCP_TRUST_PROXY` | _(unset)_ | Passed to Express's `trust proxy` setting (a hop count, or `true`) so rate limiting sees the real client IP behind a reverse proxy. Only set this when every request actually goes through that trusted proxy: it makes `X-Forwarded-For` authoritative, so setting it without one lets a client spoof its own rate-limit key and bypass the limit |
 | `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE` | `false` | Allow a non-loopback bind without auth (not recommended) |
-| `STEAMPIPE_MCP_AUTH_MODE` | `none` | `none`, `token`, or `google` ([docs/remote-deployment.md](docs/remote-deployment.md)) |
+| `STEAMPIPE_MCP_AUTH_MODE` | `none` | `none`, `token`, `google`, or `jwt` ([docs/remote-deployment.md](docs/remote-deployment.md)) |
 | `STEAMPIPE_MCP_AUTH_TOKEN` | _(unset)_ | Static bearer token, at least 32 characters (`token` mode) |
 | `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` | _(unset)_ | Google OAuth client ID that tokens must be issued to (`google` mode) |
 | `STEAMPIPE_MCP_ALLOWED_EMAILS` | _(empty)_ | Comma-separated emails allowed in `google` mode (case-insensitive) |
 | `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive). Only a membership boundary with an Internal consent screen on Google Workspace; with External, use `ALLOWED_EMAILS` ([details](docs/remote-deployment.md#allowed_domains-is-only-a-boundary-with-an-internal-consent-screen)) |
 | `STEAMPIPE_MCP_ALLOW_DEGRADED_START` | `false` | `google` mode only (ignored otherwise; read in `http` mode only): start even when Google's discovery document cannot be fetched, and keep retrying it in the background (1 s, doubling to 60 s, ±20% jitter). Until it succeeds, the Protected Resource Metadata answers `503` with `Retry-After: 5` and `/readyz` reports `"auth":"pending"`; bearer tokens are still verified, since tokeninfo does not need discovery. With `false`, an unreachable Google fails startup |
+| `STEAMPIPE_MCP_JWT_ISSUER` | _(unset)_ | `jwt` mode, required: the issuer identifier, compared exactly with the token's `iss` and the discovery document's `issuer`. `https`, or `http` on a loopback host only; no query or fragment |
+| `STEAMPIPE_MCP_JWT_AUDIENCES` | `PUBLIC_URL` | `jwt` mode: comma-separated accepted `aud` values, compared as exact strings. Defaults to the canonical `PUBLIC_URL` (the PRM `resource`), so write `PUBLIC_URL` canonically (e.g. `https://mcp.example.com/mcp`) |
+| `STEAMPIPE_MCP_JWT_ALGORITHMS` | `RS256,ES256` | `jwt` mode: accepted asymmetric JWS algorithms (`RS*`, `PS*`, `ES*`, `EdDSA`, `Ed25519`). `none` and `HS*` are refused at startup |
+| `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` | `at+jwt,application/at+jwt` | `jwt` mode: accepted header `typ` values (case-insensitive), per RFC 9068. Add `JWT` only for issuers that don't stamp `typ` (e.g. Entra v2); audience and the `client_id`/`jti` claims still keep ID tokens out |
+| `STEAMPIPE_MCP_JWT_CLOCK_SKEW_S` | `0` | `jwt` mode: seconds of leeway applied equally to `exp` and `nbf`; there is no other leeway |
+| `STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S` | `0` | `jwt` mode: reject tokens whose `iat` is older than this many seconds; `0` turns the check off |
+| `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S` | `30` | `jwt` mode: 1 to 3600. Minimum seconds between JWKS refetches, so a newly rotated-in `kid` is accepted at most this long after its first use (until then such tokens get `401`) |
+| `STEAMPIPE_MCP_JWT_SCOPES_SUPPORTED` | _(empty)_ | `jwt` mode: comma-separated RFC 6750 scope tokens advertised as `scopes_supported` in the PRM document |
+| `STEAMPIPE_MCP_JWT_CHALLENGE_SCOPE` | _(empty)_ | `jwt` mode: comma-separated RFC 6750 scope tokens sent as `scope` in every `401` challenge |
+| `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS` | _(empty)_ | `jwt` mode: extra `https` hostnames the discovery document may point the JWKS at (the issuer's host is always allowed). No scheme or path |
 | `STEAMPIPE_MCP_REQUIRED_CLAIMS` | _(empty)_ | Identity policy: a JSON object mapping a claim name to the values it may take, e.g. `{"hd":["corp.com"],"groups":["platform"]}`. Every listed claim must match: a string claim must equal an allowed value, an array claim must contain one, and a boolean or number matches its string form (`true` matches `"true"`). An absent, `null`, or object claim fails. Validated at startup: every claim must list at least one value (an empty list `[]` is rejected), and claim names and values must be 1 to 256 characters (an empty string `""` is rejected) |
 | `STEAMPIPE_MCP_ALLOWED_SUBJECTS` | _(empty)_ | Identity policy: a JSON array of exact subjects (`sub`) allowed, at most 1024 entries. Each entry must be 1 to 256 characters; an empty string `""` is rejected at startup |
 | `STEAMPIPE_MCP_SUBJECT_PREFIXES` | _(empty)_ | Identity policy: a JSON array of subject prefixes allowed, at most 64 entries (prefix `"platform-"` does not admit `"platform"`). A subject passes when it is on `ALLOWED_SUBJECTS` or starts with a prefix; when both are empty, any subject passes. No regex is supported. Each entry must be 1 to 256 characters; an empty string `""` is rejected at startup, since it would match every subject. All three policy variables default to empty, meaning no policy, and are read in `http` mode only. In `google` mode the policy runs after `ALLOWED_EMAILS`/`ALLOWED_DOMAINS` and both must pass; the claims are the tokeninfo fields `sub`, `email`, `email_verified`, `hd`, `aud`, `azp` and `scope`, compared exactly as Google returns them (case-sensitive), and the subject is `sub`. A principal that fails it gets `403 access_denied`. Only `google` mode enforces a policy: configuring a non-empty policy with `AUTH_MODE=none` or `token` fails startup (`REQUIRED_CLAIMS={}` and `ALLOWED_SUBJECTS=[]`/`SUBJECT_PREFIXES=[]` are an empty policy, i.e. no policy, and are accepted in every mode) |
@@ -358,7 +368,7 @@ HTTP transport settings. Some are validated in every mode, so a malformed value 
 
 Logs go to stderr. Values in log lines that come from clients, tokens, or the database (the audit line's `sub`, `clientId`, `method` and `tool`, request, tool and driver error messages, and the Google principal email at debug level) are sanitised: control, line-separator and bidi characters are stripped, and each value is capped at 256 characters, with a `…(+N)` suffix giving the number of characters cut. Tool argument-validation diagnostics are sanitised the same way, with a cap of 512 characters, and the debug-level SQL line with a cap of 8192 characters.
 
-In `token` and `google` mode, every request the bearer check refuses writes one info-level line:
+In `token`, `google` and `jwt` mode, every request the bearer check refuses writes one info-level line:
 
 ```
 {"event":"auth_reject","reason":"expired","status":401,"ip":"203.0.113.7","durationMs":42}

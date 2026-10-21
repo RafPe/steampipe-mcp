@@ -4,12 +4,13 @@ This guide covers running the Steampipe MCP server over Streamable HTTP for
 clients on other machines, with authentication. For local use, stdio (the
 default) needs none of this.
 
-The server supports two auth modes:
+The server supports three auth modes:
 
 | Mode | `STEAMPIPE_MCP_AUTH_MODE` | Who can connect | Setup cost |
 |------|---------------------------|-----------------|------------|
 | Static token | `token` | Anyone holding one shared secret | Low |
 | Google OAuth | `google` | Allowlisted Google accounts, each signing in as themselves | Google Cloud OAuth client |
+| JWT access tokens | `jwt` | Anyone your OAuth/OIDC issuer mints an RFC 9068 access token for this server | An issuer that signs JWT access tokens (Keycloak, Auth0, Entra, Okta, ...) |
 
 `none` is the default and is only accepted on a loopback bind, unless you set
 `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true`.
@@ -21,7 +22,7 @@ default `/mcp`). Every tool, prompt and resource is reached through it, and the
 tools run arbitrary read-only SQL against Steampipe with the server's own
 database credentials.
 
-**Read this first: every authenticated principal gets full access.** Neither
+**Read this first: every authenticated principal gets full access.** No
 mode has per-user or per-connection authorization. Every allowlisted Google
 account, and everyone holding the static token, can query **every** Steampipe
 connection the server's database user can see: every cloud account, SaaS
@@ -67,6 +68,10 @@ Steampipe instances or workspaces.
   needs a restart, which also clears the cache.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
+- *Issuer trust* (jwt mode). Every token your issuer signs for this server's
+  audience is accepted. Restrict who can obtain such tokens at the issuer.
+  Tokens are verified locally, so a token revoked at the issuer keeps working
+  until its `exp`.
 - *Google availability* (google mode). If tokeninfo is unreachable, slower
   than 5 seconds, answers `429`/`5xx` or a redirect, or sends a body over
   64 KiB, requests fail closed with `503` `temporarily_unavailable` and
@@ -80,8 +85,8 @@ Steampipe instances or workspaces.
 
 The unauthenticated endpoints that never touch the database are
 `GET /healthz` (static `{"status":"ok"}`), `GET`/`DELETE /mcp` (always
-`405`), and in google mode the public metadata under `/.well-known/` (see
-below).
+`405`), and in google and jwt mode the public metadata under `/.well-known/`
+(see below).
 
 `GET /readyz` is also unauthenticated, and it **does** connect to the
 database: its `db` check opens a dedicated, short-lived connection (never a
@@ -341,3 +346,68 @@ either host) will not find any.
 roll google mode out, sign in once with Claude Code against a staging
 deployment. If Google rejects the authorization or token request, use token
 mode instead. Please report the result so this section can be updated.
+
+## Option 3: JWT access tokens
+
+For an OAuth 2.0 / OIDC issuer that signs access tokens as JWTs. Tokens follow
+the RFC 9068 profile and are verified locally against the issuer's JWKS, with
+no call to the issuer per request.
+
+```sh
+STEAMPIPE_MCP_AUTH_MODE=jwt
+STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp
+STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform
+# Optional:
+# STEAMPIPE_MCP_JWT_AUDIENCES=https://mcp.example.com/mcp   # default: PUBLIC_URL
+# STEAMPIPE_MCP_JWT_ALGORITHMS=RS256,ES256
+# STEAMPIPE_MCP_JWT_ACCEPTED_TYP=at+jwt,application/at+jwt
+# STEAMPIPE_MCP_JWT_CLOCK_SKEW_S=0
+# STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S=0
+# STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S=30
+# STEAMPIPE_MCP_JWT_SCOPES_SUPPORTED=
+# STEAMPIPE_MCP_JWT_CHALLENGE_SCOPE=
+# STEAMPIPE_MCP_JWT_ALLOWED_HOSTS=        # extra https hosts for the JWKS
+```
+
+At startup the server fetches the issuer's metadata from
+`<issuer>/.well-known/openid-configuration`, then from the RFC 8414 location
+(`https://idp.example.com/.well-known/oauth-authorization-server/realms/platform`).
+The document's `issuer` must equal `STEAMPIPE_MCP_JWT_ISSUER` exactly, and its
+`jwks_uri` must be on the issuer's host or in `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`
+(https only). Otherwise the server refuses to start. Only `issuer` and
+`jwks_uri` are read, so machine-to-machine issuers work too. Discovery and JWKS
+fetches use the same restricted fetch as Google mode: no redirects, 64 KiB
+bodies, 5 s timeouts.
+
+A token is accepted only if all of these hold:
+
+- its header `typ` is in `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` (case-insensitive).
+  The default, `at+jwt`, keeps ID tokens and other generic JWTs out. Add `JWT`
+  only for issuers that do not stamp `typ` (e.g. Entra v2).
+- its `alg` is in `STEAMPIPE_MCP_JWT_ALGORITHMS`. `none` and `HS*` are refused
+  at startup, so neither `alg:none` nor an HMAC key made from the public key
+  works.
+- the signature verifies against a key in the issuer's JWKS.
+- `iss` equals the issuer and `aud` contains one of the audiences, both
+  compared as exact strings.
+- `exp` is in the future and `nbf`, if present, is not, each with
+  `STEAMPIPE_MCP_JWT_CLOCK_SKEW_S` of leeway and no more. `iat` is no older
+  than `STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S`, when that is set.
+- the RFC 9068 §2.2 claims `exp`, `iat`, `jti`, `client_id` and `sub` are
+  present, with `sub` a string of 1 to 256 characters.
+
+A rejected token gets `401` with `error="invalid_token"`. If the JWKS cannot
+be fetched, requests get `503` with `Retry-After: 5`.
+
+**Key rotation.** The JWKS is cached. A token whose `kid` is not in the cache
+triggers a refetch, at most once per `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S`
+(default 30 s). So a key your issuer starts signing with is accepted within
+that time; until then its tokens get `401`. Publish new keys in the JWKS before
+signing with them.
+
+The server serves Protected Resource Metadata at
+`/.well-known/oauth-protected-resource/<path>`, with `resource` set to the
+canonical `STEAMPIPE_MCP_PUBLIC_URL` and `authorization_servers` set to
+`[STEAMPIPE_MCP_JWT_ISSUER]` exactly as written. Audit lines carry the
+token's `iss`, and the per-principal rate limit keys on `iss|sub`, so the same
+`sub` from different issuers never shares a quota.

@@ -1,5 +1,6 @@
 import type { RequestHandler } from "express";
 import { ipKeyGenerator, rateLimit } from "express-rate-limit";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { ServerConfig } from "../config.js";
 
 const BATCH_NOT_SUPPORTED = {
@@ -31,6 +32,12 @@ export function rejectBatch(): RequestHandler {
   };
 }
 
+function principalKey(auth: AuthInfo | undefined): string | undefined {
+  const { principal, sub } = auth?.extra ?? {};
+  if (typeof principal === "string") return principal;
+  return typeof sub === "string" ? sub : undefined;
+}
+
 /** Shared by both limiters below: the same JSON-RPC-shaped 429, rather
  * than express-rate-limit's default plain text body. */
 const rateLimitExceeded: RequestHandler = (_req, res) => {
@@ -39,8 +46,10 @@ const rateLimitExceeded: RequestHandler = (_req, res) => {
 
 /**
  * Per-principal rate limiting (`rateLimitPerMin` per rolling 60s window).
- * Keyed by the authenticated `sub` when auth set `req.auth` (token/google
- * mode), falling back to the client IP otherwise (`none` mode). Standard
+ * Keyed by the issuer-qualified `principal` (jwt mode, so the same `sub`
+ * from two issuers never shares a quota), else the authenticated `sub`
+ * (token/google mode), falling back to the client IP otherwise (`none`
+ * mode). Standard
  * `RateLimit-*` headers only; answers over-limit requests with a
  * JSON-RPC-shaped 429 rather than express-rate-limit's default plain text.
  */
@@ -50,7 +59,7 @@ export function createRateLimiter(http: ServerConfig["http"]): RequestHandler {
     limit: http.rateLimitPerMin,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => (req.auth?.extra?.sub as string | undefined) ?? ipKeyGenerator(req.ip ?? "unknown"),
+    keyGenerator: (req) => principalKey(req.auth) ?? ipKeyGenerator(req.ip ?? "unknown"),
     handler: rateLimitExceeded,
   });
 }
