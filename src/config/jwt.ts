@@ -1,7 +1,13 @@
 import { isEmptyPolicy, type IdentityPolicy } from "../auth/policy.js";
 import { ConfigError } from "../config.js";
 import { isLoopback } from "../services/ssl.js";
-import { policyFromValues, type PolicyValues } from "./policy.js";
+import { policyFromValues, type PolicyConfig, type PolicyValues } from "./policy.js";
+
+/**
+ * `rfc9068` (the default): RFC 9068 access tokens only. `lenient` (R27):
+ * also GitHub Actions / Entra v2 style tokens, see `createJwtVerifier`.
+ */
+export type JwtProfile = "rfc9068" | "lenient";
 
 /** One trusted issuer: its identifier and the claims settings for its tokens. */
 export interface JwtIssuerConfig {
@@ -22,6 +28,8 @@ export interface JwtIssuerConfig {
    * the entry sets none of the policy fields, so the global policy applies.
    */
   policy?: IdentityPolicy;
+  /** Present only for `lenient`; absent means `rfc9068`. */
+  profile?: "lenient";
 }
 
 export interface JwtConfig {
@@ -38,6 +46,10 @@ const PREFIX = "STEAMPIPE_MCP_";
 const DEFAULT_ALGORITHMS = ["RS256", "ES256"];
 // RFC 9068 §4: "at+jwt", with the "application/" prefix optional (RFC 7515 §4.1.9).
 const DEFAULT_ACCEPTED_TYP = ["at+jwt", "application/at+jwt"];
+// The lenient profile's default: also the generic "JWT" that GitHub Actions
+// and Entra v2 put on their access tokens. A missing typ is still refused.
+const LENIENT_ACCEPTED_TYP = [...DEFAULT_ACCEPTED_TYP, "jwt"];
+const PROFILES: readonly JwtProfile[] = ["rfc9068", "lenient"];
 const DEFAULT_JWKS_COOLDOWN_S = 30;
 const MAX_JWKS_COOLDOWN_S = 3600;
 // More skew than this is a broken clock to fix (NTP), not leeway to grant (R26).
@@ -174,11 +186,51 @@ const ISSUER_FIELDS = new Set([
   "requiredClaims",
   "allowedSubjects",
   "subjectPrefixes",
+  "profile",
 ]);
 
 const POLICY_FIELDS = ["requiredClaims", "allowedSubjects", "subjectPrefixes"] as const;
 
-type IssuerDefaults = Omit<JwtIssuerConfig, "issuer" | "advertise" | "policy">;
+type IssuerDefaults = Omit<JwtIssuerConfig, "issuer" | "advertise" | "policy" | "profile"> & {
+  /** Whether `JWT_ACCEPTED_TYP` was set, which keeps the lenient `typ` default out. */
+  acceptedTypExplicit: boolean;
+};
+
+/** Errors name `name` and never echo the value. */
+function parseProfile(value: unknown, name: string): JwtProfile {
+  if (typeof value !== "string" || !(PROFILES as readonly string[]).includes(value)) {
+    throw new ConfigError(`${name} must be "rfc9068" or "lenient"`);
+  }
+  return value as JwtProfile;
+}
+
+/**
+ * R27: a lenient issuer's tokens need not carry `client_id` or an RFC 9068
+ * `typ`, so the audience and the identity policy are the only per-principal
+ * controls left. Refuse to start unless its effective policy (its own
+ * override, else the global one) has at least one rule.
+ */
+function assertLenientPolicy(effective: IdentityPolicy | undefined, name: string): void {
+  if (!effective || isEmptyPolicy(effective)) {
+    throw new ConfigError(
+      `${name} "lenient" requires a non-empty identity policy for this issuer ` +
+        `(e.g. subjectPrefixes / requiredClaims, or the global ${PREFIX}SUBJECT_PREFIXES / ${PREFIX}REQUIRED_CLAIMS)`,
+    );
+  }
+}
+
+/** The issuer fields a profile decides: `profile` itself (lenient only) and the default `typ` list. */
+function profileFields(
+  profile: JwtProfile,
+  acceptedTyp: string[] | undefined,
+  defaults: IssuerDefaults,
+): Pick<JwtIssuerConfig, "acceptedTyp" | "profile"> {
+  const lenient = profile === "lenient";
+  return {
+    acceptedTyp: acceptedTyp ?? (lenient && !defaults.acceptedTypExplicit ? LENIENT_ACCEPTED_TYP : defaults.acceptedTyp),
+    ...(lenient && { profile: "lenient" as const }),
+  };
+}
 
 function stringList(value: unknown, name: string): string[] {
   if (
@@ -230,7 +282,12 @@ function parseIssuerPolicy(fields: Record<string, unknown>, at: string): Identit
  * cannot silently fall back to its default; missing ones take `defaults`
  * (the single-issuer env values). Errors name the entry by index only.
  */
-function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefaults): JwtIssuerConfig {
+function parseIssuerEntry(
+  entry: unknown,
+  index: number,
+  defaults: IssuerDefaults,
+  globalPolicy: PolicyConfig,
+): JwtIssuerConfig {
   const at = `${PREFIX}JWT_ISSUERS[${index}]`;
   if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
     throw new ConfigError(`${at} must be an object`);
@@ -250,15 +307,21 @@ function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefault
     throw new ConfigError(`${at}.advertise must be a boolean`);
   }
   const policy = parseIssuerPolicy(fields, at);
+  const profile = has("profile") ? parseProfile(fields.profile, `${at}.profile`) : "rfc9068";
+  if (profile === "lenient") {
+    assertLenientPolicy(policy ?? globalPolicy, `${at}.profile`);
+  }
   return {
     issuer: validateIssuer(fields.issuer, `${at}.issuer`),
     audiences: has("audiences") ? stringList(fields.audiences, `${at}.audiences`) : defaults.audiences,
     algorithms: has("algorithms")
       ? validateAlgorithms(stringList(fields.algorithms, `${at}.algorithms`), `${at}.algorithms`)
       : defaults.algorithms,
-    acceptedTyp: has("acceptedTyp")
-      ? stringList(fields.acceptedTyp, `${at}.acceptedTyp`).map((t) => t.toLowerCase())
-      : defaults.acceptedTyp,
+    ...profileFields(
+      profile,
+      has("acceptedTyp") ? stringList(fields.acceptedTyp, `${at}.acceptedTyp`).map((t) => t.toLowerCase()) : undefined,
+      defaults,
+    ),
     clockSkewS: has("clockSkewS")
       ? seconds(fields.clockSkewS, `${at}.clockSkewS`, MAX_CLOCK_SKEW_S)
       : defaults.clockSkewS,
@@ -268,23 +331,43 @@ function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefault
   };
 }
 
+function issuerFromDefaults(issuer: string, defaults: IssuerDefaults): JwtIssuerConfig {
+  const { acceptedTypExplicit: _, ...settings } = defaults;
+  return { issuer, ...settings, advertise: true };
+}
+
 /**
  * `JWT_ISSUER` (one issuer) or `JWT_ISSUERS` (a JSON array of entries),
  * never both. Duplicate issuers, compared as exact strings, are refused,
  * and at least one issuer must be advertised in the PRM document.
+ *
+ * `JWT_PROFILE` applies to `JWT_ISSUER` only. Unlike the other single-issuer
+ * settings it is not a default for `JWT_ISSUERS` entries, which set
+ * `profile` each (R27: lenient is opt-in per issuer), so setting it with
+ * `JWT_ISSUERS` is refused rather than silently ignored.
  */
-function parseIssuers(env: NodeJS.ProcessEnv, defaults: IssuerDefaults): JwtIssuerConfig[] {
+function parseIssuers(env: NodeJS.ProcessEnv, defaults: IssuerDefaults, globalPolicy: PolicyConfig): JwtIssuerConfig[] {
   const single = raw(env, "JWT_ISSUER");
   const many = raw(env, "JWT_ISSUERS");
+  const profileEnv = raw(env, "JWT_PROFILE");
   const name = `${PREFIX}JWT_ISSUERS`;
   if (single !== undefined && many !== undefined) {
     throw new ConfigError(`${PREFIX}JWT_ISSUER and ${name} are mutually exclusive`);
   }
   if (single !== undefined) {
-    return [{ issuer: validateIssuer(single, `${PREFIX}JWT_ISSUER`), ...defaults, advertise: true }];
+    const profileName = `${PREFIX}JWT_PROFILE`;
+    const profile = profileEnv === undefined ? "rfc9068" : parseProfile(profileEnv, profileName);
+    if (profile === "lenient") {
+      assertLenientPolicy(globalPolicy, profileName);
+    }
+    const cfg = issuerFromDefaults(validateIssuer(single, `${PREFIX}JWT_ISSUER`), defaults);
+    return [{ ...cfg, ...profileFields(profile, undefined, defaults) }];
   }
   if (many === undefined) {
     throw new ConfigError(`${PREFIX}JWT_ISSUER or ${name} is required when ${PREFIX}AUTH_MODE=jwt`);
+  }
+  if (profileEnv !== undefined) {
+    throw new ConfigError(`${PREFIX}JWT_PROFILE applies to ${PREFIX}JWT_ISSUER only; set "profile" per ${name} entry`);
   }
   let entries: unknown;
   try {
@@ -296,7 +379,7 @@ function parseIssuers(env: NodeJS.ProcessEnv, defaults: IssuerDefaults): JwtIssu
   if (!Array.isArray(entries) || entries.length === 0) {
     throw new ConfigError(`${name} must be a non-empty JSON array of issuer objects`);
   }
-  const issuers = entries.map((entry, index) => parseIssuerEntry(entry, index, defaults));
+  const issuers = entries.map((entry, index) => parseIssuerEntry(entry, index, defaults, globalPolicy));
   const seen = new Set<string>();
   issuers.forEach((cfg, index) => {
     if (seen.has(cfg.issuer)) {
@@ -314,19 +397,22 @@ function parseIssuers(env: NodeJS.ProcessEnv, defaults: IssuerDefaults): JwtIssu
  * Parse the `AUTH_MODE=jwt` settings. `publicUrl` is the parsed PUBLIC_URL;
  * its canonical href is the default audience, the same value the PRM
  * document advertises as `resource` (R12). The single-issuer claims
- * variables are the defaults for every `JWT_ISSUERS` entry. Throws
+ * variables (except `JWT_PROFILE`) are the defaults for every `JWT_ISSUERS`
+ * entry. `globalPolicy` is the parsed global identity policy, which a
+ * lenient issuer without its own needs to be non-empty. Throws
  * `ConfigError` naming the variable, never echoing its value.
  */
-export function parseJwtConfig(env: NodeJS.ProcessEnv, publicUrl: URL): JwtConfig {
+export function parseJwtConfig(env: NodeJS.ProcessEnv, publicUrl: URL, globalPolicy: PolicyConfig): JwtConfig {
   const defaults: IssuerDefaults = {
     audiences: nonEmptyCsv(env, "JWT_AUDIENCES", [publicUrl.href]),
     algorithms: validateAlgorithms(nonEmptyCsv(env, "JWT_ALGORITHMS", DEFAULT_ALGORITHMS), `${PREFIX}JWT_ALGORITHMS`),
     acceptedTyp: nonEmptyCsv(env, "JWT_ACCEPTED_TYP", DEFAULT_ACCEPTED_TYP).map((t) => t.toLowerCase()),
+    acceptedTypExplicit: raw(env, "JWT_ACCEPTED_TYP") !== undefined,
     clockSkewS: int(env, "JWT_CLOCK_SKEW_S", 0, 0, MAX_CLOCK_SKEW_S),
     maxTokenAgeS: int(env, "JWT_MAX_TOKEN_AGE_S", 0, 0),
   };
   return {
-    issuers: parseIssuers(env, defaults),
+    issuers: parseIssuers(env, defaults, globalPolicy),
     jwksCooldownS: int(env, "JWT_JWKS_COOLDOWN_S", DEFAULT_JWKS_COOLDOWN_S, 1, MAX_JWKS_COOLDOWN_S),
     scopesSupported: parseScopes(env, "JWT_SCOPES_SUPPORTED"),
     challengeScope: parseScopes(env, "JWT_CHALLENGE_SCOPE"),

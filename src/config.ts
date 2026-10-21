@@ -358,7 +358,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
       if (!publicUrl) {
         throw new ConfigError(`${PREFIX}PUBLIC_URL is required when ${PREFIX}AUTH_MODE=jwt`);
       }
-      jwt = parseJwtConfig(env, publicUrl);
+      jwt = parseJwtConfig(env, publicUrl, policy);
     }
 
     if (!isLoopback(httpHost) && authMode === "none" && !allowInsecureRemote) {

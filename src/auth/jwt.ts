@@ -19,6 +19,8 @@ export interface IssuerConfig {
   maxTokenAgeS: number;
   /** This issuer's identity policy; replaces `JwtVerifierOptions.policy` when set. */
   policy?: IdentityPolicy;
+  /** Claims profile; absent means `rfc9068`. */
+  profile?: "rfc9068" | "lenient";
 }
 
 export interface JwtVerifierOptions {
@@ -40,6 +42,11 @@ const MAX_SUB_LENGTH = 256;
 // RFC 9068 §2.2 mandatory claims (iss and aud are enforced by the
 // issuer/audience options).
 const REQUIRED_CLAIMS = ["exp", "sub", "iat", "client_id", "jti"];
+// The lenient profile (R27): client_id and jti become optional.
+const LENIENT_REQUIRED_CLAIMS = ["exp", "sub", "iat"];
+// Lenient only: identifier claims that, when present, must be non-empty
+// strings. client_id, azp, appid are also the clientId fallbacks, in order.
+const LENIENT_OPTIONAL_STRINGS = ["client_id", "jti", "azp", "appid", "uti"];
 
 /** The key resolver could not reach or use the issuer's JWKS. */
 class KeysUnavailable extends Error {
@@ -239,6 +246,37 @@ function classify(error: unknown): VerifyError {
   throw error;
 }
 
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+/** RFC 9068: `client_id` and `jti` non-empty strings; returns `client_id`. */
+function strictClientId(payload: JWTPayload): string {
+  const { client_id: clientId, jti } = payload as JWTPayload & { client_id?: unknown };
+  if (!isNonEmptyString(clientId) || !isNonEmptyString(jti)) {
+    throw malformed();
+  }
+  return clientId;
+}
+
+/**
+ * Lenient (R27): refuse `nonce` (ID-token substitution guard), check the
+ * optional identifier claims, and return `client_id ?? azp ?? appid ??
+ * "unknown"`. Presence is an own property, so a JSON null counts.
+ */
+function lenientClientId(payload: JWTPayload): string {
+  if (Object.hasOwn(payload, "nonce")) {
+    throw malformed();
+  }
+  for (const name of LENIENT_OPTIONAL_STRINGS) {
+    if (Object.hasOwn(payload, name) && !isNonEmptyString(payload[name])) {
+      throw malformed();
+    }
+  }
+  const { client_id: clientId, azp, appid } = payload as JWTPayload & Record<string, string | undefined>;
+  return clientId ?? azp ?? appid ?? "unknown";
+}
+
 function effectivePolicy(policy: IdentityPolicy | undefined): IdentityPolicy | undefined {
   return policy && !isEmptyPolicy(policy) ? policy : undefined;
 }
@@ -261,6 +299,7 @@ interface RoutedIssuer {
   getKey: JWTVerifyGetKey;
   acceptedTyp: Set<string>;
   policy: IdentityPolicy | undefined;
+  lenient: boolean;
 }
 
 /**
@@ -287,6 +326,15 @@ interface RoutedIssuer {
  *    `sub` (`not_allowed`, 403). The issuer's own policy replaces the
  *    global one as a whole; it is never merged with it.
  *
+ * An issuer with `profile: "lenient"` (R27; config refuses one without a
+ * non-empty identity policy) differs in steps 2 and 3 only: the required
+ * claims are `exp`, `sub` and `iat`; `client_id`, `jti`, `azp`, `appid` and
+ * `uti` are optional but, when present, non-empty strings; a token carrying
+ * `nonce` is refused, since ID tokens carry one and these issuers' access
+ * tokens do not (all `malformed`); and `AuthInfo.clientId` is
+ * `client_id ?? azp ?? appid ?? "unknown"`. Its default `acceptedTyp` also
+ * holds `JWT` (set by config); a missing `typ` is still refused.
+ *
  * Error messages are fixed strings: they reach `error_description`, so they
  * never quote a claim. Every refusal after step 1 has routed the token
  * carries the configured issuer as `VerifyError.iss`.
@@ -306,6 +354,7 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
           getKey: guardKeys(getKey),
           acceptedTyp: new Set(cfg.acceptedTyp.map((t) => t.toLowerCase())),
           policy: effectivePolicy(cfg.policy ?? o.policy),
+          lenient: cfg.profile === "lenient",
         },
       ];
     }),
@@ -341,7 +390,7 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
   };
 
   async function verifyRouted(token: string, segments: string[], entry: RoutedIssuer): Promise<AuthInfo> {
-    const { cfg, getKey, acceptedTyp, policy } = entry;
+    const { cfg, getKey, acceptedTyp, policy, lenient } = entry;
     const header = decodeObject(segments[0]);
     const unverified = decodeObject(segments[1]);
     if (typeof header.typ !== "string" || !acceptedTyp.has(header.typ.toLowerCase())) {
@@ -367,22 +416,17 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
         clockTolerance: cfg.clockSkewS,
         maxTokenAge: cfg.maxTokenAgeS || undefined,
         currentDate: new Date(now()),
-        requiredClaims: REQUIRED_CLAIMS,
+        requiredClaims: lenient ? LENIENT_REQUIRED_CLAIMS : REQUIRED_CLAIMS,
       }));
     } catch (error) {
       throw classify(error);
     }
 
-    const { sub, jti, client_id: clientId, scope } = payload as JWTPayload & { client_id?: unknown; scope?: unknown };
+    const { sub, scope } = payload as JWTPayload & { scope?: unknown };
     if (typeof sub !== "string" || sub.length === 0 || sub.length > MAX_SUB_LENGTH) {
       throw new VerifyError("subject_missing", "Access token has no subject");
     }
-    if (typeof clientId !== "string" || clientId.length === 0) {
-      throw malformed();
-    }
-    if (typeof jti !== "string" || jti.length === 0) {
-      throw malformed();
-    }
+    const clientId = lenient ? lenientClientId(payload) : strictClientId(payload);
     if (scope !== undefined && typeof scope !== "string") {
       throw malformed();
     }

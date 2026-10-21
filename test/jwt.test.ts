@@ -1303,3 +1303,262 @@ describe("jwt config", () => {
     expect(cfg.auth.jwt).toBeUndefined();
   });
 });
+
+describe("jwt: lenient profile (R27)", () => {
+  const GH_SUB = "repo:acme/app:ref:refs/heads/main";
+  const ENTRA_AZP = "11111111-2222-3333-4444-555555555555";
+  const LENIENT = { STEAMPIPE_MCP_JWT_PROFILE: "lenient", STEAMPIPE_MCP_SUBJECT_PREFIXES: '["repo:acme/"]' };
+
+  /** GitHub Actions shaped: typ JWT, jti, no client_id. */
+  function github(iss: TestIssuer, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return claims(iss, { sub: GH_SUB, repository_owner: "acme", client_id: undefined, ...overrides });
+  }
+
+  /** Entra v2 shaped: typ JWT, azp and uti, no client_id or jti. */
+  function entra(iss: TestIssuer, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return claims(iss, {
+      sub: "repo:acme/entra-sp",
+      azp: ENTRA_AZP,
+      uti: "AbCdEf123",
+      tid: "tenant-1",
+      client_id: undefined,
+      jti: undefined,
+      ...overrides,
+    });
+  }
+
+  it("accepts a GitHub Actions shaped token under lenient + subjectPrefixes, and refuses it under rfc9068", async () => {
+    const iss = await issuerFor();
+    const lenient = await startJwt(iss, LENIENT);
+    await expectAccepted(lenient, await iss.sign(github(iss), { typ: "JWT" }));
+    const strict = await startJwt(iss, { STEAMPIPE_MCP_SUBJECT_PREFIXES: '["repo:acme/"]' });
+    await expectRejected(strict, await iss.sign(github(iss), { typ: "JWT" }), "malformed");
+  });
+
+  it("denies a GitHub Actions shaped token whose sub is outside the policy (403 access_denied)", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    const res = await expectRejected(
+      app,
+      await iss.sign(github(iss, { sub: "repo:other/x:ref:refs/heads/main", repository_owner: "other" }), { typ: "JWT" }),
+      "not_allowed",
+      403,
+    );
+    expect(JSON.parse(res.body).error).toBe("access_denied");
+  });
+
+  it("accepts an Entra v2 shaped token under lenient + policy, and refuses it under rfc9068", async () => {
+    const iss = await issuerFor();
+    const lenient = await startJwt(iss, LENIENT);
+    await expectAccepted(lenient, await iss.sign(entra(iss), { typ: "JWT" }));
+    const strict = await startJwt(iss, { STEAMPIPE_MCP_SUBJECT_PREFIXES: '["repo:acme/"]' });
+    await expectRejected(strict, await iss.sign(entra(iss), { typ: "JWT" }), "malformed");
+  });
+
+  it("does not relax the claims of an rfc9068 issuer, even when its typ allowlist includes JWT", async () => {
+    const iss = await issuerFor();
+    // typ cannot be what rejects these: only the RFC 9068 claim set can.
+    const strict = await startJwt(iss, {
+      STEAMPIPE_MCP_JWT_ACCEPTED_TYP: "at+jwt,JWT",
+      STEAMPIPE_MCP_SUBJECT_PREFIXES: '["repo:acme/"]',
+    });
+    await expectRejected(strict, await iss.sign(github(iss)), "malformed");
+    await expectRejected(strict, await iss.sign(github(iss), { typ: "JWT" }), "malformed");
+    await expectRejected(strict, await iss.sign(entra(iss)), "malformed");
+  });
+
+  it("keeps rfc9068 reason order: a missing client_id or jti is malformed before an expiry or audience failure", async () => {
+    const iss = await issuerFor();
+    const strict = await startJwt(iss);
+    await expectRejected(strict, await iss.sign(claims(iss, { client_id: undefined, exp: NOW_S - 10 })), "malformed");
+    await expectRejected(strict, await iss.sign(claims(iss, { jti: undefined, aud: "https://other.example/mcp" })), "malformed");
+  });
+
+  it("still accepts an RFC 9068 token (at+jwt, client_id, jti) under lenient", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    await expectAccepted(app, await iss.sign(claims(iss, { sub: GH_SUB })));
+  });
+
+  it("rejects a token carrying nonce (ID-token substitution guard) as malformed", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    // The same token without nonce is accepted, so only the nonce rule refuses it.
+    await expectAccepted(app, await iss.sign(github(iss), { typ: "JWT" }));
+    await expectRejected(app, await iss.sign(github(iss, { nonce: "n-1" }), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await iss.sign(github(iss, { nonce: null }), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await iss.sign(entra(iss, { nonce: "n-1" }), { typ: "JWT" }), "malformed");
+  });
+
+  it("rejects a missing typ as malformed", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    await expectRejected(app, await iss.sign(github(iss), { typ: null }), "malformed");
+    await expectRejected(app, await iss.sign(entra(iss), { typ: null }), "malformed");
+  });
+
+  it("rejects a non-string or empty client_id, jti, azp, appid or uti as malformed", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    for (const bad of [
+      { client_id: 42 },
+      { client_id: "" },
+      { client_id: null },
+      { jti: "" },
+      { jti: 42 },
+      { azp: "" },
+      { azp: 42 },
+      { appid: "" },
+      { appid: null },
+      { uti: "" },
+      { uti: 42 },
+    ]) {
+      await expectRejected(app, await iss.sign(entra(iss, bad), { typ: "JWT" }), "malformed");
+    }
+  });
+
+  it("still requires exp, iat and sub", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    await expectRejected(app, await iss.sign(github(iss, { exp: undefined }), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await iss.sign(github(iss, { iat: undefined }), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await iss.sign(github(iss, { sub: undefined }), { typ: "JWT" }), "subject_missing");
+    await expectRejected(app, await iss.sign(github(iss, { exp: NOW_S - 1 }), { typ: "JWT" }), "expired");
+  });
+
+  it("keeps the algorithm allowlist: alg none and HS256 are malformed without fetching keys", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    const none = `${b64url({ alg: "none", typ: "JWT" })}.${b64url(github(iss, { jti: "j" }))}.`;
+    await expectRejected(app, none, "malformed");
+    const pem = new TextEncoder().encode(await iss.publicKeyPem());
+    await expectRejected(app, await iss.sign(github(iss), { alg: "HS256", key: pem, typ: "JWT" }), "malformed");
+    expect(iss.jwksRequests()).toBe(0);
+  });
+
+  it("keeps the exact audience and issuer checks", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, LENIENT);
+    await expectRejected(app, await iss.sign(github(iss, { aud: "https://other.example/mcp" }), { typ: "JWT" }), "audience");
+    await expectRejected(app, await iss.sign(github(iss, { iss: `${iss.issuer}/other` }), { typ: "JWT" }), "unknown_issuer");
+  });
+
+  it("accepts typ JWT by default, but only the explicitly configured typ when JWT_ACCEPTED_TYP is set", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss, { ...LENIENT, STEAMPIPE_MCP_JWT_ACCEPTED_TYP: "at+jwt" });
+    await expectRejected(app, await iss.sign(github(iss), { typ: "JWT" }), "malformed");
+    await expectAccepted(app, await iss.sign(github(iss)));
+  });
+
+  describe("AuthInfo.clientId", () => {
+    async function lenientVerifier(iss: TestIssuer): Promise<ReturnType<typeof createJwtVerifier>> {
+      const cfg: IssuerConfig = {
+        issuer: iss.issuer,
+        audiences: [AUD],
+        algorithms: ["RS256"],
+        acceptedTyp: ["at+jwt", "application/at+jwt", "jwt"],
+        clockSkewS: 0,
+        maxTokenAgeS: 0,
+        profile: "lenient",
+      };
+      const keys = new Map([[iss.issuer, createRemoteJWKSet(new URL(`${new URL(iss.issuer).origin}/jwks`))]]);
+      return createJwtVerifier({ issuers: [cfg], publicUrl: new URL(PUBLIC_URL), keys, now: () => NOW_MS });
+    }
+
+    it.each<[string, Record<string, unknown>, string]>([
+      ["azp for an Entra v2 shaped token", {}, ENTRA_AZP],
+      ["client_id over azp", { client_id: "cid" }, "cid"],
+      ["client_id over azp and appid", { client_id: "cid", appid: "app" }, "cid"],
+      ["azp over appid", { appid: "app" }, ENTRA_AZP],
+      ["appid when there is no client_id or azp", { azp: undefined, appid: "app" }, "app"],
+      ["\"unknown\" when there is none of them", { azp: undefined }, "unknown"],
+    ])("is %s", async (_name, overrides, expected) => {
+      const iss = await issuerFor();
+      const verifier = await lenientVerifier(iss);
+      const info = await verifier.verify(await iss.sign(entra(iss, overrides), { typ: "JWT" }));
+      expect(info.clientId).toBe(expected);
+      expect(info.extra?.principal).toBe(`${iss.issuer}|repo:acme/entra-sp`);
+    });
+
+    it("is unchanged (client_id) for an rfc9068 issuer, which never falls back to azp", async () => {
+      const iss = await issuerFor();
+      const cfg: IssuerConfig = {
+        issuer: iss.issuer,
+        audiences: [AUD],
+        algorithms: ["RS256"],
+        acceptedTyp: ["at+jwt", "jwt"],
+        clockSkewS: 0,
+        maxTokenAgeS: 0,
+      };
+      const keys = new Map([[iss.issuer, createRemoteJWKSet(new URL(`${new URL(iss.issuer).origin}/jwks`))]]);
+      const verifier = createJwtVerifier({ issuers: [cfg], publicUrl: new URL(PUBLIC_URL), keys, now: () => NOW_MS });
+      await expect(verifier.verify(await iss.sign(entra(iss), { typ: "JWT" }))).rejects.toSatisfy(
+        (e: unknown) => e instanceof VerifyError && e.reason === "malformed",
+      );
+      const info = await verifier.verify(await iss.sign(claims(iss, { client_id: "cid", azp: "other" })));
+      expect(info.clientId).toBe("cid");
+    });
+  });
+});
+
+describe("jwt lenient profile config (R27)", () => {
+  const ISSUER = "https://idp.example.com/tenant";
+
+  function load(env: Record<string, string>): ServerConfig {
+    return loadConfig(
+      {
+        STEAMPIPE_MCP_TRANSPORT: "http",
+        STEAMPIPE_MCP_AUTH_MODE: "jwt",
+        STEAMPIPE_MCP_PUBLIC_URL: PUBLIC_URL,
+        STEAMPIPE_MCP_JWT_ISSUER: ISSUER,
+        ...env,
+      },
+      ["node", "index.js"],
+    );
+  }
+
+  function configError(env: Record<string, string>): ConfigError {
+    try {
+      load(env);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return error as ConfigError;
+    }
+    throw new Error("expected loadConfig to throw");
+  }
+
+  it("loads JWT_PROFILE=lenient with a policy, widening the default typ to include JWT", () => {
+    const issuer = load({ STEAMPIPE_MCP_JWT_PROFILE: "lenient", STEAMPIPE_MCP_SUBJECT_PREFIXES: '["repo:acme/"]' }).auth
+      .jwt?.issuers[0];
+    expect(issuer?.profile).toBe("lenient");
+    expect(issuer?.acceptedTyp).toEqual(["at+jwt", "application/at+jwt", "jwt"]);
+  });
+
+  it("keeps an explicit JWT_ACCEPTED_TYP under lenient", () => {
+    const issuer = load({
+      STEAMPIPE_MCP_JWT_PROFILE: "lenient",
+      STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"tid":["t-1"]}',
+      STEAMPIPE_MCP_JWT_ACCEPTED_TYP: "at+jwt",
+    }).auth.jwt?.issuers[0];
+    expect(issuer?.acceptedTyp).toEqual(["at+jwt"]);
+  });
+
+  it("accepts JWT_PROFILE=rfc9068 explicitly, with the same config as the default", () => {
+    expect(load({ STEAMPIPE_MCP_JWT_PROFILE: "rfc9068" }).auth.jwt).toEqual(load({}).auth.jwt);
+    expect(load({}).auth.jwt?.issuers[0].profile).toBeUndefined();
+  });
+
+  it("refuses JWT_PROFILE=lenient without an identity policy (fail closed)", () => {
+    const err = configError({ STEAMPIPE_MCP_JWT_PROFILE: "lenient" });
+    expect(err.message).toMatch(/STEAMPIPE_MCP_JWT_PROFILE/);
+    expect(err.message).toMatch(/identity policy/);
+  });
+
+  it("refuses an unknown JWT_PROFILE without echoing it", () => {
+    for (const value of ["loose", "Lenient", "RFC9068", "none"]) {
+      const err = configError({ STEAMPIPE_MCP_JWT_PROFILE: value, STEAMPIPE_MCP_SUBJECT_PREFIXES: '["x"]' });
+      expect(err.message).toMatch(/^STEAMPIPE_MCP_JWT_PROFILE must be/);
+      expect(err.message).not.toContain(value);
+    }
+  });
+});
