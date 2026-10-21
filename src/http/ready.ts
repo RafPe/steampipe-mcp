@@ -1,5 +1,6 @@
 import type { RequestHandler } from "express";
 import type { DatabaseService } from "../services/database.js";
+import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 
 export type CheckStatus = "ready" | "pending" | "failing";
@@ -84,7 +85,7 @@ export class Readiness {
       .then(
         (status): CheckStatus => (STATUSES.has(status) ? status : "failing"),
         (error): CheckStatus => {
-          logger.debug(`Readiness check ${c.name} failed:`, error instanceof Error ? error.message : String(error));
+          logger.debug(`Readiness check ${boundForLog(c.name)} failed:`, boundForLog(error instanceof Error ? error.message : error));
           return "failing";
         },
       );

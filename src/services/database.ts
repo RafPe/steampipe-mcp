@@ -372,7 +372,7 @@ export class DatabaseService {
     });
     // An unhandled 'error' event (e.g. the backend dying mid-ping) would
     // otherwise crash the process; the awaited calls below already reject.
-    client.on('error', (err) => logger.debug('Readiness ping client error:', err.message));
+    client.on('error', (err) => logger.debug('Readiness ping client error:', errorText(err)));
     try {
       await client.connect();
       await client.query('select 1');
