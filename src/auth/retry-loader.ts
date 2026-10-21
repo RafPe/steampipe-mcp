@@ -2,6 +2,10 @@ import type { CheckStatus } from "../http/ready.js";
 import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 
+/** Default retry schedule: 1 s, doubling after every failure, capped at 60 s. */
+export const DEFAULT_INITIAL_DELAY_MS = 1000;
+export const DEFAULT_MAX_DELAY_MS = 60000;
+
 export interface RetryLoaderOptions {
   /** First retry delay; doubles after every failure. Default 1000. */
   initialDelayMs?: number;
@@ -54,7 +58,7 @@ export function createRetryLoader<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   opts: RetryLoaderOptions = {},
 ): RetryLoader<T> {
-  const maxDelayMs = opts.maxDelayMs ?? 60000;
+  const maxDelayMs = opts.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
   const jitter = opts.jitter ?? 0.2;
   const sleep = opts.sleep ?? defaultSleep;
   const name = opts.name ?? "Background load";
@@ -63,7 +67,7 @@ export function createRetryLoader<T>(
   let value: T | undefined;
 
   const run = async () => {
-    let delay = Math.min(opts.initialDelayMs ?? 1000, maxDelayMs);
+    let delay = Math.min(opts.initialDelayMs ?? DEFAULT_INITIAL_DELAY_MS, maxDelayMs);
     for (let attempt = 1; !signal.aborted; attempt++) {
       try {
         const result = await fetcher(signal);

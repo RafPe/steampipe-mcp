@@ -9,7 +9,7 @@ import { discoverJwks } from "./discovery.js";
 import { VerifyError } from "./errors.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, guardedFetch, type FetchPolicy } from "./fetch-guard.js";
 import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
-import { createJwtVerifier } from "./jwt.js";
+import { createJwtVerifier, jwksBackoff } from "./jwt.js";
 import { prmPath, prmRouter, type PrmOptions } from "./prm.js";
 import { createRetryLoader, type RetryLoaderOptions } from "./retry-loader.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
@@ -35,7 +35,7 @@ export interface AuthMiddlewareOptions {
   discoveryRetry?: Omit<RetryLoaderOptions, "name">;
   tokeninfoUrl?: string;
   tokeninfoTimeoutMs?: number;
-  /** Clock for JWT time checks (ms). Default `Date.now`. */
+  /** Clock for JWT time checks and the JWKS backoff (ms). Default `Date.now`. */
   now?: () => number;
   onReject?: (e: RejectEvent) => void;
 }
@@ -161,7 +161,7 @@ export async function authMiddleware(
       return createRemoteJWKSet(jwksUri, {
         timeoutDuration: JWKS_TIMEOUT_MS,
         cooldownDuration: jwt.jwksCooldownS * 1000,
-        [customFetch]: fetchImpl,
+        [customFetch]: jwksBackoff(fetchImpl, opts.now),
       });
     };
     // Same canonical href for the PRM resource, the expected token

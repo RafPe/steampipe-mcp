@@ -5,6 +5,7 @@ import { VerifyError } from "./errors.js";
 import { FetchRefused } from "./fetch-guard.js";
 import { peekIssuer } from "./issuer-peek.js";
 import { checkPolicy, isEmptyPolicy, PolicyViolation, type IdentityPolicy } from "./policy.js";
+import { DEFAULT_INITIAL_DELAY_MS, DEFAULT_MAX_DELAY_MS } from "./retry-loader.js";
 
 export interface IssuerConfig {
   issuer: string;
@@ -96,6 +97,63 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
       }
       throw error;
     }
+  };
+}
+
+/**
+ * Wrap the `fetch` an issuer's JWKS is loaded with (jose's `customFetch`)
+ * in a backoff (R16). jose retries a cold or stale cache on every request,
+ * so without this each request during a JWKS outage would wait for its own
+ * failing fetch. After a failure (a throw, a non-200 answer, or a 200 whose
+ * body is not a JSON object with a `keys` array) every call is refused with
+ * `issuer_unavailable` and no network I/O until a window has passed: 1 s, doubling after each further failure up to 60 s (the retry
+ * loader's schedule, without jitter). The first call after the window
+ * fetches again (jose merges concurrent reloads into that one); a usable 200
+ * resets the schedule.
+ *
+ * The gate sits on the fetch, not on the key resolver, so while jose's
+ * cached JWKS is fresh (`cacheMaxAge`, 10 minutes by default) tokens whose
+ * key is cached keep working during an outage: only requests that need the
+ * network are refused. Once the cache is stale every request needs a
+ * refetch, and gets 503 until the JWKS is back.
+ */
+export function jwksBackoff(fetchImpl: typeof fetch, now: () => number = Date.now): typeof fetch {
+  let failures = 0;
+  let retryAt = 0;
+  const failed = () => {
+    retryAt = now() + Math.min(DEFAULT_INITIAL_DELAY_MS * 2 ** failures, DEFAULT_MAX_DELAY_MS);
+    failures++;
+  };
+  return async (input, init) => {
+    if (failures > 0 && now() < retryAt) {
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+    }
+    let res: Response;
+    try {
+      res = await fetchImpl(input, init);
+    } catch (error) {
+      failed();
+      throw error;
+    }
+    // A 200 counts only if jose can use it: a JSON object with a `keys`
+    // array. Anything else fails in jose as `issuer_unavailable` too, so it
+    // backs off like an error status. The guarded fetch buffers the body,
+    // so the clone costs no network I/O.
+    let usable = false;
+    if (res.status === 200) {
+      try {
+        const body: unknown = await res.clone().json();
+        usable = typeof body === "object" && body !== null && Array.isArray((body as { keys?: unknown }).keys);
+      } catch {
+        usable = false;
+      }
+    }
+    if (usable) {
+      failures = 0;
+    } else {
+      failed();
+    }
+    return res;
   };
 }
 

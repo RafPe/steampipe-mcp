@@ -399,7 +399,15 @@ A token is accepted only if all of these hold:
   present, with `sub` a string of 1 to 256 characters.
 
 A rejected token gets `401` with `error="invalid_token"`. If the JWKS cannot
-be fetched, requests get `503` with `Retry-After: 5`.
+be fetched, requests get `503` with `Retry-After: 5`. After a failed JWKS fetch
+(a connection error, a timeout, a non-`200` answer, or a `200` that is not a
+JSON key set) the server backs off for that issuer: for 1 s, doubling after each
+further failure up to 60 s, requests that would need a JWKS fetch get `503` at
+once without contacting the issuer, then the next such request tries again. A
+successful fetch ends the backoff. Tokens whose key is cached are not affected
+while the cached JWKS is fresh (10 minutes after the last successful fetch);
+once it is stale, every request needs a refetch and gets `503` until the JWKS
+is back.
 
 **Key rotation.** The JWKS is cached. A token whose `kid` is not in the cache
 triggers a refetch, at most once per `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S`

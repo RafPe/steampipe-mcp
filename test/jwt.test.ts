@@ -5,7 +5,7 @@ import { createLocalJWKSet, createRemoteJWKSet, errors, generateKeyPair, type JW
 import { authMiddleware } from "../src/auth/index.js";
 import type { RejectEvent } from "../src/auth/bearer.js";
 import { VerifyError, type Reason } from "../src/auth/errors.js";
-import { createJwtVerifier, type IssuerConfig } from "../src/auth/jwt.js";
+import { createJwtVerifier, jwksBackoff, type IssuerConfig } from "../src/auth/jwt.js";
 import { discoverJwks } from "../src/auth/discovery.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, FetchRefused, type FetchPolicy } from "../src/auth/fetch-guard.js";
 import { ConfigError, loadConfig, type ServerConfig } from "../src/config.js";
@@ -480,13 +480,151 @@ describe("jwt: issuer reachability", () => {
     expect(res.headers["retry-after"]).toBe("5");
   });
 
-  it("answers 503 issuer_unavailable when the JWKS answers 503", async () => {
+  it("answers 503 issuer_unavailable when the JWKS answers 503, and recovers once the backoff has passed", async () => {
+    let clock = NOW_MS;
     const iss = await issuerFor();
-    const app = await startJwt(iss);
+    const app = await startJwt(iss, {}, () => clock);
     iss.setJwksFailing(503);
     await expectRejected(app, await iss.sign(claims(iss)), "issuer_unavailable", 503);
     iss.setJwksFailing(false);
+    clock += 1000;
     await expectAccepted(app, await iss.sign(claims(iss)));
+  });
+});
+
+describe("jwt: JWKS backoff during an outage (R16)", () => {
+  it("fails fast inside the window, doubles it, and serves again after recovery", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    iss.setJwksFailing(true);
+
+    // First failure opens a 1 s window: 3 requests, 1 fetch, 3 × 503.
+    for (let i = 0; i < 3; i++) await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    clock += 999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    // Window over: one more fetch, which fails and opens a 2 s window.
+    clock += 1;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+    clock += 1000;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+
+    iss.setJwksFailing(false);
+    clock += 1000;
+    await expectAccepted(app, token);
+    expect(iss.jwksRequests()).toBe(3);
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(3);
+  });
+
+  it("does not let an unknown-kid refetch failure block tokens served from the warm cache", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(NOW_MS);
+    const iss = await issuerFor();
+    const app = await startJwt(iss, { STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S: "1" }, () => Date.now());
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(1);
+
+    iss.setJwksFailing(true);
+    vi.setSystemTime(NOW_MS + 2_000);
+    await expectRejected(app, await iss.sign(claims(iss), { kid: "unknown-kid" }), "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+    // Inside the backoff window, but the key is cached: no fetch needed.
+    await expectAccepted(app, await iss.sign(claims(iss)));
+    expect(iss.jwksRequests()).toBe(2);
+  });
+});
+
+describe("jwksBackoff", () => {
+  function fakeFetch(outcomes: Array<number | "throw" | { body: string }>) {
+    let calls = 0;
+    const impl = vi.fn(async () => {
+      const next = outcomes[calls++] ?? 200;
+      if (next === "throw") throw new FetchRefused("network", "down");
+      if (typeof next === "object") return new Response(next.body, { status: 200 });
+      return new Response('{"keys":[]}', { status: next });
+    });
+    return { impl: impl as unknown as typeof fetch, calls: () => impl.mock.calls.length };
+  }
+
+  async function outcome(f: typeof fetch): Promise<unknown> {
+    try {
+      return (await f(new URL("https://idp.example/jwks"))).status;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  it("refuses with issuer_unavailable inside the window, without calling fetch", async () => {
+    let clock = 0;
+    const f = fakeFetch(["throw"]);
+    const gated = jwksBackoff(f.impl, () => clock);
+    expect(await outcome(gated)).toBeInstanceOf(FetchRefused);
+    clock = 999;
+    const refused = await outcome(gated);
+    expect(refused).toBeInstanceOf(VerifyError);
+    expect((refused as VerifyError).reason).toBe("issuer_unavailable");
+    expect(f.calls()).toBe(1);
+  });
+
+  it("treats a non-200 answer as a failure, and a 200 resets the schedule", async () => {
+    let clock = 0;
+    const f = fakeFetch([503, "throw", 200, 500]);
+    const gated = jwksBackoff(f.impl, () => clock);
+    expect(await outcome(gated)).toBe(503); // window 1 s
+    clock = 1000;
+    expect(await outcome(gated)).toBeInstanceOf(FetchRefused); // window 2 s
+    clock = 2999;
+    expect(await outcome(gated)).toBeInstanceOf(VerifyError);
+    clock = 3000;
+    expect(await outcome(gated)).toBe(200);
+    expect(f.calls()).toBe(3);
+
+    // After the reset the next failure opens a 1 s window again, not 4 s.
+    expect(await outcome(gated)).toBe(500);
+    clock = 3999;
+    expect(await outcome(gated)).toBeInstanceOf(VerifyError);
+    clock = 4000;
+    expect(await outcome(gated)).toBe(200);
+    expect(f.calls()).toBe(5);
+  });
+
+  it("treats a 200 that is not a JSON key set as a failure", async () => {
+    for (const body of ["not json", "{}", '{"keys":{}}', "[]"]) {
+      let clock = 0;
+      const f = fakeFetch([{ body }, 200]);
+      const gated = jwksBackoff(f.impl, () => clock);
+      expect(await outcome(gated)).toBe(200); // handed to jose, which rejects it
+      clock = 999;
+      expect(await outcome(gated)).toBeInstanceOf(VerifyError);
+      expect(f.calls()).toBe(1);
+      clock = 1000;
+      expect(await outcome(gated)).toBe(200);
+      expect(f.calls()).toBe(2);
+    }
+  });
+
+  it("doubles from 1 s and caps the window at 60 s", async () => {
+    let clock = 0;
+    const f = fakeFetch(Array(9).fill(503));
+    const gated = jwksBackoff(f.impl, () => clock);
+    expect(await outcome(gated)).toBe(503);
+    for (const window of [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]) {
+      const before = f.calls();
+      clock += window - 1;
+      expect(await outcome(gated)).toBeInstanceOf(VerifyError);
+      expect(f.calls()).toBe(before);
+      clock += 1;
+      expect(await outcome(gated)).toBe(503);
+      expect(f.calls()).toBe(before + 1);
+    }
   });
 });
 
