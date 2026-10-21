@@ -548,6 +548,32 @@ describe("jwt: issuer reachability", () => {
 });
 
 describe("jwt: JWKS backoff during an outage (R16)", () => {
+  it("sends one probe for 10 concurrent requests at the window boundary, and answers them all alike", async () => {
+    let clock = NOW_MS;
+    const iss = await issuerFor();
+    const app = await startJwt(iss, {}, () => clock);
+    const token = await iss.sign(claims(iss));
+    iss.setJwksFailing(true);
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(1);
+
+    // Window over, JWKS still down: one probe, ten 503s, and the window doubles.
+    clock += 1000;
+    let replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(503));
+    expect(iss.jwksRequests()).toBe(2);
+    clock += 1999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(iss.jwksRequests()).toBe(2);
+
+    // Window over again, JWKS back: one probe, ten 200s.
+    iss.setJwksFailing(false);
+    clock += 1;
+    replies = await Promise.all(Array.from({ length: 10 }, () => toolsList(app.port, token)));
+    expect(replies.map((r) => r.status)).toEqual(Array(10).fill(200));
+    expect(iss.jwksRequests()).toBe(3);
+  });
+
   it("fails fast inside the window, doubles it, and serves again after recovery", async () => {
     let clock = NOW_MS;
     const iss = await issuerFor();
