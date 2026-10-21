@@ -1,5 +1,6 @@
 import { isLoopback } from "./services/ssl.js";
 import type { DatabaseOptions } from "./services/database.js";
+import { parsePolicyConfig, type PolicyConfig } from "./config/policy.js";
 
 const PREFIX = "STEAMPIPE_MCP_";
 
@@ -39,6 +40,9 @@ export interface ServerConfig {
     allowedDomains: string[];
   };
   allowInsecureRemote: boolean;
+  // Identity policy (REQUIRED_CLAIMS, ALLOWED_SUBJECTS, SUBJECT_PREFIXES),
+  // parsed in http mode only. Consumed by the verifier adapters.
+  policy?: PolicyConfig;
 }
 
 const DEFAULT_CONNECTION_STRING = "postgresql://steampipe@localhost:9193/steampipe";
@@ -280,6 +284,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   const token = raw(env, "AUTH_TOKEN");
   const googleClientId = raw(env, "GOOGLE_CLIENT_ID");
   const allowInsecureRemote = parseBool(env, "ALLOW_INSECURE_REMOTE", false);
+  let policy: PolicyConfig | undefined;
 
   // R11: stdio never binds a port or serves auth/PUBLIC_URL, so none of
   // these settings can make stdio unsafe or unable to start. Scope all of
@@ -287,6 +292,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   // a stdio user's env never blocks startup.
   if (transport === "http") {
     assertPublicUrlIsSecure(publicUrl);
+    policy = parsePolicyConfig(env);
 
     if (authMode === "token") {
       if (!token || token.length < MIN_AUTH_TOKEN_LENGTH) {
@@ -330,5 +336,6 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
       allowedDomains,
     },
     allowInsecureRemote,
+    policy,
   };
 }
