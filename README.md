@@ -252,7 +252,7 @@ This resource enables AI tools to check and verify the connection status to your
 
 1. Clone the repository and navigate to the directory:
 ```sh
-git clone https://github.com/turbot/steampipe-mcp.git
+git clone https://github.com/RafPe/steampipe-mcp.git
 cd steampipe-mcp
 ```
 
@@ -303,7 +303,7 @@ Query limits (both transports):
 | `STEAMPIPE_MCP_MAX_ROWS` | `0` on stdio, `10000` on http | Maximum rows `steampipe_query` returns; `0` means unlimited. When the cap cuts a result short, the tool returns `{"rows": [...], "truncated": true}` instead of a plain array |
 | `STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS` | `120000` | Per-connection Postgres `statement_timeout` (and `idle_in_transaction_session_timeout`) in milliseconds; minimum `1` |
 
-HTTP transport settings. Every value is parsed and syntax-checked in every mode (numbers, `PUBLIC_URL`, `ALLOWED_ORIGINS`, `ALLOWED_HOSTS`), so a malformed value fails startup even on stdio. The policy checks (the non-loopback bind guard, the `token`/`google` auth requirements, and `https` for a non-loopback `PUBLIC_URL`) apply only when `STEAMPIPE_MCP_TRANSPORT=http`:
+HTTP transport settings. Some are validated in every mode, so a malformed value fails startup even on stdio: the numeric settings, `TRANSPORT`, `AUTH_MODE`, `ALLOW_INSECURE_REMOTE`, `TRUST_PROXY`, and the syntax of `PUBLIC_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS`. The policy checks (the non-loopback bind guard, the `token`/`google` auth requirements, and `https` for a non-loopback `PUBLIC_URL`) apply only when `STEAMPIPE_MCP_TRANSPORT=http`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
