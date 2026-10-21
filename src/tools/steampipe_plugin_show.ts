@@ -1,8 +1,10 @@
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { ServerResult, Tool } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from "../services/logger.js";
 import { DatabaseService } from "../services/database.js";
 
-export const tool: Tool = {
+export const tool: Tool & {
+  handler: (db: DatabaseService, args: { name: string }) => Promise<ServerResult>;
+} = {
   name: "steampipe_plugin_show",
   description: "Get details for a specific Steampipe plugin installation, including version, memory limits, and configuration.",
   inputSchema: {

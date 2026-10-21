@@ -1,32 +1,10 @@
 #!/usr/bin/env node
 
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DatabaseService } from "./services/database.js";
 import { configureTypeParser } from "./services/database-config.js";
-import { setupTools, tools } from "./tools/index.js";
-import { setupPromptHandlers, promptCapabilities } from "./prompts/index.js";
-import { setupResourceHandlers, resourceCapabilities } from "./resources/index.js";
-import { setupResourceTemplateHandlers, resourceTemplateCapabilities } from "./resourceTemplates/index.js";
+import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
-import { readFileSync } from 'fs';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-
-// Load package.json
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
-
-// Server metadata
-const SERVER_INFO = {
-  name: "steampipe",
-  version: pkg.version,
-  description: pkg.description,
-  vendor: pkg.author,
-  license: pkg.license,
-  homepage: pkg.homepage,
-} as const;
 
 let serverStartTime: Date;
 
@@ -59,46 +37,30 @@ export async function startServer(port: number = 27123) {
     // Configure global type parsers
     configureTypeParser();
 
-    // Get database service instance (but don't connect yet)
-    const db = DatabaseService.getInstance();
-
-    // Set connection string from command line if provided
-    const connectionString = process.argv[2];
-    if (connectionString) {
-      db.setConfig({
-        connectionString
-      });
+    // Create the database service (it connects lazily on first query)
+    const argConnectionString = process.argv[2];
+    if (argConnectionString) {
       logger.info('Using connection string from command line argument');
     }
+    const db = new DatabaseService({
+      connectionString: argConnectionString
+        || process.env.STEAMPIPE_MCP_WORKSPACE_DATABASE
+        || 'postgresql://steampipe@localhost:9193/steampipe',
+      maxRows: 0,
+      statementTimeoutMs: 120000,
+      poolMax: 20,
+      exposeConnectionDetails: true,
+    });
 
     // Set up shutdown handlers
     setupShutdownHandlers(db);
     logger.info('Shutdown handlers configured');
 
-    // Initialize server
+    // Initialize server (capabilities, tools, prompts, resources, templates)
     logger.info('Creating MCP server instance...');
     const serverStartTime = Date.now();
-    const server = new Server(SERVER_INFO, {
-      capabilities: {
-        tools,
-        prompts: promptCapabilities.prompts,
-        resources: resourceCapabilities.resources,
-        resourceTemplates: resourceTemplateCapabilities.resourceTemplates
-      },
-    });
+    const server = createServer(db);
     logger.info(`MCP server instance created (took ${Date.now() - serverStartTime}ms)`);
-
-    // Initialize handlers
-    logger.info('Setting up handlers...');
-    const handlersStartTime = Date.now();
-    setupTools(server, db);
-    logger.info('Tools handlers initialized');
-    setupPromptHandlers(server);
-    logger.info('Prompt handlers initialized');
-    setupResourceHandlers(server, db);
-    logger.info('Resource handlers initialized');
-    setupResourceTemplateHandlers(server);
-    logger.info(`All handlers initialized successfully (took ${Date.now() - handlersStartTime}ms)`);
 
     // Connect transport
     logger.info('Connecting transport...');

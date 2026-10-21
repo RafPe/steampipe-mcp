@@ -45,8 +45,5 @@ jobs:
       - name: Test
         run: npm test
 
-      # Advisory until PR 2 lands the dependency/CVE cleanup; Task 3 removes
-      # continue-on-error so this gate becomes blocking.
-      - name: Audit (advisory)
+      - name: Audit
         run: npm audit --omit=dev --audit-level=high
-        continue-on-error: true

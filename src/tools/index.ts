@@ -1,7 +1,7 @@
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type CallToolRequest, type Tool, type ServerResult } from "@modelcontextprotocol/sdk/types.js";
 import { DatabaseService } from "../services/database.js";
-import AjvModule from "ajv";
+import AjvModule, { type ValidateFunction } from "ajv";
 import { logger } from "../services/logger.js";
 
 // Import tools
@@ -29,6 +29,15 @@ export const tools = {
   steampipe_plugin_show: pluginShowTool as DbTool,
 } as const;
 
+// Compile each tool's input-schema validator once at module load, rather than
+// on every tool call (ajv.compile() parses/builds a validator function from
+// the JSON schema, which is wasted work to repeat per request).
+const validators: Record<string, ValidateFunction> = Object.fromEntries(
+  Object.entries(tools)
+    .filter(([, tool]) => Boolean(tool.inputSchema))
+    .map(([name, tool]) => [name, ajv.compile(tool.inputSchema)])
+);
+
 // Initialize tool handlers
 export function setupTools(server: Server, db: DatabaseService) {
   // Register tool list handler
@@ -53,8 +62,8 @@ export function setupTools(server: Server, db: DatabaseService) {
       }
 
       // Validate arguments against the tool's schema
-      if (tool.inputSchema) {
-        const validate = ajv.compile(tool.inputSchema);
+      const validate = validators[name];
+      if (validate) {
         if (!validate(args)) {
           logger.error(`Invalid arguments for tool ${name}:`, validate.errors);
           

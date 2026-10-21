@@ -15,7 +15,6 @@ export const resourceCapabilities = {
     resources.map(r => [r.name, {
       uri: r.uri,
       name: r.name,
-      type: r.type,
       description: r.description
     }])
   )
