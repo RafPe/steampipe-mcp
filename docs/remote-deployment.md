@@ -553,7 +553,8 @@ The server serves Protected Resource Metadata at
 `/.well-known/oauth-protected-resource/<path>`, with `resource` set to the
 canonical `STEAMPIPE_MCP_PUBLIC_URL` and `authorization_servers` set to
 `[STEAMPIPE_MCP_JWT_ISSUER]` exactly as written. Audit lines carry the
-token's `iss`, and the per-principal rate limit keys on `iss|sub`, so the same
+configured issuer as `iss` (set once the token has been routed to it, and equal
+to the verified `iss` for accepted tokens), and the per-principal rate limit keys on `iss|sub`, so the same
 `sub` from different issuers never shares a quota. An issuer identifier must
 therefore not contain `|`; the server refuses to start if one does. An
 `auth_reject` line carries `iss` (the configured issuer) once the token has been
