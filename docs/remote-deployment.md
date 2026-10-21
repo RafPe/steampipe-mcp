@@ -10,7 +10,7 @@ The server supports three auth modes:
 |------|---------------------------|-----------------|------------|
 | Static token | `token` | Anyone holding one shared secret | Low |
 | Google OAuth | `google` | Allowlisted Google accounts, each signing in as themselves | Google Cloud OAuth client |
-| JWT access tokens | `jwt` | Anyone your OAuth/OIDC issuer mints an RFC 9068 access token for this server | An issuer that signs JWT access tokens (Keycloak, Auth0, Entra, Okta, ...) |
+| JWT access tokens | `jwt` | Anyone your OAuth/OIDC issuer mints an RFC 9068 access token for this server, narrowed by an optional identity policy | An issuer that mints RFC 9068 JWT access tokens (`typ: at+jwt`, with `client_id` and `jti`); see [Issuer requirements](#issuer-requirements) |
 
 `none` is the default and is only accepted on a loopback bind, unless you set
 `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true`.
@@ -69,9 +69,13 @@ Steampipe instances or workspaces.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
 - *Issuer trust* (jwt mode). Every token your issuer signs for this server's
-  audience is accepted. Restrict who can obtain such tokens at the issuer.
-  Tokens are verified locally, so a token revoked at the issuer keeps working
-  until its `exp`.
+  audience is accepted, unless the [identity policy](#identity-policy-jwt-mode)
+  refuses it. That policy (`STEAMPIPE_MCP_REQUIRED_CLAIMS`,
+  `STEAMPIPE_MCP_ALLOWED_SUBJECTS`, `STEAMPIPE_MCP_SUBJECT_PREFIXES`, or an
+  issuer's own `requiredClaims`/`allowedSubjects`/`subjectPrefixes`) is the
+  per-principal control in jwt mode; scopes are not checked. Also restrict who
+  can obtain such tokens at the issuer. Tokens are verified locally, so a token
+  revoked at the issuer keeps working until its `exp`.
 - *Google availability* (google mode). If tokeninfo is unreachable, slower
   than 5 seconds, answers `429`/`5xx` or a redirect, or sends a body over
   64 KiB, requests fail closed with `503` `temporarily_unavailable` and
@@ -361,11 +365,11 @@ STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform
 # STEAMPIPE_MCP_JWT_AUDIENCES=https://mcp.example.com/mcp   # default: PUBLIC_URL
 # STEAMPIPE_MCP_JWT_ALGORITHMS=RS256,ES256
 # STEAMPIPE_MCP_JWT_ACCEPTED_TYP=at+jwt,application/at+jwt
-# STEAMPIPE_MCP_JWT_CLOCK_SKEW_S=0
+# STEAMPIPE_MCP_JWT_CLOCK_SKEW_S=0          # 0 to 300
 # STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S=0
 # STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S=30
-# STEAMPIPE_MCP_JWT_SCOPES_SUPPORTED=
-# STEAMPIPE_MCP_JWT_CHALLENGE_SCOPE=
+# STEAMPIPE_MCP_JWT_SCOPES_SUPPORTED=      # advertised only, never required
+# STEAMPIPE_MCP_JWT_CHALLENGE_SCOPE=        # advertised only, never required
 # STEAMPIPE_MCP_JWT_ALLOWED_HOSTS=        # extra https hosts for the JWKS
 ```
 
@@ -380,11 +384,32 @@ loopback http URL (local development). Otherwise the server refuses to start. On
 fetches use the same restricted fetch as Google mode: no redirects, 64 KiB
 bodies, 5 s timeouts.
 
+### Issuer requirements
+
+The issuer must mint **RFC 9068 JWT access tokens**. Concretely, every access
+token it issues for this server must have:
+
+- header `typ` `at+jwt` (or `application/at+jwt`), unless
+  `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` widens it;
+- the claims `iss`, `aud`, `exp`, `iat`, `sub`, `client_id` and `jti`.
+
+This profile is strict and is not configurable per claim.
+`STEAMPIPE_MCP_JWT_ACCEPTED_TYP` widens the `typ` check only: a token without
+`client_id` or `jti` is rejected as `malformed` (`401`) whatever `typ` it
+carries, including a token that names its client in another claim (such as
+`azp`) or carries its ID under another name. ID tokens and other generic JWTs
+are rejected too. This guide names no identity provider as compatible: check
+your issuer's documented access-token header and claim set against the list
+above before you rely on it, and test with a real token.
+
+### Token checks
+
 A token is accepted only if all of these hold:
 
 - its header `typ` is in `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` (case-insensitive).
   The default, `at+jwt`, keeps ID tokens and other generic JWTs out. Add `JWT`
-  only for issuers that put `typ: "JWT"` on their access tokens (e.g. Entra v2).
+  only for issuers that put `typ: "JWT"` on otherwise RFC 9068 access tokens:
+  it widens the `typ` check only, and the claims below are still required.
   A token with no `typ` at all is always rejected.
 - its `alg` is in `STEAMPIPE_MCP_JWT_ALGORITHMS`. `none` and `HS*` are refused
   at startup, so neither `alg:none` nor an HMAC key made from the public key
@@ -393,7 +418,7 @@ A token is accepted only if all of these hold:
 - `iss` equals the issuer and `aud` contains one of the audiences, both
   compared as exact strings.
 - `exp` is in the future and `nbf`, if present, is not, each with
-  `STEAMPIPE_MCP_JWT_CLOCK_SKEW_S` of leeway and no more. `iat` is no older
+  `STEAMPIPE_MCP_JWT_CLOCK_SKEW_S` of leeway (0 to 300 s) and no more. `iat` is no older
   than `STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S`, when that is set.
 - the RFC 9068 §2.2 claims `exp`, `iat`, `jti`, `client_id` and `sub` are
   present, with `sub` a string of 1 to 256 characters.
@@ -407,7 +432,10 @@ once without contacting the issuer, then the next such request tries again. A
 successful fetch ends the backoff. Tokens whose key is cached are not affected
 while the cached JWKS is fresh (10 minutes after the last successful fetch);
 once it is stale, every request needs a refetch and gets `503` until the JWKS
-is back.
+is back. Each backoff window logs one warning with the issuer's origin (never
+its path), the consecutive failure count, the next delay and the cause, and the
+first successful fetch after failures logs one info line (see Logging in the
+README).
 
 **Key rotation.** The JWKS is cached. A token whose `kid` is not in the cache
 triggers a refetch, at most once per `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S`
@@ -420,23 +448,48 @@ The server serves Protected Resource Metadata at
 canonical `STEAMPIPE_MCP_PUBLIC_URL` and `authorization_servers` set to
 `[STEAMPIPE_MCP_JWT_ISSUER]` exactly as written. Audit lines carry the
 token's `iss`, and the per-principal rate limit keys on `iss|sub`, so the same
-`sub` from different issuers never shares a quota.
+`sub` from different issuers never shares a quota. An issuer identifier must
+therefore not contain `|`; the server refuses to start if one does. An
+`auth_reject` line carries `iss` (the configured issuer) once the token has been
+routed to an issuer, and none when its `iss` is missing or unconfigured.
 
-**Several issuers.** To trust more than one issuer behind the same header, set
+### Several issuers
+
+To trust more than one issuer behind the same header, set
 `STEAMPIPE_MCP_JWT_ISSUERS` instead of `STEAMPIPE_MCP_JWT_ISSUER`:
 
 ```sh
 STEAMPIPE_MCP_JWT_ISSUERS='[
   {"issuer": "https://idp.example.com/realms/platform"},
-  {"issuer": "https://login.example.net/tenant-1/v2.0", "acceptedTyp": ["JWT"],
-   "audiences": ["api://steampipe-mcp"], "advertise": false}
+  {"issuer": "https://login.example.net/tenant-1",
+   "audiences": ["api://steampipe-mcp"], "advertise": false,
+   "requiredClaims": {"client_id": ["reporting-job"]}}
 ]'
 ```
 
 Each entry accepts `issuer` (required), `audiences`, `algorithms`,
-`acceptedTyp`, `clockSkewS`, `maxTokenAgeS` and `advertise`; a missing field
-takes the matching single-issuer variable. The server reads the token's `iss`
-without verifying it, only to pick the entry whose `issuer` matches exactly;
+`acceptedTyp`, `clockSkewS` (0 to 300), `maxTokenAgeS`, `advertise`,
+`requiredClaims`, `allowedSubjects` and `subjectPrefixes`. A missing
+`audiences`, `algorithms`, `acceptedTyp`, `clockSkewS` or `maxTokenAgeS` takes
+the matching single-issuer variable, and `issuer` follows the
+`STEAMPIPE_MCP_JWT_ISSUER` rules (`|` included). Every issuer must meet the
+[issuer requirements](#issuer-requirements).
+
+`requiredClaims`, `allowedSubjects` and `subjectPrefixes` take the same form
+and limits as `STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`
+and `STEAMPIPE_MCP_SUBJECT_PREFIXES`, and give that issuer its own identity
+policy. It **replaces** the global policy for that issuer as a whole and is
+never merged with it: a policy field the entry leaves out is empty, not
+inherited from the global variables. In the example above, tokens from
+`login.example.net/tenant-1` must have `client_id` `reporting-job` and are not
+checked against the global policy at all, while the first issuer stays on the
+global policy. An entry with none of the three fields uses the global policy.
+An entry whose policy fields set no rules (for example `"requiredClaims": {}`)
+is a startup error, since it would silently switch the global policy off for
+that issuer; to leave an issuer unrestricted, leave the global policy empty
+instead.
+
+The server reads the token's `iss` without verifying it, only to pick the entry whose `issuer` matches exactly;
 the token is then verified with that issuer's JWKS and settings alone, so a
 token claiming one issuer but signed by another fails its signature check. A
 token whose `iss` matches no entry is refused (`401`) without any network call.
@@ -454,3 +507,27 @@ first entry), never its URL, so the unauthenticated `/readyz` does not reveal
 entry per configured issuer instead of the single `auth` entry. `authorization_servers` lists the entries with
 `"advertise": true` (the default), in array order, so an issuer used only by
 machine clients can stay unlisted; at least one entry must be advertised.
+
+### Identity policy (jwt mode)
+
+Without a policy, every valid token for this server's audience is accepted. To
+narrow that, set `STEAMPIPE_MCP_REQUIRED_CLAIMS`,
+`STEAMPIPE_MCP_ALLOWED_SUBJECTS` and `STEAMPIPE_MCP_SUBJECT_PREFIXES` (see the
+README for their form and limits). The policy is checked after every other
+token check, against the verified token payload, with `sub` as the subject. A
+token that fails it gets `403 access_denied` with no `WWW-Authenticate`
+challenge. A `STEAMPIPE_MCP_JWT_ISSUERS` entry can replace it for one issuer
+(see [Several issuers](#several-issuers)).
+
+```sh
+STEAMPIPE_MCP_REQUIRED_CLAIMS='{"client_id":["claude-code","reporting-job"]}'
+STEAMPIPE_MCP_SUBJECT_PREFIXES='["svc-"]'
+```
+
+**Scopes are advertised only; a token is not required to carry them. Use the
+identity policy to restrict who is accepted.** `STEAMPIPE_MCP_JWT_SCOPES_SUPPORTED`
+only fills `scopes_supported` in the Protected Resource Metadata, and
+`STEAMPIPE_MCP_JWT_CHALLENGE_SCOPE` only adds `scope` to `401` challenges. To
+require a scope, use `REQUIRED_CLAIMS`, but note that it compares the token's
+whole `scope` string: `{"scope":["mcp.read"]}` matches a token whose `scope` is
+exactly `mcp.read`, not one with `mcp.read mcp.write`.
