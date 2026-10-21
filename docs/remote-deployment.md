@@ -10,7 +10,7 @@ The server supports three auth modes:
 |------|---------------------------|-----------------|------------|
 | Static token | `token` | Anyone holding one shared secret | Low |
 | Google OAuth | `google` | Allowlisted Google accounts, each signing in as themselves | Google Cloud OAuth client |
-| JWT access tokens | `jwt` | Anyone your OAuth/OIDC issuer mints an RFC 9068 access token for this server, narrowed by an optional identity policy | An issuer that mints RFC 9068 JWT access tokens (`typ: at+jwt`, with `client_id` and `jti`); see [Issuer requirements](#issuer-requirements) |
+| JWT access tokens | `jwt` | Anyone your OAuth/OIDC issuer mints an RFC 9068 access token for this server, narrowed by an optional identity policy | An issuer that mints RFC 9068 JWT access tokens (`typ: at+jwt`, with `client_id` and `jti`), or, per issuer and only with an identity policy, the opt-in [lenient profile](#lenient-profile-opt-in-per-issuer); see [Issuer requirements](#issuer-requirements) |
 
 `none` is the default and is only accepted on a loopback bind, unless you set
 `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true`.
@@ -365,6 +365,7 @@ STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform
 # STEAMPIPE_MCP_JWT_AUDIENCES=https://mcp.example.com/mcp   # default: PUBLIC_URL
 # STEAMPIPE_MCP_JWT_ALGORITHMS=RS256,ES256
 # STEAMPIPE_MCP_JWT_ACCEPTED_TYP=at+jwt,application/at+jwt
+# STEAMPIPE_MCP_JWT_PROFILE=rfc9068         # or lenient (needs an identity policy)
 # STEAMPIPE_MCP_JWT_CLOCK_SKEW_S=0          # 0 to 300
 # STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S=0
 # STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S=30
@@ -386,31 +387,128 @@ bodies, 5 s timeouts.
 
 ### Issuer requirements
 
-The issuer must mint **RFC 9068 JWT access tokens**. Concretely, every access
-token it issues for this server must have:
+With the default profile (`rfc9068`), the issuer must mint **RFC 9068 JWT
+access tokens**. Concretely, every access token it issues for this server must
+have:
 
 - header `typ` `at+jwt` (or `application/at+jwt`), unless
   `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` widens it;
 - the claims `iss`, `aud`, `exp`, `iat`, `sub`, `client_id` and `jti`.
 
-This profile is strict and is not configurable per claim.
+This profile is strict and is not configurable per claim; the only relaxation
+is the opt-in [lenient profile](#lenient-profile-opt-in-per-issuer), chosen per
+issuer. Under the default profile,
 `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` widens the `typ` check only: a token without
 `client_id` or `jti` is rejected as `malformed` (`401`) whatever `typ` it
 carries, including a token that names its client in another claim (such as
 `azp`) or carries its ID under another name. ID tokens and other generic JWTs
-are rejected too. This guide names no identity provider as compatible: check
-your issuer's documented access-token header and claim set against the list
-above before you rely on it, and test with a real token.
+are rejected too. This guide names no identity provider as compatible with the
+default profile: check your issuer's documented access-token header and claim
+set against the list above before you rely on it, and test with a real token.
+
+### Lenient profile (opt-in, per issuer)
+
+Some issuers sign access tokens that are not RFC 9068 tokens: for example,
+GitHub Actions OIDC tokens carry `typ: "JWT"` and no `client_id`, and Entra ID
+v2 access tokens carry `typ: "JWT"`, `azp` instead of `client_id` and `uti`
+instead of `jti`. The default profile rejects them as `malformed`. To accept
+such tokens from one issuer, set `"profile": "lenient"` on its
+`STEAMPIPE_MCP_JWT_ISSUERS` entry, or `STEAMPIPE_MCP_JWT_PROFILE=lenient` with
+a single `STEAMPIPE_MCP_JWT_ISSUER`. The default is `rfc9068`; any other value
+is a startup error. `STEAMPIPE_MCP_JWT_PROFILE` applies to
+`STEAMPIPE_MCP_JWT_ISSUER` only: it is not a default for
+`STEAMPIPE_MCP_JWT_ISSUERS` entries, and setting it together with
+`STEAMPIPE_MCP_JWT_ISSUERS` is a startup error.
+
+**A lenient issuer needs an identity policy.** Without `client_id` and an
+`at+jwt` `typ` to bind a token to an OAuth client, the audience and the
+identity policy are the only checks that tell one principal from another. So
+the server refuses to start unless the lenient issuer's effective policy (its
+own `requiredClaims` / `allowedSubjects` / `subjectPrefixes`, or else the
+global `STEAMPIPE_MCP_REQUIRED_CLAIMS` / `STEAMPIPE_MCP_ALLOWED_SUBJECTS` /
+`STEAMPIPE_MCP_SUBJECT_PREFIXES`) has at least one rule.
+
+Under the lenient profile, only these checks change; everything else in
+[Token checks](#token-checks) still applies (signature, algorithm allowlist,
+exact issuer, exact audience, `exp`/`nbf`/`iat` and maximum age, the identity
+policy):
+
+- the accepted `typ` values default to `at+jwt`, `application/at+jwt` and
+  `JWT` (case-insensitive), unless the entry's `acceptedTyp` or
+  `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` is set, which then applies as written. A
+  token with no `typ` is still rejected.
+- the required claims are `exp`, `iat` and `sub`. `client_id` and `jti` are
+  optional, but when present (as are `azp`, `appid` and `uti`) they must be
+  non-empty strings, or the token is rejected as `malformed`.
+- a token carrying a `nonce` claim is rejected as `malformed`. OIDC ID tokens
+  carry `nonce` when the client sent one; the access tokens these issuers mint
+  are not expected to. This is a heuristic, not a full ID-token defence: an ID
+  token minted without `nonce` whose `aud` is one of this server's audiences
+  is stopped only by the audience and the identity policy. Keep the audience
+  specific to this server (do not reuse a client ID that also receives ID
+  tokens), and keep the policy narrow.
+- the client reported in the audit line and the request's auth info is
+  `client_id`, else `azp`, else `appid`, else `unknown`. The identity policy
+  still compares the token's own claims: `{"client_id": [...]}` does not
+  match an Entra token, which carries `azp`.
+
+The two examples below are **illustrative only**. They show the shape of a
+config, not a verified integration. Decode a real token from your workflow or
+tenant and check its `iss`, `aud`, `typ`, `sub` and the claims your policy
+names before relying on either; issuers can change what they emit, and the
+values depend on how the token was requested.
+
+GitHub Actions (OIDC token requested with this server's URL as its audience,
+for example via `core.getIDToken(<audience>)`):
+
+```sh
+STEAMPIPE_MCP_JWT_ISSUERS='[
+  {"issuer": "https://idp.example.com/realms/platform"},
+  {"issuer": "https://token.actions.githubusercontent.com",
+   "audiences": ["https://mcp.example.com/mcp"],
+   "profile": "lenient",
+   "subjectPrefixes": ["repo:example-org/"],
+   "advertise": false}
+]'
+# or, instead of subjectPrefixes: "requiredClaims": {"repository_owner": ["example-org"]}
+```
+
+Use the trailing `/` in the prefix, so that `repo:example-org-evil/...` does
+not match. `advertise: false` keeps an issuer used only by CI out of the
+Protected Resource Metadata; the first entry (your interactive issuer, with
+the default profile) stays advertised, since at least one entry must be.
+
+Entra ID v2 (an app registration that exposes this API and issues v2 access
+tokens):
+
+```sh
+STEAMPIPE_MCP_JWT_ISSUERS='[
+  {"issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0",
+   "audiences": ["<App ID URI or client ID your API exposes>"],
+   "profile": "lenient",
+   "requiredClaims": {"tid": ["<tenant-id>"]}}
+]'
+```
+
+Check the token's `iss` against the configured string byte for byte: Entra
+issues v1-format tokens (with a different `iss`) unless the API's app
+registration asks for v2 tokens. A `tid` rule alone admits every principal in
+the tenant that can get a token for this audience; narrow it further (for
+example `azp` or `roles`) where you can.
 
 ### Token checks
 
 A token is accepted only if all of these hold:
 
-- its header `typ` is in `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` (case-insensitive).
-  The default, `at+jwt`, keeps ID tokens and other generic JWTs out. Add `JWT`
-  only for issuers that put `typ: "JWT"` on otherwise RFC 9068 access tokens:
-  it widens the `typ` check only, and the claims below are still required.
-  A token with no `typ` at all is always rejected.
+- its header `typ` is in the issuer's accepted list (case-insensitive): the
+  entry's `acceptedTyp`, else `STEAMPIPE_MCP_JWT_ACCEPTED_TYP`. Under the
+  default profile the default, `at+jwt` (or `application/at+jwt`), keeps ID
+  tokens and other generic JWTs out. Add `JWT` only for issuers that put
+  `typ: "JWT"` on otherwise RFC 9068 access tokens: it widens the `typ` check
+  only, and the claims below are still required. For a
+  [lenient](#lenient-profile-opt-in-per-issuer) issuer the default list also
+  holds `JWT` (unless `acceptedTyp` or `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` is
+  set). A token with no `typ` at all is always rejected, under either profile.
 - its `alg` is in `STEAMPIPE_MCP_JWT_ALGORITHMS`. `none` and `HS*` are refused
   at startup, so neither `alg:none` nor an HMAC key made from the public key
   works.
@@ -421,7 +519,9 @@ A token is accepted only if all of these hold:
   `STEAMPIPE_MCP_JWT_CLOCK_SKEW_S` of leeway (0 to 300 s) and no more. `iat` is no older
   than `STEAMPIPE_MCP_JWT_MAX_TOKEN_AGE_S`, when that is set.
 - the RFC 9068 §2.2 claims `exp`, `iat`, `jti`, `client_id` and `sub` are
-  present, with `sub` a string of 1 to 256 characters.
+  present, with `sub` a string of 1 to 256 characters (for a
+  [lenient](#lenient-profile-opt-in-per-issuer) issuer: `exp`, `iat` and
+  `sub`).
 
 A rejected token gets `401` with `error="invalid_token"`. If the JWKS cannot
 be fetched, requests get `503` with `Retry-After: 5`. After a failed JWKS fetch
@@ -469,11 +569,12 @@ STEAMPIPE_MCP_JWT_ISSUERS='[
 
 Each entry accepts `issuer` (required), `audiences`, `algorithms`,
 `acceptedTyp`, `clockSkewS` (0 to 300), `maxTokenAgeS`, `advertise`,
-`requiredClaims`, `allowedSubjects` and `subjectPrefixes`. A missing
+`requiredClaims`, `allowedSubjects`, `subjectPrefixes` and `profile`. A missing
 `audiences`, `algorithms`, `acceptedTyp`, `clockSkewS` or `maxTokenAgeS` takes
 the matching single-issuer variable, and `issuer` follows the
-`STEAMPIPE_MCP_JWT_ISSUER` rules (`|` included). Every issuer must meet the
-[issuer requirements](#issuer-requirements).
+`STEAMPIPE_MCP_JWT_ISSUER` rules (`|` included). A missing `profile` is
+`rfc9068`; it never takes `STEAMPIPE_MCP_JWT_PROFILE`. Every issuer must meet the
+[issuer requirements](#issuer-requirements) of its profile.
 
 `requiredClaims`, `allowedSubjects` and `subjectPrefixes` take the same form
 and limits as `STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`

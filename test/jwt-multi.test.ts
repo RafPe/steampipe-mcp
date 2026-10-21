@@ -831,3 +831,119 @@ describe("jwt identity policy config", () => {
     expect(configError({ subjectPrefix: ["repo:RafPe/"] }).message).toMatch(/subjectPrefix/);
   });
 });
+
+describe("jwt multi-issuer: lenient profile (R27)", () => {
+  /** GitHub Actions / Entra v2 shaped: no client_id (and no jti for Entra). */
+  function lenientShaped(iss: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return claims(iss, { sub: "repo:acme/app:ref:refs/heads/main", azp: "azp-1", uti: "u-1", client_id: undefined, jti: undefined, ...overrides });
+  }
+
+  it("applies the lenient profile to its own issuer only", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti([
+      // A's typ allowlist includes JWT, so only the claim set can refuse a B-shaped token.
+      { issuer: a.issuer, acceptedTyp: ["at+jwt", "JWT"] },
+      { issuer: b.issuer, profile: "lenient", subjectPrefixes: ["repo:acme/"] },
+    ]);
+    await expectAccepted(app, await b.sign(lenientShaped(b.issuer), { typ: "JWT" }));
+    // The same shape signed by A for A: A stays rfc9068.
+    await expectRejected(app, await a.sign(lenientShaped(a.issuer), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await a.sign(lenientShaped(a.issuer)), "malformed");
+    // A still accepts its own RFC 9068 tokens.
+    await expectAccepted(app, await a.sign(claims(a.issuer)));
+  });
+
+  it("does not let a lenient issuer's key sign for an rfc9068 issuer", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti([
+      { issuer: a.issuer },
+      { issuer: b.issuer, profile: "lenient", subjectPrefixes: ["repo:acme/"] },
+    ]);
+    await expectRejected(app, await b.sign(lenientShaped(a.issuer), { typ: "JWT" }), "malformed");
+    await expectRejected(app, await b.sign(claims(a.issuer)), "signature");
+  });
+
+  it("writes the azp fallback as clientId in the audit line", async () => {
+    const b = await issuerFor();
+    const app = await startMulti(
+      [{ issuer: b.issuer, profile: "lenient", requiredClaims: { tid: ["tenant-1"] } }],
+      {},
+      { audit: true },
+    );
+    const token = await b.sign(lenientShaped(b.issuer, { azp: "azp-entra-7", tid: "tenant-1" }), { typ: "JWT" });
+    expect((await toolsList(app.port, token)).status).toBe(200);
+    const audit = logger.getCollectedLogs().filter((l) => l.includes('"method":"tools/list"'));
+    expect(audit).toHaveLength(1);
+    expect(audit[0]).toContain('"clientId":"azp-entra-7"');
+  });
+});
+
+describe("jwt multi-issuer lenient profile config (R27)", () => {
+  function load(entries: unknown[], env: Record<string, string> = {}): ServerConfig {
+    return loadConfig(multiEnv(entries, env), ["node", "index.js"]);
+  }
+
+  function configError(entries: unknown[], env: Record<string, string> = {}): ConfigError {
+    try {
+      load(entries, env);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return error as ConfigError;
+    }
+    throw new Error("expected loadConfig to throw");
+  }
+
+  it("refuses a lenient entry with no override and an empty global policy", () => {
+    const err = configError([{ issuer: "https://a.example" }, { issuer: "https://b.example", profile: "lenient" }]);
+    expect(err.message).toMatch(/STEAMPIPE_MCP_JWT_ISSUERS\[1\]\.profile/);
+    expect(err.message).toMatch(/identity policy/);
+  });
+
+  it("loads a lenient entry covered by the global policy only", () => {
+    const cfg = load([{ issuer: "https://a.example", profile: "lenient" }], {
+      STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"repository_owner":["acme"]}',
+    });
+    expect(cfg.auth.jwt?.issuers[0].profile).toBe("lenient");
+    expect(cfg.auth.jwt?.issuers[0].policy).toBeUndefined();
+  });
+
+  it("loads a lenient entry with its own override only", () => {
+    const cfg = load([{ issuer: "https://a.example", profile: "lenient", subjectPrefixes: ["repo:acme/"] }]);
+    expect(cfg.auth.jwt?.issuers[0].profile).toBe("lenient");
+    expect(cfg.auth.jwt?.issuers[0].acceptedTyp).toEqual(["at+jwt", "application/at+jwt", "jwt"]);
+  });
+
+  it("keeps an entry's explicit acceptedTyp, or an explicit JWT_ACCEPTED_TYP, under lenient", () => {
+    const own = load([{ issuer: "https://a.example", profile: "lenient", acceptedTyp: ["at+jwt"], subjectPrefixes: ["x"] }]);
+    expect(own.auth.jwt?.issuers[0].acceptedTyp).toEqual(["at+jwt"]);
+    const env = load([{ issuer: "https://a.example", profile: "lenient", subjectPrefixes: ["x"] }], {
+      STEAMPIPE_MCP_JWT_ACCEPTED_TYP: "at+jwt",
+    });
+    expect(env.auth.jwt?.issuers[0].acceptedTyp).toEqual(["at+jwt"]);
+  });
+
+  it("leaves rfc9068 entries (explicit or default) without a profile field", () => {
+    const cfg = load([{ issuer: "https://a.example", profile: "rfc9068" }, { issuer: "https://b.example" }]);
+    expect(cfg.auth.jwt?.issuers.map((i) => i.profile)).toEqual([undefined, undefined]);
+    expect(cfg.auth.jwt?.issuers[0].acceptedTyp).toEqual(["at+jwt", "application/at+jwt"]);
+  });
+
+  it("refuses an unknown or non-string profile without echoing it", () => {
+    for (const profile of ["loose", "LENIENT", 1, null, ["lenient"]]) {
+      const err = configError([{ issuer: "https://a.example", profile, subjectPrefixes: ["x"] }]);
+      expect(err.message).toMatch(/^STEAMPIPE_MCP_JWT_ISSUERS\[0\]\.profile must be/);
+      expect(err.message).not.toContain("loose");
+      expect(err.message).not.toContain("LENIENT");
+    }
+  });
+
+  it("refuses JWT_PROFILE together with JWT_ISSUERS, so lenient is set per entry", () => {
+    const err = configError([{ issuer: "https://a.example", subjectPrefixes: ["x"] }], {
+      STEAMPIPE_MCP_JWT_PROFILE: "lenient",
+    });
+    expect(err.message).toMatch(/STEAMPIPE_MCP_JWT_PROFILE/);
+    expect(err.message).toMatch(/profile/);
+  });
+});
