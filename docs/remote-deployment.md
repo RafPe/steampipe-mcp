@@ -78,9 +78,23 @@ Steampipe instances or workspaces.
   `/readyz` reports `"auth":"pending"`, while bearer tokens are still
   verified.
 
-The unauthenticated endpoints are `GET /healthz` (static `{"status":"ok"}`),
-`GET`/`DELETE /mcp` (always `405`), and in google mode the public metadata
-under `/.well-known/` (see below). None of them touch the database.
+The unauthenticated endpoints that never touch the database are
+`GET /healthz` (static `{"status":"ok"}`), `GET`/`DELETE /mcp` (always
+`405`), and in google mode the public metadata under `/.well-known/` (see
+below).
+
+`GET /readyz` is also unauthenticated, and it **does** connect to the
+database: its `db` check opens a dedicated, short-lived connection (never a
+pooled one) and runs `select 1`. Like `/healthz` it is exempt from Host and
+Origin validation, so Kubernetes probes work, and it is not rate limited.
+Concurrent probes share one in-flight evaluation and its result is reused
+for 1 s, so a flood of probes does not multiply database connections: a new
+evaluation starts at most once per second after the previous one finishes.
+Connect and query together are bounded by 2 s and cleanup by another 2 s,
+and timeout parameters in the database URL cannot extend that.
+The response carries check names and statuses only. If you do not want it
+reachable from outside, block `/readyz` at your proxy and probe it from
+inside the cluster.
 
 ## Common server settings
 
@@ -136,8 +150,8 @@ This is also the fallback if google mode does not work with your client (see
 In this mode the server is an OAuth 2.0 *resource server*. Google is the
 authorization server. The MCP client signs the user in with Google, gets a
 Google access token, and sends it as a bearer token. The server checks each
-token against Google's tokeninfo endpoint and then applies the email
-allowlist.
+token against Google's tokeninfo endpoint, then applies the email
+allowlist, then the identity policy if one is configured.
 
 Two Google constraints shape the setup:
 
@@ -145,7 +159,11 @@ Two Google constraints shape the setup:
   with Google, so you create an OAuth client once and give its credentials to
   each user's MCP client.
 - **Opaque access tokens and no custom scopes.** Tokens are validated online
-  through tokeninfo, and authorization is by email allowlist only.
+  through tokeninfo. Authorization is by the email/domain allowlist plus,
+  optionally, a declarative identity policy on the tokeninfo fields
+  (`STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`,
+  `STEAMPIPE_MCP_SUBJECT_PREFIXES`; see the README). There are no OAuth
+  scopes to check.
 
 ### 1. Google Cloud setup
 
@@ -211,12 +229,17 @@ often omits `hd`. A missing `hd` is not rejected, so this check is **not** a
 substitute for the Internal consent screen.
 
 At startup the server fetches
-`https://accounts.google.com/.well-known/openid-configuration`, and refuses to
-start if that fails or names any issuer other than
-`https://accounts.google.com`. Once running it serves:
+`https://accounts.google.com/.well-known/openid-configuration`. With degraded
+start disabled (the default, `STEAMPIPE_MCP_ALLOW_DEGRADED_START=false`) it
+refuses to start if that fails or names any issuer other than
+`https://accounts.google.com`. With degraded start enabled it starts anyway
+and keeps retrying in the background; until a fetch succeeds, the metadata
+below answers `503` with `Retry-After: 5` (see *Google availability* above).
+Once running it serves:
 
 - `GET /.well-known/oauth-protected-resource/mcp` (and `HEAD`): RFC 9728
-  Protected Resource Metadata. `resource` is your `PUBLIC_URL`,
+  Protected Resource Metadata. `resource` is your `PUBLIC_URL` in canonical
+  form (a bare origin gains a trailing `/`; see the README),
   `authorization_servers` is `["https://accounts.google.com"]`,
   `scopes_supported` is `["openid","email"]`, and `bearer_methods_supported`
   is `["header"]`. It is served with `Cache-Control: max-age=300`; any other
@@ -245,7 +268,12 @@ How each token is validated:
    `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout covering
    headers and body. Like the startup discovery fetch, this goes through a
    restricted fetch: https to `oauth2.googleapis.com` or `accounts.google.com`
-   only, redirects never followed, bodies capped at 64 KiB.
+   only, redirects never followed, bodies capped at 64 KiB. This restricts
+   which URLs the identity-provider calls may reach; it is not general SSRF
+   protection. Hostnames are not resolved and checked against private or
+   internal address ranges (no DNS or private-address filtering), so if an
+   allowlisted name resolved to an internal address, that address would be
+   reached. Its trust boundary is the hostname allowlist and your DNS.
 2. A network error, a timeout, a `429`/`5xx` answer, any redirect, or a body
    over 64 KiB → `503 temporarily_unavailable` with `Retry-After: 5`.
 3. Any other non-200 response, a body that is not a JSON object, `aud`
@@ -255,8 +283,12 @@ How each token is validated:
    an allowlisted domain, or a domain-only match where `hd` is present and
    differs from the email's domain → `403 access_denied`, with no
    `WWW-Authenticate` challenge.
-5. Otherwise accept. The result is cached for at most 60 seconds, keyed by the
-   token's sha256.
+5. If an identity policy is configured (`REQUIRED_CLAIMS`, `ALLOWED_SUBJECTS`,
+   `SUBJECT_PREFIXES`) and the tokeninfo fields do not satisfy it →
+   `403 access_denied`, with no `WWW-Authenticate` challenge. The policy runs
+   only after the allowlist has passed; both must pass.
+6. Otherwise accept. The result is cached for at most 60 seconds, keyed by the
+   token's sha256. Only accepted results are cached.
 
 At `STEAMPIPE_MCP_LOG_LEVEL=debug` the server logs the authenticated (or
 rejected) email. It never logs tokens.
