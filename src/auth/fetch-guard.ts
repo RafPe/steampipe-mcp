@@ -145,6 +145,34 @@ async function readBounded(res: Response, maxBytes: number): Promise<Uint8Array 
   return out.subarray(0, length);
 }
 
+// `AbortSignal.any` only exists from Node 20.3; engines allows 20.0. The
+// fallback aborts one controller from whichever input fires first, and
+// `release` detaches its listeners once the request settles.
+function anySignal(signals: AbortSignal[]): { signal: AbortSignal; release: () => void } {
+  if (typeof AbortSignal.any === "function") {
+    return { signal: AbortSignal.any(signals), release: () => {} };
+  }
+  const controller = new AbortController();
+  const listeners: Array<[AbortSignal, () => void]> = [];
+  const release = () => {
+    for (const [s, l] of listeners) s.removeEventListener("abort", l);
+  };
+  for (const s of signals) {
+    if (s.aborted) {
+      controller.abort(s.reason);
+      break;
+    }
+    const l = () => {
+      controller.abort(s.reason);
+      release();
+    };
+    s.addEventListener("abort", l, { once: true });
+    listeners.push([s, l]);
+  }
+  if (controller.signal.aborted) release();
+  return { signal: controller.signal, release };
+}
+
 /**
  * Returns a `fetch` that enforces `policy` (see the module comment). The
  * returned Response has its body fully buffered (at most `maxBytes`), so
@@ -157,7 +185,9 @@ export function guardedFetch(policy: FetchPolicy): typeof fetch {
 
     const timeout = AbortSignal.timeout(policy.timeoutMs);
     const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
-    const signal = callerSignal ? AbortSignal.any([callerSignal, timeout]) : timeout;
+    const { signal, release } = callerSignal
+      ? anySignal([callerSignal, timeout])
+      : { signal: timeout, release: () => {} };
     const where = `${url.protocol}//${url.host}`;
 
     try {
@@ -180,6 +210,8 @@ export function guardedFetch(policy: FetchPolicy): typeof fetch {
         throw new FetchRefused("timeout", `request to ${where} exceeded ${policy.timeoutMs}ms`);
       }
       throw new FetchRefused("network", `request to ${where} failed`);
+    } finally {
+      release();
     }
   };
 }

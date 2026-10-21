@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import {
@@ -87,6 +87,7 @@ describe("assertAllowedUrl", () => {
     allowed("https://idp.example.com/.well-known/openid-configuration");
     allowed("https://IDP.EXAMPLE.COM/jwks");
     allowed("https://idp.example.com:8443/jwks");
+    refused("https://other.example.com/jwks");
   });
 
   it("refuses https hosts not on the allowlist, including look-alikes", () => {
@@ -102,6 +103,7 @@ describe("assertAllowedUrl", () => {
     allowed("http://[::1]:9000/x");
     allowed("http://localhost:9000/x");
     allowed("http://LOCALHOST/x");
+    refused("http://10.0.0.1/x");
   });
 
   it("refuses http to hosts that only look like loopback", () => {
@@ -269,6 +271,33 @@ describe("guardedFetch", () => {
     await expectRefused(guardedFetch(POLICY)(`${srv.base}/65537`), "too_large");
   });
 
+  it("refuses a never-ending body as soon as it passes maxBytes and closes the socket", async () => {
+    let socketClosed: () => void;
+    const closed = new Promise<void>((resolve) => (socketClosed = resolve));
+    const srv = await fake((req, res) => {
+      req.socket.on("close", () => socketClosed());
+      res.writeHead(200);
+      const chunk = "a".repeat(16_384);
+      // Keep streaming without ever ending; only a client abort stops it.
+      const pump = () => {
+        while (!res.destroyed && res.write(chunk)) {
+          if (res.writableLength > 1 << 20) break;
+        }
+        if (!res.destroyed) res.once("drain", pump);
+      };
+      pump();
+    });
+    const started = Date.now();
+    await expectRefused(guardedFetch({ ...POLICY, timeoutMs: 5000 })(`${srv.base}/`), "too_large");
+    expect(Date.now() - started).toBeLessThan(1000);
+    await Promise.race([
+      closed,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("server socket was not closed")), 1000)),
+    ]);
+    // Long enough for a buffer-everything implementation to fail on the
+    // assertions above rather than on the test runner's timeout.
+  }, 10_000);
+
   it("refuses a body that is still trickling in after timeoutMs", async () => {
     const srv = await fake((_req, res) => {
       res.writeHead(200);
@@ -293,6 +322,46 @@ describe("guardedFetch", () => {
     const p = guardedFetch(POLICY)(`${srv.base}/`, { signal: ctl.signal });
     setTimeout(() => ctl.abort(), 50);
     await expectRefused(p, "network");
+  });
+
+  describe("without AbortSignal.any (Node 20.0-20.2)", () => {
+    const original = Object.getOwnPropertyDescriptor(AbortSignal, "any");
+    beforeEach(() => {
+      delete (AbortSignal as { any?: unknown }).any;
+    });
+    afterEach(() => {
+      if (original) Object.defineProperty(AbortSignal, "any", original);
+    });
+
+    it("runs with AbortSignal.any removed", () => {
+      expect("any" in AbortSignal).toBe(false);
+    });
+
+    it("still completes a request that carries a caller signal", async () => {
+      const srv = await fake((_req, res) => res.end("ok"));
+      const res = await guardedFetch(POLICY)(`${srv.base}/`, { signal: new AbortController().signal });
+      expect(await res.text()).toBe("ok");
+    });
+
+    it("still enforces timeoutMs when a caller signal is present", async () => {
+      const srv = await fake(() => {});
+      const ctl = new AbortController();
+      await expectRefused(guardedFetch({ ...POLICY, timeoutMs: 200 })(`${srv.base}/`, { signal: ctl.signal }), "timeout");
+    });
+
+    it("still honours a caller abort", async () => {
+      const srv = await fake(() => {});
+      const ctl = new AbortController();
+      const p = guardedFetch(POLICY)(`${srv.base}/`, { signal: ctl.signal });
+      setTimeout(() => ctl.abort(), 50);
+      await expectRefused(p, "network");
+    });
+
+    it("honours a caller signal that is already aborted without sending a request", async () => {
+      const srv = await fake((_req, res) => res.end("ok"));
+      await expectRefused(guardedFetch(POLICY)(`${srv.base}/`, { signal: AbortSignal.abort() }), "network");
+      expect(srv.requests).toEqual([]);
+    });
   });
 
   it("maps a connection failure to network", async () => {
