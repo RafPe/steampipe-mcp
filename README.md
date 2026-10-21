@@ -323,6 +323,9 @@ HTTP transport settings. Some are validated in every mode, so a malformed value 
 | `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` | _(unset)_ | Google OAuth client ID that tokens must be issued to (`google` mode) |
 | `STEAMPIPE_MCP_ALLOWED_EMAILS` | _(empty)_ | Comma-separated emails allowed in `google` mode (case-insensitive) |
 | `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive). Only a membership boundary with an Internal consent screen on Google Workspace; with External, use `ALLOWED_EMAILS` ([details](docs/remote-deployment.md#allowed_domains-is-only-a-boundary-with-an-internal-consent-screen)) |
+| `STEAMPIPE_MCP_REQUIRED_CLAIMS` | _(empty)_ | Identity policy: a JSON object mapping a claim name to the values it may take, e.g. `{"hd":["corp.com"],"groups":["platform"]}`. Every listed claim must match: a string claim must equal an allowed value, an array claim must contain one, and a boolean or number matches its string form (`true` matches `"true"`). An absent, `null`, or object claim fails. Each list must be non-empty |
+| `STEAMPIPE_MCP_ALLOWED_SUBJECTS` | _(empty)_ | Identity policy: a JSON array of exact subjects (`sub`) allowed, at most 1024 entries |
+| `STEAMPIPE_MCP_SUBJECT_PREFIXES` | _(empty)_ | Identity policy: a JSON array of subject prefixes allowed, at most 64 entries (prefix `"platform-"` does not admit `"platform"`). A subject passes when it is on `ALLOWED_SUBJECTS` or starts with a prefix; when both are empty, any subject passes. No regex is supported. Policy strings are non-empty and at most 256 characters; all three policy variables default to empty, meaning no policy, and are read in `http` mode only |
 
 ## Open Source & Contributing
 
