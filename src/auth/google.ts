@@ -5,12 +5,12 @@ import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
+import { FetchRefused, GOOGLE_FETCH_POLICY, guardedFetch } from "./fetch-guard.js";
 import { checkPolicy, isEmptyPolicy, PolicyViolation, type IdentityPolicy } from "./policy.js";
 
 export const GOOGLE_ISSUER = "https://accounts.google.com";
 const DEFAULT_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo";
 const DEFAULT_DISCOVERY_URL = `${GOOGLE_ISSUER}/.well-known/openid-configuration`;
-const GOOGLE_TIMEOUT_MS = 5000;
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX_ENTRIES = 1000;
 
@@ -22,7 +22,7 @@ export interface GoogleVerifierOptions {
   tokeninfoUrl?: string;
   /** Identity policy applied after the allowlist. Absent or empty: none. */
   policy?: IdentityPolicy;
-  /** tokeninfo request timeout. Default 5000. */
+  /** tokeninfo request timeout, headers and body. Default 5000. */
   timeoutMs?: number;
   now?: () => number;
 }
@@ -40,11 +40,13 @@ interface TokenInfo {
 
 /**
  * Verifier for Google OAuth access tokens. Google access tokens are opaque,
- * so each one is checked against Google's tokeninfo endpoint:
+ * so each one is checked against Google's tokeninfo endpoint, through
+ * `guardedFetch(GOOGLE_FETCH_POLICY)`:
  *
  * - tokeninfo unreachable, timed out (headers or body), dropping the
- *   connection mid-body, or answering 429/5xx: `issuer_unavailable` (503).
- *   Never accepted.
+ *   connection mid-body, answering 429/5xx, or refused by the fetch guard (a
+ *   host outside the policy, any redirect, a body over 64 KiB):
+ *   `issuer_unavailable` (503). Never accepted.
  * - any other non-200 (400/401 for a bad token): `invalid`.
  * - a 200 whose complete body is not a JSON object: `malformed`.
  * - issued to another client (`aud` differs from `clientId`; R17: a matching
@@ -65,7 +67,7 @@ interface TokenInfo {
  */
 export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
   const tokeninfoUrl = o.tokeninfoUrl ?? DEFAULT_TOKENINFO_URL;
-  const timeoutMs = o.timeoutMs ?? GOOGLE_TIMEOUT_MS;
+  const guarded = guardedFetch({ ...GOOGLE_FETCH_POLICY, timeoutMs: o.timeoutMs ?? GOOGLE_FETCH_POLICY.timeoutMs });
   const now = o.now ?? Date.now;
   const allowedEmails = new Set(o.allowedEmails.map((e) => e.toLowerCase()));
   const allowedDomains = new Set(o.allowedDomains.map((d) => d.toLowerCase()));
@@ -77,13 +79,12 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
     let res: Response;
     try {
       // POST with a form body keeps the token out of URLs and access logs.
-      res = await fetch(tokeninfoUrl, {
+      res = await guarded(tokeninfoUrl, {
         method: "POST",
         body: new URLSearchParams({ access_token: token }),
-        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
-      logger.error("Google tokeninfo request failed", error instanceof Error ? error.name : "unknown error");
+      logger.error("Google tokeninfo request failed", describeFailure(error));
       throw new VerifyError("issuer_unavailable", "Token validation unavailable");
     }
     if (res.status === 429 || res.status >= 500) {
@@ -93,14 +94,15 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
     if (res.status !== 200) {
       throw new VerifyError("invalid", "Invalid token");
     }
-    // Read and parse separately: the timeout signal also covers the body,
-    // and a stall or dropped connection mid-body is an outage, not a
-    // malformed answer.
+    // Read and parse separately: a stall or dropped connection mid-body is
+    // an outage, not a malformed answer. The guard has already buffered the
+    // body (and refused a stalled one as a timeout), so this read failing is
+    // not expected, but it is classified the same way.
     let text: string;
     try {
       text = await res.text();
     } catch (error) {
-      logger.error("Google tokeninfo body read failed", error instanceof Error ? error.name : "unknown error");
+      logger.error("Google tokeninfo body read failed", describeFailure(error));
       throw new VerifyError("issuer_unavailable", "Token validation unavailable");
     }
     let body: unknown;
@@ -203,12 +205,20 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
 }
 
 /**
- * Fetch Google's OpenID discovery document as RFC 8414 metadata, for the
- * Protected Resource Metadata router. Throws unless it parses and names
- * Google as its issuer.
+ * Fetch Google's OpenID discovery document through
+ * `guardedFetch(GOOGLE_FETCH_POLICY)`. A guard refusal (host outside the
+ * policy, redirect, timeout, oversized body, network error) throws
+ * `VerifyError("issuer_unavailable")`; otherwise throws unless the answer is
+ * a 2xx that parses as RFC 8414 metadata naming Google as its issuer.
  */
 export async function fetchGoogleMetadata(discoveryUrl = DEFAULT_DISCOVERY_URL): Promise<OAuthMetadata> {
-  const res = await fetch(discoveryUrl, { signal: AbortSignal.timeout(GOOGLE_TIMEOUT_MS) });
+  let res: Response;
+  try {
+    res = await guardedFetch(GOOGLE_FETCH_POLICY)(discoveryUrl);
+  } catch (error) {
+    logger.error("Google discovery request failed", describeFailure(error));
+    throw new VerifyError("issuer_unavailable", "Google discovery document unavailable");
+  }
   if (!res.ok) {
     throw new Error(`Google discovery document request failed with HTTP ${res.status}`);
   }
@@ -217,4 +227,13 @@ export async function fetchGoogleMetadata(discoveryUrl = DEFAULT_DISCOVERY_URL):
     throw new Error(`Unexpected issuer in Google discovery document: ${JSON.stringify(metadata.issuer)}`);
   }
   return metadata;
+}
+
+// A FetchRefused message names at most the scheme and host, never the path
+// or query; anything else is reduced to its error name.
+function describeFailure(error: unknown): string {
+  if (error instanceof FetchRefused) {
+    return `${error.cause_}: ${error.message}`;
+  }
+  return error instanceof Error ? error.name : "unknown error";
 }

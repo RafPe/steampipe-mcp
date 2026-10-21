@@ -68,8 +68,9 @@ Steampipe instances or workspaces.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
 - *Google availability* (google mode). If tokeninfo is unreachable, slower
-  than 5 seconds, or answers `429`/`5xx`, requests fail closed with `503`
-  `temporarily_unavailable` and `Retry-After: 5`. They are never accepted.
+  than 5 seconds, answers `429`/`5xx` or a redirect, or sends a body over
+  64 KiB, requests fail closed with `503` `temporarily_unavailable` and
+  `Retry-After: 5`. They are never accepted.
   The server also refuses to start if it cannot fetch Google's discovery
   document.
 
@@ -210,14 +211,18 @@ At startup the server fetches
 start if that fails or names any issuer other than
 `https://accounts.google.com`. Once running it serves:
 
-- `GET /.well-known/oauth-protected-resource/mcp`: RFC 9728 Protected
-  Resource Metadata. `resource` is your `PUBLIC_URL`, `authorization_servers`
-  is `["https://accounts.google.com"]`, and `scopes_supported` is
-  `["openid","email"]`.
-- `GET /.well-known/oauth-authorization-server`: a copy of Google's metadata,
-  for clients that look for it on the resource host.
+- `GET /.well-known/oauth-protected-resource/mcp` (and `HEAD`): RFC 9728
+  Protected Resource Metadata. `resource` is your `PUBLIC_URL`,
+  `authorization_servers` is `["https://accounts.google.com"]`,
+  `scopes_supported` is `["openid","email"]`, and `bearer_methods_supported`
+  is `["header"]`. It is served with `Cache-Control: max-age=300`; any other
+  method gets `405`.
 
-These are public, but still subject to Host and Origin validation. An
+The server does not mirror Google's metadata at
+`/.well-known/oauth-authorization-server`: clients fetch it from Google, the
+server named in `authorization_servers`.
+
+This endpoint is public, but still subject to Host and Origin validation. An
 unauthenticated `POST /mcp` gets:
 
 ```
@@ -233,9 +238,12 @@ character set (no quotes, backslashes, control characters or non-ASCII) and
 How each token is validated:
 
 1. POST `access_token=<token>` (form body) to
-   `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout.
-2. A network error, a timeout, or a `429`/`5xx` answer → `503
-   temporarily_unavailable` with `Retry-After: 5`.
+   `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout covering
+   headers and body. Like the startup discovery fetch, this goes through a
+   restricted fetch: https to `oauth2.googleapis.com` or `accounts.google.com`
+   only, redirects never followed, bodies capped at 64 KiB.
+2. A network error, a timeout, a `429`/`5xx` answer, any redirect, or a body
+   over 64 KiB → `503 temporarily_unavailable` with `Retry-After: 5`.
 3. Any other non-200 response, a body that is not a JSON object, `aud`
    different from `GOOGLE_CLIENT_ID` (`azp` is not consulted), or `exp`
    missing or in the past → `401 invalid_token`.
@@ -288,8 +296,10 @@ might:
 
 Related: Google publishes its metadata at
 `/.well-known/openid-configuration`, not at
-`/.well-known/oauth-authorization-server`. Spec-compliant clients try both, but
-an older client may not.
+`/.well-known/oauth-authorization-server`, and this server no longer mirrors
+it on the resource host. Spec-compliant clients try both on Google's host, but
+an older client that only looks for `oauth-authorization-server` metadata (on
+either host) will not find any.
 
 **This has not been verified end-to-end with a real Google client.** Before you
 roll google mode out, sign in once with Claude Code against a staging

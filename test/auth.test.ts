@@ -1,9 +1,10 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   createServer as createNodeServer,
   request as httpRequest,
   type IncomingMessage,
   type Server as HttpServer,
+  type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -15,6 +16,9 @@ import { buildHttpApp } from "../src/http/app.js";
 import { authMiddleware } from "../src/auth/index.js";
 import { createStaticTokenVerifier } from "../src/auth/verifiers.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "../src/auth/google.js";
+import { prmPath } from "../src/auth/prm.js";
+import { GOOGLE_FETCH_POLICY } from "../src/auth/fetch-guard.js";
+import { logger } from "../src/services/logger.js";
 import { testDbUrl } from "./helpers/db.js";
 
 // No test here talks to Google: tokeninfo and the discovery document are
@@ -268,10 +272,38 @@ describe("authMiddleware: google", () => {
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
     const res = await send(port, { method: "GET", path: "/.well-known/oauth-protected-resource/mcp" });
     expect(res.status).toBe(200);
-    const prm = JSON.parse(res.body);
-    expect(prm.resource).toBe(PUBLIC_URL);
-    expect(prm.authorization_servers).toEqual(["https://accounts.google.com"]);
-    expect(prm.scopes_supported).toEqual(["openid", "email"]);
+    expect(res.headers["cache-control"]).toBe("max-age=300");
+    expect(res.body).toBe(
+      `{"resource":"${PUBLIC_URL}",` +
+        '"authorization_servers":["https://accounts.google.com"],' +
+        '"scopes_supported":["openid","email"],' +
+        '"bearer_methods_supported":["header"],' +
+        '"resource_name":"Steampipe MCP"}',
+    );
+  });
+
+  it("points the 401 resource_metadata at origin + prmPath(resource), where the PRM is served", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const url = new URL(PUBLIC_URL);
+    const challenge = String((await toolsList(port)).headers["www-authenticate"]);
+    expect(challenge).toContain(`resource_metadata="${url.origin}${prmPath(PUBLIC_URL)}"`);
+    expect((await send(port, { method: "GET", path: prmPath(PUBLIC_URL) })).status).toBe(200);
+  });
+
+  it("no longer mirrors Google's metadata at /.well-known/oauth-authorization-server", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const res = await send(port, { method: "GET", path: "/.well-known/oauth-authorization-server" });
+    expect(res.status).toBe(404);
+  });
+
+  it("answers POST on the PRM path with 405", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const res = await send(port, { method: "POST", path: "/.well-known/oauth-protected-resource/mcp" });
+    expect(res.status).toBe(405);
+    expect(res.headers.allow).toBe("GET, HEAD");
   });
 
   it("still applies Origin validation to the well-known routes", async () => {
@@ -768,6 +800,146 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     clock += 2_000;
     await v.verify("t");
     expect(google.requests).toHaveLength(2);
+  });
+});
+
+/** An HTTP server that counts TCP connections, not just parsed requests. */
+async function countingServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<{ base: string; port: number; connections: () => number; requests: string[] }> {
+  let connections = 0;
+  const requests: string[] = [];
+  const server = createNodeServer((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    req.resume();
+    req.on("end", () => handler(req, res));
+  });
+  server.on("connection", () => connections++);
+  const port = await listen(server);
+  return { base: `http://127.0.0.1:${port}`, port, connections: () => connections, requests };
+}
+
+const UNAVAILABLE = { error: "temporarily_unavailable", error_description: "Token validation unavailable" };
+
+describe("Google identity calls go through the restricted fetch (R3)", () => {
+  // Each refusal is logged once at error level, by cause and scheme+host
+  // only. The spy keeps the test output clean; the global afterEach
+  // restores it.
+  let errorLog: MockInstance<typeof logger.error>;
+  beforeEach(() => {
+    errorLog = vi.spyOn(logger, "error").mockImplementation(() => {});
+  });
+
+  it("refuses a tokeninfo URL on a non-allowlisted https host with 503, before connecting", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(tokeninfo().body));
+    });
+    const port = await startApp(googleConfig(), `https://127.0.0.1:${target.port}/tokeninfo`);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+    expect(target.connections()).toBe(0);
+    expect(target.requests).toHaveLength(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google tokeninfo request failed", "policy: https host 127.0.0.1 is not in the allowed identity-provider hosts"],
+    ]);
+  });
+
+  for (const status of [302, 307]) {
+    it(`answers 503, not 401 or 200, when tokeninfo answers ${status}, and never follows it`, async () => {
+      const valid = await countingServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(tokeninfo().body));
+      });
+      const redirecting = await countingServer((_req, res) => {
+        res.writeHead(status, { Location: `${valid.base}/tokeninfo` });
+        res.end();
+      });
+      const port = await startApp(googleConfig(), `${redirecting.base}/tokeninfo`);
+      const res = await toolsList(port, "t");
+      expect(res.status).toBe(503);
+      expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+      expect(redirecting.requests).toEqual(["POST /tokeninfo"]);
+      expect(valid.connections()).toBe(0);
+      expect(errorLog.mock.calls).toEqual([
+        ["Google tokeninfo request failed", `redirect: redirect from ${redirecting.base} refused`],
+      ]);
+    });
+  }
+
+  it("answers 503 when a tokeninfo 200 body is larger than maxBytes", async () => {
+    const big = { ...(tokeninfo().body as object), padding: "x".repeat(GOOGLE_FETCH_POLICY.maxBytes) };
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(big));
+    });
+    const port = await startApp(googleConfig(), `${target.base}/tokeninfo`);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+    expect(target.requests).toEqual(["POST /tokeninfo"]);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google tokeninfo request failed", `too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes`],
+    ]);
+  });
+
+  it("still classifies a well-formed but non-object 200 as malformed after the guard", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("[1,2]");
+    });
+    const v = createGoogleVerifier({
+      clientId: CLIENT,
+      allowedEmails: [],
+      allowedDomains: ["corp.com"],
+      publicUrl: new URL(PUBLIC_URL),
+      tokeninfoUrl: `${target.base}/tokeninfo`,
+    });
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("malformed");
+    expect(errorLog).not.toHaveBeenCalled();
+  });
+
+  it("refuses a discovery URL on a non-allowlisted https host as issuer_unavailable, before connecting", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(FAKE_GOOGLE_METADATA));
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`https://127.0.0.1:${target.port}/discovery`))).resolves.toBe(
+      "issuer_unavailable",
+    );
+    expect(target.connections()).toBe(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", "policy: https host 127.0.0.1 is not in the allowed identity-provider hosts"],
+    ]);
+  });
+
+  it("refuses a discovery redirect as issuer_unavailable without following it", async () => {
+    const valid = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(FAKE_GOOGLE_METADATA));
+    });
+    const redirecting = await countingServer((_req, res) => {
+      res.writeHead(302, { Location: `${valid.base}/discovery` });
+      res.end();
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`${redirecting.base}/discovery`))).resolves.toBe("issuer_unavailable");
+    expect(valid.connections()).toBe(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", `redirect: redirect from ${redirecting.base} refused`],
+    ]);
+  });
+
+  it("refuses a discovery document larger than maxBytes as issuer_unavailable", async () => {
+    const big = { ...FAKE_GOOGLE_METADATA, padding: "x".repeat(GOOGLE_FETCH_POLICY.maxBytes) };
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(big));
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`${target.base}/discovery`))).resolves.toBe("issuer_unavailable");
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", `too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes`],
+    ]);
   });
 });
 
