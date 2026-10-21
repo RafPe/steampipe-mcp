@@ -76,15 +76,43 @@ function assertUsableKey(key: unknown): void {
 }
 
 /**
- * The issuer's JWKS holds a key that matched the token but cannot be used:
- * Web Crypto refused its key data (a `DOMException`, e.g. RSA without
- * `n`/`e` or an EC point off the curve), jose refused it (a private key,
- * `JWKSInvalid`), or `assertUsableKey` did. Never caused by the token alone:
- * a healthy key imports for every algorithm jose lets the token select it
+ * A key lookup refused because of the token: no key matches its `kid` and
+ * `alg`, several do, or jose has no key type for its `alg`. `classify`
+ * turns these into 401s.
+ */
+function isTokenKeyError(error: unknown): boolean {
+  return (
+    error instanceof errors.JWKSNoMatchingKey ||
+    error instanceof errors.JWKSMultipleMatchingKeys ||
+    error instanceof errors.JOSENotSupported
+  );
+}
+
+/**
+ * The JWKS could not be fetched: the backoff gate (`VerifyError`), the
+ * fetch guard (`FetchRefused`), a timeout, or a non-200 or non-JSON answer
+ * (jose's generic `JOSEError`).
+ */
+function isFetchError(error: unknown): boolean {
+  return (
+    error instanceof VerifyError ||
+    error instanceof FetchRefused ||
+    error instanceof errors.JWKSTimeout ||
+    (error instanceof errors.JOSEError && error.constructor === errors.JOSEError)
+  );
+}
+
+/**
+ * Anything else a key lookup throws comes from the fetched key set: Web
+ * Crypto refusing a key's data (a `DOMException`, e.g. RSA without `n`/`e`
+ * or an EC point off the curve, or a `TypeError`, e.g. an unknown `key_ops`
+ * entry or an `n` that is not a string), jose refusing it (a private key,
+ * `JWKSInvalid`), or `assertUsableKey`. Never caused by the token alone: a
+ * healthy key imports for every algorithm jose lets the token select it
  * with.
  */
 function isKeyMaterialError(error: unknown): boolean {
-  return error instanceof DOMException || error instanceof errors.JWKSInvalid || error instanceof KeyUnusable;
+  return !isTokenKeyError(error) && !isFetchError(error);
 }
 
 function malformed(): VerifyError {
@@ -115,7 +143,9 @@ function isTimestamp(value: unknown): boolean {
 /**
  * Wrap a jose key resolver so that a failure to fetch or use the JWKS is
  * told apart from a key that simply does not match. No matching key (or
- * several) and an unsupported `alg` pass through for `classify`.
+ * several) and an unsupported `alg` pass through for `classify`; anything
+ * else the lookup throws (a fetch failure or unusable key material, see
+ * `isFetchError` and `isKeyMaterialError`) is `issuer_unavailable`.
  */
 function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
   return async (header, token) => {
@@ -124,25 +154,10 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
       assertUsableKey(key);
       return key;
     } catch (error) {
-      if (
-        error instanceof errors.JWKSNoMatchingKey ||
-        error instanceof errors.JWKSMultipleMatchingKeys ||
-        error instanceof errors.JOSENotSupported
-      ) {
+      if (isTokenKeyError(error)) {
         throw error;
       }
-      // JWKSTimeout, a non-200 or non-JSON JWKS (generic JOSEError), an
-      // invalid key set, a key that cannot be used, or the fetch guard
-      // refusing the request.
-      if (
-        error instanceof FetchRefused ||
-        error instanceof VerifyError ||
-        error instanceof errors.JOSEError ||
-        isKeyMaterialError(error)
-      ) {
-        throw new KeysUnavailable();
-      }
-      throw error;
+      throw new KeysUnavailable();
     }
   };
 }

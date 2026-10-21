@@ -537,8 +537,8 @@ is back. Each backoff window logs one warning with the issuer's origin (never
 its path), the consecutive failure count, the next delay and the cause, and the
 first successful fetch after failures logs one info line (see Logging in the
 README). A signing key that cannot be used (key data that does not import, such
-as RSA without `n`/`e` or EC without `x`/`y`, a private key, or an RSA modulus
-under 2048 bits) is treated the same way: tokens that need it get `503`, never
+as RSA without `n`/`e`, EC without `x`/`y` or an unknown `key_ops` entry, a
+private key, or an RSA modulus under 2048 bits) is treated the same way: tokens that need it get `503`, never
 `500`, and once the backoff window is over the next such request fetches the
 JWKS again, so a repaired JWKS is picked up then rather than when the cache
 expires. Other keys in the same JWKS keep working.
