@@ -425,9 +425,10 @@ function toolsList(port: number, token: string): Promise<Response> {
 }
 
 /** Wire the app exactly as `startHttp` does, with an uncached readiness. */
-async function startApp(auth: AuthMiddleware, cfg: ServerConfig): Promise<number> {
+async function startApp(auth: AuthMiddleware, cfg: ServerConfig, opts: { dbDown?: boolean } = {}): Promise<number> {
   const db = newDb();
-  vi.spyOn(db, "ping").mockResolvedValue(undefined);
+  if (opts.dbDown) vi.spyOn(db, "ping").mockRejectedValue(new Error("db down"));
+  else vi.spyOn(db, "ping").mockResolvedValue(undefined);
   const readiness = buildReadiness(db, auth.readiness, { cacheMs: 0 });
   const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters, readiness);
   const server = await new Promise<HttpServer>((resolve) => {
@@ -806,12 +807,18 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     expect(pending.status).toBe(503);
     expect(pending.headers["retry-after"]).toBe("5");
 
-    const notReady = await send(port, { method: "GET", path: "/readyz" });
-    expect(notReady.status).toBe(503);
-    expect(JSON.parse(notReady.body)).toEqual({
-      status: "not_ready",
+    // R28: one ready issuer keeps the pod ready, flagged degraded.
+    const degraded = await send(port, { method: "GET", path: "/readyz" });
+    expect(degraded.status).toBe(200);
+    expect(JSON.parse(degraded.body)).toEqual({
+      status: "ready",
+      degraded: true,
       checks: { db: "ready", "auth:1": "pending", "auth:2": "ready" },
     });
+    for (const iss of [a, b]) {
+      expect(degraded.body).not.toContain(iss.issuer);
+      expect(degraded.body).not.toContain(new URL(iss.issuer).host);
+    }
 
     const prm = await send(port, { method: "GET", path: PRM });
     expect(prm.status).toBe(200);
@@ -830,6 +837,7 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
       status: "ready",
       checks: { db: "ready", "auth:1": "ready", "auth:2": "ready" },
     });
+    expect(JSON.parse(ready.body)).not.toHaveProperty("degraded");
     const recovered = await send(port, { method: "GET", path: PRM });
     expect(JSON.parse(recovered.body).authorization_servers).toEqual([a.issuer, b.issuer]);
     expect(warn).toHaveBeenCalledWith(
@@ -895,8 +903,12 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     const port = await startApp(auth, cfg);
     await untilReady(auth, 2);
     const res = await send(port, { method: "GET", path: "/readyz" });
-    expect(res.status).toBe(503);
-    expect(JSON.parse(res.body)).toEqual({ status: "not_ready", checks: { db: "ready", "auth:1": "pending", "auth:2": "ready" } });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body)).toEqual({
+      status: "ready",
+      degraded: true,
+      checks: { db: "ready", "auth:1": "pending", "auth:2": "ready" },
+    });
     for (const iss of [a, b]) {
       expect(res.body).not.toContain(iss.issuer);
       expect(res.body).not.toContain(new URL(iss.issuer).host);
@@ -909,6 +921,52 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     const b = await issuerFor();
     const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
     expect(auth.readiness.map((c) => c.name)).toEqual(["auth:1", "auth:2"]);
+  });
+
+  it("groups the auth:<n> checks as jwt-issuers (R28)", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
+    expect(auth.readiness.map((c) => [c.name, c.group])).toEqual([
+      ["auth:1", "jwt-issuers"],
+      ["auth:2", "jwt-issuers"],
+    ]);
+  });
+
+  it("answers /readyz 503 while no issuer has resolved", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    b.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg);
+    await vi.waitFor(() => expect(s.delays).toHaveLength(2));
+    const res = await send(port, { method: "GET", path: "/readyz" });
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({
+      status: "not_ready",
+      checks: { db: "ready", "auth:1": "pending", "auth:2": "pending" },
+    });
+  });
+
+  it("answers /readyz 503 when the database is down, even with an issuer ready", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg, { dbDown: true });
+    await untilReady(auth, 2);
+    const res = await send(port, { method: "GET", path: "/readyz" });
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({
+      status: "not_ready",
+      checks: { db: "failing", "auth:1": "pending", "auth:2": "ready" },
+    });
   });
 
   it("dispose() stops every issuer's discovery loader", async () => {
@@ -957,5 +1015,28 @@ describe("authMiddleware: jwt with the flag off (default)", () => {
     auths.push(auth);
     expect(auth.readiness.map((c) => c.name)).toEqual(["auth"]);
     expect(await auth.readiness[0].check(new AbortController().signal)).toBe("ready");
+  });
+});
+
+// R28: only jwt degraded start groups its checks; every other mode keeps
+// ungrouped checks, so their readiness rule is unchanged.
+describe("readiness groups outside jwt degraded start", () => {
+  it("leaves google's auth check ungrouped, with and without degraded start", async () => {
+    const s = manualSleep();
+    const degraded = await build(googleConfig(DEGRADED), async () => FAKE_GOOGLE_METADATA, s);
+    const strict = await build(googleConfig(), async () => FAKE_GOOGLE_METADATA);
+    for (const auth of [degraded, strict]) {
+      expect(auth.readiness.map((c) => c.name)).toEqual(["auth"]);
+      expect(auth.readiness[0]).not.toHaveProperty("group");
+    }
+  });
+
+  it("leaves jwt's single auth check ungrouped without degraded start", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const auth = await authMiddleware(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }]), { now: () => NOW_MS });
+    auths.push(auth);
+    expect(auth.readiness.map((c) => c.name)).toEqual(["auth"]);
+    expect(auth.readiness[0]).not.toHaveProperty("group");
   });
 });

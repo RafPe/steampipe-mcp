@@ -504,7 +504,13 @@ metadata answers `503` while no advertised issuer has been discovered), and
 meanwhile. `<n>` is the issuer's 1-based position in the array (`auth:1` is the
 first entry), never its URL, so the unauthenticated `/readyz` does not reveal
 `"advertise": false` issuers. With the flag on, `/readyz` has one `auth:<n>`
-entry per configured issuer instead of the single `auth` entry. `authorization_servers` lists the entries with
+entry per configured issuer instead of the single `auth` entry, and it stays
+`200` while the database and at least one issuer are ready: a pending issuer
+then shows as `"auth:<n>":"pending"` and the body gains `"degraded": true`, so
+one unreachable issuer does not take the pod out of its Service. With no issuer
+discovered, or with the database down, `/readyz` answers `503`. Alert on
+`"degraded": true` or on any `auth:<n>` that is not `ready`.
+`authorization_servers` lists the entries with
 `"advertise": true` (the default), in array order, so an issuer used only by
 machine clients can stay unlisted; at least one entry must be advertised.
 

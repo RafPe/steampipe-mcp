@@ -21,8 +21,8 @@ export interface AuthMiddleware {
   mcpMiddleware: RequestHandler[];
   /**
    * Checks for `GET /readyz`: one named `auth` in google and jwt mode, or
-   * one `auth:<n>` per issuer (1-based config position) in jwt mode with
-   * degraded start.
+   * one `auth:<n>` per issuer (1-based config position, group
+   * `jwt-issuers`) in jwt mode with degraded start.
    */
   readiness: ReadinessCheck[];
   /** Stop background work (the degraded-start discovery retries). */
@@ -214,9 +214,11 @@ export async function authMiddleware(
       });
       // Named by 1-based config position, never by URL: /readyz is
       // unauthenticated and would otherwise reveal `advertise: false`
-      // issuers (R22).
+      // issuers (R22). One group, so a single ready issuer keeps the
+      // pod ready (R28).
       readiness = [...loaders.values()].map((loader, index) => ({
         name: `auth:${index + 1}`,
+        group: "jwt-issuers",
         check: async () => loader.status(),
       }));
       dispose = () => {

@@ -133,6 +133,92 @@ describe("Readiness.evaluate", () => {
   });
 });
 
+// R28: a check with a `group` only needs one ready member of its group;
+// ungrouped checks must all be ready. Ready with any check not ready is
+// reported as `degraded: true`.
+describe("Readiness groups", () => {
+  function grouped(checks: Array<[name: string, status: CheckStatus, group?: string]>): Readiness {
+    const r = new Readiness({ cacheMs: 0 });
+    for (const [name, status, group] of checks) {
+      r.register({ name, ...(group && { group }), check: async () => status });
+    }
+    return r;
+  }
+
+  async function readyz(r: Readiness): Promise<{ status: number; body: unknown }> {
+    const res = await get(await start(r));
+    return { status: res.status, body: JSON.parse(res.body) };
+  }
+
+  it("still needs every ungrouped check: an ungrouped pending check gives 503", async () => {
+    const r = grouped([["db", "ready"], ["x", "pending"], ["g1", "ready", "g"]]);
+    await expect(r.evaluate()).resolves.toEqual({ ready: false, checks: { db: "ready", x: "pending", g1: "ready" } });
+    expect(await readyz(r)).toEqual({
+      status: 503,
+      body: { status: "not_ready", checks: { db: "ready", x: "pending", g1: "ready" } },
+    });
+  });
+
+  it("is ready but degraded when a group has one pending and one ready member", async () => {
+    const r = grouped([["db", "ready"], ["g1", "pending", "g"], ["g2", "ready", "g"]]);
+    await expect(r.evaluate()).resolves.toEqual({
+      ready: true,
+      degraded: true,
+      checks: { db: "ready", g1: "pending", g2: "ready" },
+    });
+    expect(await readyz(r)).toEqual({
+      status: 200,
+      body: { status: "ready", degraded: true, checks: { db: "ready", g1: "pending", g2: "ready" } },
+    });
+  });
+
+  it("is not ready when no member of a group is ready", async () => {
+    const r = grouped([["db", "ready"], ["g1", "pending", "g"], ["g2", "pending", "g"]]);
+    await expect(r.evaluate()).resolves.toEqual({ ready: false, checks: { db: "ready", g1: "pending", g2: "pending" } });
+    expect(await readyz(r)).toEqual({
+      status: 503,
+      body: { status: "not_ready", checks: { db: "ready", g1: "pending", g2: "pending" } },
+    });
+  });
+
+  it("is ready and not degraded when every grouped and ungrouped check is ready", async () => {
+    const r = grouped([["db", "ready"], ["g1", "ready", "g"], ["g2", "ready", "g"]]);
+    await expect(r.evaluate()).resolves.toEqual({ ready: true, checks: { db: "ready", g1: "ready", g2: "ready" } });
+    const res = await readyz(r);
+    expect(res).toEqual({ status: 200, body: { status: "ready", checks: { db: "ready", g1: "ready", g2: "ready" } } });
+    expect(res.body).not.toHaveProperty("degraded");
+  });
+
+  it("is not ready when the ungrouped db check fails, however healthy the group", async () => {
+    const r = grouped([["db", "failing"], ["g1", "ready", "g"], ["g2", "ready", "g"]]);
+    await expect(r.evaluate()).resolves.toEqual({ ready: false, checks: { db: "failing", g1: "ready", g2: "ready" } });
+    expect(await readyz(r)).toEqual({
+      status: 503,
+      body: { status: "not_ready", checks: { db: "failing", g1: "ready", g2: "ready" } },
+    });
+  });
+
+  it("needs a ready member in every group: one all-pending group gives 503", async () => {
+    const r = grouped([
+      ["db", "ready"],
+      ["a1", "ready", "a"],
+      ["a2", "pending", "a"],
+      ["b1", "pending", "b"],
+      ["b2", "failing", "b"],
+    ]);
+    const checks = { db: "ready", a1: "ready", a2: "pending", b1: "pending", b2: "failing" };
+    await expect(r.evaluate()).resolves.toEqual({ ready: false, checks });
+    expect(await readyz(r)).toEqual({ status: 503, body: { status: "not_ready", checks } });
+  });
+
+  it("counts a grouped check that times out as failing", async () => {
+    const r = new Readiness({ timeoutMs: 20, cacheMs: 0 });
+    r.register({ name: "g1", group: "g", check: never });
+    r.register({ name: "g2", group: "g", check: async () => "ready" });
+    await expect(r.evaluate()).resolves.toEqual({ ready: true, degraded: true, checks: { g1: "failing", g2: "ready" } });
+  });
+});
+
 describe("GET /readyz", () => {
   it("returns 200 ready with no checks", async () => {
     const port = await start(new Readiness());
