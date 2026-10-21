@@ -44,7 +44,7 @@ services:
       - steampipe-net
 
   mcp:
-    image: ghcr.io/rafpe/steampipe-mcp:0.2.1
+    image: ghcr.io/rafpe/steampipe-mcp:0.3.0
     # 15s: the default `docker stop`/compose grace period is 10s, which
     # would SIGKILL this container at almost the same moment its own 10s
     # forced-close shutdown timeout (src/shutdown.ts) fires. Give it room to

@@ -1,4 +1,4 @@
-## Unreleased
+## 0.3.0 [2026-10-21]
 
 _What's new_
 
