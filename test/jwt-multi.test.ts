@@ -683,7 +683,21 @@ describe("jwt identity policy config", () => {
     expect(load({ allowedSubjects: ["bob"] }).auth.jwt?.issuers[0].policy?.allowedSubjects).toEqual(new Set(["bob"]));
   });
 
-  it("leaves an issuer without policy fields on the global policy", () => {
+  it("leaves an issuer without policy fields on the global policy", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti(
+      [{ issuer: a.issuer }, { issuer: b.issuer, requiredClaims: { repository_owner: ["RafPe"] } }],
+      { STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}' },
+    );
+    // A has no override, so the global policy decides for it, even though
+    // another issuer carries its own.
+    await expectAccepted(app, await a.sign(claims(a.issuer, { groups: ["platform"] })));
+    const before = app.rejects.length;
+    const res = await toolsList(app.port, await a.sign(claims(a.issuer, { groups: ["x"] })));
+    expect(app.rejects.slice(before).map((e) => e.reason)).toEqual(["not_allowed"]);
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error).toBe("access_denied");
     expect(load({}).auth.jwt?.issuers[0].policy).toBeUndefined();
   });
 
