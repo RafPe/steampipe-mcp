@@ -3,6 +3,7 @@ import type { DatabaseOptions } from "./services/database.js";
 import { parsePolicyConfig, type PolicyConfig } from "./config/policy.js";
 import { isEmptyPolicy } from "./auth/policy.js";
 import { parseDegradedConfig } from "./config/degraded.js";
+import { parseJwtConfig, type JwtConfig } from "./config/jwt.js";
 
 const PREFIX = "STEAMPIPE_MCP_";
 
@@ -35,7 +36,7 @@ export interface ServerConfig {
     trustProxy?: number | boolean;
   };
   auth: {
-    mode: "none" | "token" | "google";
+    mode: "none" | "token" | "google" | "jwt";
     token?: string;
     googleClientId?: string;
     allowedEmails: string[];
@@ -44,6 +45,8 @@ export interface ServerConfig {
     // background (STEAMPIPE_MCP_ALLOW_DEGRADED_START). Parsed in http mode
     // only; unset means false.
     allowDegradedStart?: boolean;
+    // AUTH_MODE=jwt settings, parsed in http mode only.
+    jwt?: JwtConfig;
   };
   allowInsecureRemote: boolean;
   // Identity policy (REQUIRED_CLAIMS, ALLOWED_SUBJECTS, SUBJECT_PREFIXES),
@@ -237,13 +240,15 @@ function parseTransport(env: NodeJS.ProcessEnv): "stdio" | "http" {
   return value;
 }
 
-function parseAuthMode(env: NodeJS.ProcessEnv): "none" | "token" | "google" {
+function parseAuthMode(env: NodeJS.ProcessEnv): ServerConfig["auth"]["mode"] {
   const value = raw(env, "AUTH_MODE");
   if (value === undefined) {
     return "none";
   }
-  if (value !== "none" && value !== "token" && value !== "google") {
-    throw new ConfigError(`${PREFIX}AUTH_MODE must be "none", "token", or "google", got ${JSON.stringify(value)}`);
+  if (value !== "none" && value !== "token" && value !== "google" && value !== "jwt") {
+    throw new ConfigError(
+      `${PREFIX}AUTH_MODE must be "none", "token", "google", or "jwt", got ${JSON.stringify(value)}`,
+    );
   }
   return value;
 }
@@ -315,6 +320,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   const allowInsecureRemote = parseBool(env, "ALLOW_INSECURE_REMOTE", false);
   let policy: PolicyConfig | undefined;
   let allowDegradedStart: boolean | undefined;
+  let jwt: JwtConfig | undefined;
 
   // R11: stdio never binds a port or serves auth/PUBLIC_URL, so none of
   // these settings can make stdio unsafe or unable to start. Scope all of
@@ -348,6 +354,13 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
       }
     }
 
+    if (authMode === "jwt") {
+      if (!publicUrl) {
+        throw new ConfigError(`${PREFIX}PUBLIC_URL is required when ${PREFIX}AUTH_MODE=jwt`);
+      }
+      jwt = parseJwtConfig(env, publicUrl);
+    }
+
     if (!isLoopback(httpHost) && authMode === "none" && !allowInsecureRemote) {
       throw new ConfigError(
         `Refusing to bind a non-loopback ${PREFIX}HTTP_HOST with ${PREFIX}AUTH_MODE=none; ` +
@@ -367,6 +380,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
       allowedEmails,
       allowedDomains,
       allowDegradedStart,
+      jwt,
     },
     allowInsecureRemote,
     policy,
