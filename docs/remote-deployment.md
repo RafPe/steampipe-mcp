@@ -434,6 +434,14 @@ token claiming one issuer but signed by another fails its signature check. A
 token whose `iss` matches no entry is refused (`401`) without any network call.
 Every issuer is discovered at startup, each with its own fetch policy (its own
 host plus `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`), and the server refuses to start if
-any discovery fails. `authorization_servers` lists the entries with
+any discovery fails, unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`. Then it
+starts anyway and retries each failed issuer's discovery in the background (1 s
+doubling to 60 s, ±20% jitter). Until an issuer has been discovered, its tokens
+get `503` with `Retry-After: 5`, it is left out of `authorization_servers` (the
+metadata answers `503` while no advertised issuer has been discovered), and
+`/readyz` reports `"auth:<issuer>":"pending"`; the other issuers are served
+meanwhile. With the flag on, `/readyz` has one `auth:<issuer>` entry per
+configured issuer instead of the single `auth` entry, so it names
+`"advertise": false` issuers too. `authorization_servers` lists the entries with
 `"advertise": true` (the default), in array order, so an issuer used only by
 machine clients can stay unlisted; at least one entry must be advertised.

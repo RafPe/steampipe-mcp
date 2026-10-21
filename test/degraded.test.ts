@@ -21,6 +21,7 @@ import { EventEmitter } from "node:events";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
 import { testDbUrl } from "./helpers/db.js";
+import { startTestIssuer, type TestIssuer } from "./helpers/issuer.js";
 
 // No test here talks to Google or really waits: tokeninfo is an in-test
 // HTTP server, discovery is an injected fetcher, and retry delays go through
@@ -59,6 +60,7 @@ let error: ReturnType<typeof vi.spyOn>;
 let consoleError: ReturnType<typeof vi.spyOn>;
 let servers: HttpServer[] = [];
 let auths: AuthMiddleware[] = [];
+let issuers: TestIssuer[] = [];
 
 beforeEach(() => {
   warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
@@ -73,6 +75,8 @@ afterEach(async () => {
   for (const s of servers) s.closeAllConnections();
   await Promise.all(servers.map((s) => new Promise((resolve) => s.close(resolve))));
   servers = [];
+  await Promise.all(issuers.map((i) => i.close()));
+  issuers = [];
   // Nothing in this file may print: every expected log line is spied above.
   expect(consoleError).not.toHaveBeenCalled();
   vi.useRealTimers();
@@ -516,7 +520,7 @@ describe("authMiddleware: google with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", 
     expect(await auth.readiness[0].check(new AbortController().signal)).toBe("ready");
   });
 
-  it("is ignored outside google mode", async () => {
+  it("is ignored in token mode", async () => {
     const cfg = loadConfig(
       {
         STEAMPIPE_MCP_TRANSPORT: "http",
@@ -731,5 +735,191 @@ describe("serveHttp (the composition startHttp uses)", () => {
     expect(served.close).toHaveBeenCalledTimes(1);
     expect(dispose.mock.invocationCallOrder[0]).toBeLessThan(served.close.mock.invocationCallOrder[0]);
     expect(served.server.listening).toBe(false);
+  });
+});
+
+// --- jwt mode with the flag on ---------------------------------------------
+
+const NOW_S = 1_800_000_000;
+const NOW_MS = NOW_S * 1000;
+
+async function issuerFor(): Promise<TestIssuer> {
+  const iss = await startTestIssuer();
+  issuers.push(iss);
+  return iss;
+}
+
+function jwtConfig(entries: Array<{ issuer: string; advertise?: boolean }>, env: Record<string, string> = {}): ServerConfig {
+  return loadConfig(
+    {
+      STEAMPIPE_MCP_TRANSPORT: "http",
+      STEAMPIPE_MCP_AUTH_MODE: "jwt",
+      STEAMPIPE_MCP_PUBLIC_URL: PUBLIC_URL,
+      STEAMPIPE_MCP_JWT_ISSUERS: JSON.stringify(entries),
+      STEAMPIPE_MCP_RATE_LIMIT_PER_MIN: "1000",
+      ...env,
+    },
+    ["node", "index.js"],
+  );
+}
+
+function tokenFor(iss: TestIssuer): Promise<string> {
+  return iss.sign({ iss: iss.issuer, aud: new URL(PUBLIC_URL).href, sub: "svc-1", exp: NOW_S + 300, iat: NOW_S });
+}
+
+async function buildJwt(cfg: ServerConfig, sleep: ReturnType<typeof manualSleep>): Promise<AuthMiddleware> {
+  const auth = await authMiddleware(cfg, {
+    now: () => NOW_MS,
+    onReject: () => {},
+    discoveryRetry: { sleep: sleep.sleep },
+  });
+  auths.push(auth);
+  return auth;
+}
+
+function checkOf(auth: AuthMiddleware, name: string): () => Promise<string> {
+  const c = auth.readiness.find((r) => r.name === name);
+  if (!c) throw new Error(`no readiness check ${name}`);
+  return () => c.check(new AbortController().signal);
+}
+
+async function untilReady(auth: AuthMiddleware, iss: TestIssuer): Promise<void> {
+  const check = checkOf(auth, `auth:${iss.issuer}`);
+  await vi.waitFor(async () => expect(await check()).toBe("ready"));
+}
+
+describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () => {
+  it("serves issuer B while A's discovery fails, answers A with 503, and recovers A", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg);
+    await untilReady(auth, b);
+    await vi.waitFor(() => expect(s.delays).toHaveLength(1)); // A failed once and is waiting
+
+    expect((await toolsList(port, await tokenFor(b))).status).toBe(200);
+    const pending = await toolsList(port, await tokenFor(a));
+    expect(pending.status).toBe(503);
+    expect(pending.headers["retry-after"]).toBe("5");
+
+    const notReady = await send(port, { method: "GET", path: "/readyz" });
+    expect(notReady.status).toBe(503);
+    expect(JSON.parse(notReady.body)).toEqual({
+      status: "not_ready",
+      checks: { db: "ready", [`auth:${a.issuer}`]: "pending", [`auth:${b.issuer}`]: "ready" },
+    });
+
+    const prm = await send(port, { method: "GET", path: PRM });
+    expect(prm.status).toBe(200);
+    expect(JSON.parse(prm.body).authorization_servers).toEqual([b.issuer]);
+
+    a.setDiscoveryFailing(false);
+    await s.release();
+    await untilReady(auth, a);
+
+    // No clock movement: a pending issuer's 503s never start a JWKS backoff.
+    expect((await toolsList(port, await tokenFor(a))).status).toBe(200);
+    expect((await toolsList(port, await tokenFor(b))).status).toBe(200);
+    const ready = await send(port, { method: "GET", path: "/readyz" });
+    expect(ready.status).toBe(200);
+    expect(JSON.parse(ready.body)).toEqual({
+      status: "ready",
+      checks: { db: "ready", [`auth:${a.issuer}`]: "ready", [`auth:${b.issuer}`]: "ready" },
+    });
+    const recovered = await send(port, { method: "GET", path: PRM });
+    expect(JSON.parse(recovered.body).authorization_servers).toEqual([a.issuer, b.issuer]);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining(`JWT issuer ${a.issuer} discovery failed (attempt 1)`),
+      expect.any(String),
+    );
+  });
+
+  it("answers the PRM with 503 while no issuer has resolved", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    b.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg);
+    await vi.waitFor(() => expect(s.delays).toHaveLength(2));
+    const prm = await send(port, { method: "GET", path: PRM });
+    expect(prm.status).toBe(503);
+    expect(prm.headers["retry-after"]).toBe("5");
+    expect((await toolsList(port, await tokenFor(a))).status).toBe(503);
+    expect((await toolsList(port, await tokenFor(b))).status).toBe(503);
+  });
+
+  it("answers the PRM with 503 while only a non-advertised issuer has resolved", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer, advertise: false }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg);
+    await untilReady(auth, b);
+    expect((await send(port, { method: "GET", path: PRM })).status).toBe(503);
+    expect((await toolsList(port, await tokenFor(b))).status).toBe(200);
+  });
+
+  it("exposes one auth:<issuer> readiness check per issuer, in config order", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
+    expect(auth.readiness.map((c) => c.name)).toEqual([`auth:${a.issuer}`, `auth:${b.issuer}`]);
+  });
+
+  it("dispose() stops every issuer's discovery loader", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    b.setDiscoveryFailing(true);
+    const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
+    await vi.waitFor(() => expect(s.delays).toHaveLength(2));
+    expect(s.signals.map((sig) => sig.aborted)).toEqual([false, false]);
+    const before = [a.requests().length, b.requests().length];
+
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    auth.dispose();
+    expect(s.signals.map((sig) => sig.aborted)).toEqual([true, true]);
+    // The fake sleep ignores abort; neither loader may fetch again.
+    await s.release();
+    await s.release();
+    for (let i = 0; i < 5; i++) await flush();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect([a.requests().length, b.requests().length]).toEqual(before);
+  });
+});
+
+describe("authMiddleware: jwt with the flag off (default)", () => {
+  it("rejects startup when any issuer's discovery fails, and never retries", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    await expect(
+      authMiddleware(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }]), {
+        now: () => NOW_MS,
+        discoveryRetry: { sleep: s.sleep },
+      }),
+    ).rejects.toThrow(/Issuer discovery failed/);
+    await flush();
+    expect(s.delays).toEqual([]);
+  });
+
+  it("keeps a single always-ready auth check", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const auth = await authMiddleware(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }]), { now: () => NOW_MS });
+    auths.push(auth);
+    expect(auth.readiness.map((c) => c.name)).toEqual(["auth"]);
+    expect(await auth.readiness[0].check(new AbortController().signal)).toBe("ready");
   });
 });
