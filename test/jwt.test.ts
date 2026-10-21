@@ -570,6 +570,41 @@ describe("discoverJwks", () => {
     await expect(discoverJwks(iss.issuer, fetch, policyFor(iss.issuer))).rejects.toThrow(FetchRefused);
   });
 
+  it("rejects an https issuer whose jwks_uri is loopback http (R15), with zero requests to it", async () => {
+    let connections = 0;
+    const trap = createNetServer((socket) => {
+      connections++;
+      socket.destroy();
+    });
+    await new Promise<void>((resolve) => trap.listen(0, "127.0.0.1", () => resolve()));
+    const trapPort = (trap.address() as AddressInfo).port;
+    const issuer = "https://idp.example.com/t1";
+    // Stands in for the https issuer: answers its OIDC document only.
+    const fakeFetch = (async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.href === `${issuer}/.well-known/openid-configuration`) {
+        return Response.json({ issuer, jwks_uri: `http://127.0.0.1:${trapPort}/jwks` });
+      }
+      return new Response(null, { status: 404 });
+    }) as typeof fetch;
+    try {
+      await expect(discoverJwks(issuer, fakeFetch, policyFor(issuer))).rejects.toThrow(/https/);
+      // The same document is fine once its jwks_uri is https on an allowed host.
+      const ok = (async () => Response.json({ issuer, jwks_uri: "https://idp.example.com/jwks" })) as typeof fetch;
+      await expect(discoverJwks(issuer, ok, policyFor(issuer))).resolves.toMatchObject({ issuer });
+      expect(connections).toBe(0);
+    } finally {
+      await new Promise((resolve) => trap.close(resolve));
+    }
+  });
+
+  it("still accepts a loopback-http jwks_uri for a loopback-http issuer", async () => {
+    const iss = await issuerFor();
+    const d = await discoverJwks(iss.issuer, fetch, policyFor(iss.issuer));
+    expect(d.jwksUri.protocol).toBe("http:");
+    expect(d.jwksUri.hostname).toBe("127.0.0.1");
+  });
+
   it("requires only issuer and jwks_uri", async () => {
     const iss = await issuerFor();
     const d = await discoverJwks(iss.issuer, fetch, policyFor(iss.issuer));

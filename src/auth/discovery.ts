@@ -1,4 +1,4 @@
-import { assertAllowedUrl, type FetchPolicy } from "./fetch-guard.js";
+import { assertAllowedUrl, FetchRefused, type FetchPolicy } from "./fetch-guard.js";
 
 export interface JwksDiscovery {
   issuer: string;
@@ -47,9 +47,13 @@ async function fetchDocument(url: URL, fetchImpl: typeof fetch): Promise<Record<
  * when its `issuer` equals the configured string exactly; only `issuer` and
  * `jwks_uri` are read, so M2M issuers without interactive endpoints work.
  *
- * `jwks_uri` comes from the network and is untrusted: it must parse and
- * pass `policy`, or this throws (`FetchRefused` for a policy refusal) before
- * anything is fetched from it.
+ * `jwks_uri` comes from the network and is untrusted: it must parse, use
+ * https unless the configured issuer is itself plain http (R15: config only
+ * allows that on loopback, and the fetch policy admits any loopback http, so
+ * without this an https issuer could point its keys at
+ * `http://127.0.0.1:…`), and pass `policy`. Otherwise this throws
+ * (`FetchRefused` for a scheme or policy refusal) before anything is
+ * fetched from it.
  */
 export async function discoverJwks(
   issuer: string,
@@ -83,6 +87,9 @@ export async function discoverJwks(
     jwksUri = new URL(doc.jwks_uri);
   } catch {
     throw new Error("Issuer discovery document has an invalid jwks_uri");
+  }
+  if (jwksUri.protocol !== "https:" && new URL(issuer).protocol === "https:") {
+    throw new FetchRefused("policy", "jwks_uri must use https for an https issuer");
   }
   assertAllowedUrl(jwksUri, policy);
   return { issuer, jwksUri };

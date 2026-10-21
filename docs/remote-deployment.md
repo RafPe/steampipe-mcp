@@ -374,7 +374,8 @@ At startup the server fetches the issuer's metadata from
 (`https://idp.example.com/.well-known/oauth-authorization-server/realms/platform`).
 The document's `issuer` must equal `STEAMPIPE_MCP_JWT_ISSUER` exactly, and its
 `jwks_uri` must be on the issuer's host or in `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`
-(https only). Otherwise the server refuses to start. Only `issuer` and
+and use https. Plain http is accepted only when the issuer itself is a
+loopback http URL (local development). Otherwise the server refuses to start. Only `issuer` and
 `jwks_uri` are read, so machine-to-machine issuers work too. Discovery and JWKS
 fetches use the same restricted fetch as Google mode: no redirects, 64 KiB
 bodies, 5 s timeouts.
