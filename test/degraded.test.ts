@@ -21,7 +21,7 @@ import { EventEmitter } from "node:events";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
 import { testDbUrl } from "./helpers/db.js";
-import { startTestIssuer, type TestIssuer } from "./helpers/issuer.js";
+import { startTestIssuer, type TestIssuer, type TestIssuerOptions } from "./helpers/issuer.js";
 
 // No test here talks to Google or really waits: tokeninfo is an in-test
 // HTTP server, discovery is an injected fetcher, and retry delays go through
@@ -743,8 +743,8 @@ describe("serveHttp (the composition startHttp uses)", () => {
 const NOW_S = 1_800_000_000;
 const NOW_MS = NOW_S * 1000;
 
-async function issuerFor(): Promise<TestIssuer> {
-  const iss = await startTestIssuer();
+async function issuerFor(opts?: TestIssuerOptions): Promise<TestIssuer> {
+  const iss = await startTestIssuer(opts);
   issuers.push(iss);
   return iss;
 }
@@ -833,9 +833,26 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     const recovered = await send(port, { method: "GET", path: PRM });
     expect(JSON.parse(recovered.body).authorization_servers).toEqual([a.issuer, b.issuer]);
     expect(warn).toHaveBeenCalledWith(
-      expect.stringContaining(`JWT issuer ${a.issuer} discovery failed (attempt 1)`),
+      expect.stringContaining(`JWT issuer #1 (${new URL(a.issuer).origin}) discovery failed (attempt 1)`),
       expect.any(String),
     );
+  });
+
+  it("names each issuer's retry loader by position and origin in log lines, never by its full URL (M-4)", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor({ path: "/tenant-b" });
+    b.setDiscoveryFailing(true);
+    const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
+    await vi.waitFor(() => expect(s.delays).toHaveLength(1));
+    await untilReady(auth, 1);
+    const messages = [...warn.mock.calls, ...info.mock.calls].map((call) => String(call[0]));
+    const origin = new URL(b.issuer).origin;
+    expect(messages.filter((m) => m.startsWith(`JWT issuer #2 (${origin}) discovery failed (attempt 1);`))).toHaveLength(1);
+    expect(messages).toContain(`JWT issuer #1 (${new URL(a.issuer).origin}) discovery succeeded after 1 attempt`);
+    // The message never carries an issuer path (the cause argument is the
+    // discovery error, not the loader's name).
+    for (const m of messages) expect(m).not.toContain("/tenant-b");
   });
 
   it("answers the PRM with 503 while no issuer has resolved", async () => {

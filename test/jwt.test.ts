@@ -212,6 +212,61 @@ describe("jwt: auth_reject audit", () => {
     expect(logs.some((l) => l.includes('"event":"auth_reject"') && l.includes('"reason":"expired"'))).toBe(true);
     expect(logs.join("\n")).not.toContain(token);
   });
+
+  async function startAudited(iss: TestIssuer): Promise<number> {
+    const cfg = jwtConfig(iss.issuer);
+    const { rootRouters, mcpMiddleware } = await authMiddleware(cfg, { now: () => NOW_MS });
+    const app = buildHttpApp(cfg, fakeDb(), mcpMiddleware, rootRouters);
+    const server = await new Promise<HttpServer>((resolve) => {
+      const s = app.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    servers.push(server);
+    return (server.address() as AddressInfo).port;
+  }
+
+  /** Every auth_reject line written so far, parsed. */
+  function rejectLines(): Array<Record<string, unknown>> {
+    return logger
+      .getCollectedLogs()
+      .filter((l) => l.includes('"event":"auth_reject"'))
+      .map((l) => JSON.parse(l.slice(l.indexOf("{"))) as Record<string, unknown>);
+  }
+
+  it("carries the configured issuer on a rejection once the token is routed to it (I-3)", async () => {
+    const iss = await issuerFor({ path: "/t1" });
+    const port = await startAudited(iss);
+    const token = await iss.sign(claims(iss, { exp: NOW_S }));
+    expect((await toolsList(port, token)).status).toBe(401);
+    expect(rejectLines()).toEqual([expect.objectContaining({ reason: "expired", iss: iss.issuer })]);
+    expect(logger.getCollectedLogs().join("\n")).not.toContain(token);
+  });
+
+  it("carries the configured issuer on a 503 during a JWKS outage, and the backoff warning names its origin only (I-3)", async () => {
+    const iss = await issuerFor({ path: "/t1" });
+    const port = await startAudited(iss);
+    iss.setJwksFailing(true);
+    const token = await iss.sign(claims(iss));
+    expect((await toolsList(port, token)).status).toBe(503);
+    expect(rejectLines()).toEqual([expect.objectContaining({ reason: "issuer_unavailable", iss: iss.issuer })]);
+    const warnings = logger.getCollectedLogs().filter((l) => l.includes("[WARN]"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain(`JWKS fetch for ${new URL(iss.issuer).origin} failed (1 consecutive failure, cause: network)`);
+    expect(warnings[0]).not.toContain("/t1");
+    expect(warnings[0]).not.toContain(token);
+  });
+
+  it("writes no iss for a token whose iss matches no configured issuer, or that has none (I-3)", async () => {
+    const iss = await issuerFor();
+    const port = await startAudited(iss);
+    const foreign = await iss.sign(claims(iss, { iss: "https://evil.example" }));
+    expect((await toolsList(port, foreign)).status).toBe(401);
+    const noIss = await iss.sign(claims(iss, { iss: undefined }));
+    expect((await toolsList(port, noIss)).status).toBe(401);
+    const lines = rejectLines();
+    expect(lines.map((l) => l.reason)).toEqual(["unknown_issuer", "malformed"]);
+    for (const line of lines) expect(line).not.toHaveProperty("iss");
+    expect(logger.getCollectedLogs().join("\n")).not.toContain("evil.example");
+  });
 });
 
 describe("jwt: typ and ID-token substitution (Review Focus 2)", () => {
@@ -543,11 +598,14 @@ describe("jwt: JWKS backoff during an outage (R16)", () => {
 });
 
 describe("jwksBackoff", () => {
+  const ORIGIN = "https://idp.example";
+
   function fakeFetch(outcomes: Array<number | "throw" | { body: string }>) {
     let calls = 0;
     const impl = vi.fn(async () => {
       const next = outcomes[calls++] ?? 200;
-      if (next === "throw") throw new FetchRefused("network", "down");
+      // A message with a path: the backoff must log the cause, never this.
+      if (next === "throw") throw new FetchRefused("network", "request to https://idp.example/tenant-x/jwks failed");
       if (typeof next === "object") return new Response(next.body, { status: 200 });
       return new Response('{"keys":[]}', { status: next });
     });
@@ -556,16 +614,77 @@ describe("jwksBackoff", () => {
 
   async function outcome(f: typeof fetch): Promise<unknown> {
     try {
-      return (await f(new URL("https://idp.example/jwks"))).status;
+      return (await f(new URL("https://idp.example/tenant-x/jwks"))).status;
     } catch (error) {
       return error;
     }
   }
 
+  /** Every argument of every call, joined, so nothing a call passes escapes the check. */
+  function logged(spy: ReturnType<typeof vi.spyOn>): string {
+    return spy.mock.calls.flat().map(String).join(" ");
+  }
+
+  it("warns once per window opened, with the origin, failure count, next delay and a bounded cause", async () => {
+    const warn = vi.spyOn(logger, "warn");
+    let clock = 0;
+    const f = fakeFetch(["throw", 503, { body: "{}" }]);
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
+
+    await outcome(gated);
+    await outcome(gated); // inside the window: refused, no new warning
+    await outcome(gated);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toBe(
+      "JWKS fetch for https://idp.example failed (1 consecutive failure, cause: network); backing off 1000ms",
+    );
+
+    clock = 1000;
+    await outcome(gated);
+    expect(warn).toHaveBeenCalledTimes(2);
+    expect(warn.mock.calls[1][0]).toBe(
+      "JWKS fetch for https://idp.example failed (2 consecutive failures, cause: HTTP 503); backing off 2000ms",
+    );
+
+    clock = 3000;
+    await outcome(gated);
+    expect(warn).toHaveBeenCalledTimes(3);
+    expect(warn.mock.calls[2][0]).toBe(
+      "JWKS fetch for https://idp.example failed (3 consecutive failures, cause: invalid key set); backing off 4000ms",
+    );
+
+    // Origin only: never the JWKS path or the error message.
+    expect(logged(warn)).not.toContain("tenant-x");
+    expect(logged(warn)).not.toContain("/jwks");
+    warn.mockRestore();
+  });
+
+  it("logs info on the first usable 200 after failures, and never on a 200 with no failures before it", async () => {
+    const info = vi.spyOn(logger, "info");
+    let clock = 0;
+    const f = fakeFetch([200, 503, "throw", 200, 200]);
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
+    expect(await outcome(gated)).toBe(200);
+    expect(info).not.toHaveBeenCalled();
+
+    await outcome(gated); // 503: window 1 s
+    clock = 1000;
+    await outcome(gated); // throw: window 2 s
+    clock = 3000;
+    expect(await outcome(gated)).toBe(200);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(info.mock.calls[0][0]).toBe("JWKS fetch for https://idp.example recovered after 2 consecutive failures");
+
+    expect(await outcome(gated)).toBe(200);
+    expect(info).toHaveBeenCalledTimes(1);
+    expect(logged(info)).not.toContain("tenant-x");
+    info.mockRestore();
+  });
+
   it("refuses with issuer_unavailable inside the window, without calling fetch", async () => {
     let clock = 0;
     const f = fakeFetch(["throw"]);
-    const gated = jwksBackoff(f.impl, () => clock);
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
     expect(await outcome(gated)).toBeInstanceOf(FetchRefused);
     clock = 999;
     const refused = await outcome(gated);
@@ -577,7 +696,7 @@ describe("jwksBackoff", () => {
   it("treats a non-200 answer as a failure, and a 200 resets the schedule", async () => {
     let clock = 0;
     const f = fakeFetch([503, "throw", 200, 500]);
-    const gated = jwksBackoff(f.impl, () => clock);
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
     expect(await outcome(gated)).toBe(503); // window 1 s
     clock = 1000;
     expect(await outcome(gated)).toBeInstanceOf(FetchRefused); // window 2 s
@@ -600,7 +719,7 @@ describe("jwksBackoff", () => {
     for (const body of ["not json", "{}", '{"keys":{}}', "[]"]) {
       let clock = 0;
       const f = fakeFetch([{ body }, 200]);
-      const gated = jwksBackoff(f.impl, () => clock);
+      const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
       expect(await outcome(gated)).toBe(200); // handed to jose, which rejects it
       clock = 999;
       expect(await outcome(gated)).toBeInstanceOf(VerifyError);
@@ -614,7 +733,7 @@ describe("jwksBackoff", () => {
   it("doubles from 1 s and caps the window at 60 s", async () => {
     let clock = 0;
     const f = fakeFetch(Array(9).fill(503));
-    const gated = jwksBackoff(f.impl, () => clock);
+    const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
     expect(await outcome(gated)).toBe(503);
     for (const window of [1000, 2000, 4000, 8000, 16000, 32000, 60000, 60000]) {
       const before = f.calls();
