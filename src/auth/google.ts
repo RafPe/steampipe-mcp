@@ -208,16 +208,22 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
  * Fetch Google's OpenID discovery document through
  * `guardedFetch(GOOGLE_FETCH_POLICY)`. A guard refusal (host outside the
  * policy, redirect, timeout, oversized body, network error) throws
- * `VerifyError("issuer_unavailable")`; otherwise throws unless the answer is
+ * `VerifyError("issuer_unavailable")` whose message names the cause (scheme
+ * and host only); nothing is logged here. Otherwise throws unless the answer is
  * a 2xx that parses as RFC 8414 metadata naming Google as its issuer.
+ * `signal` aborts the request (the degraded-start loader's `dispose()`).
  */
-export async function fetchGoogleMetadata(discoveryUrl = DEFAULT_DISCOVERY_URL): Promise<OAuthMetadata> {
+export async function fetchGoogleMetadata(
+  discoveryUrl = DEFAULT_DISCOVERY_URL,
+  signal?: AbortSignal,
+): Promise<OAuthMetadata> {
   let res: Response;
   try {
-    res = await guardedFetch(GOOGLE_FETCH_POLICY)(discoveryUrl);
+    res = await guardedFetch(GOOGLE_FETCH_POLICY)(discoveryUrl, { signal });
   } catch (error) {
-    logger.error("Google discovery request failed", describeFailure(error));
-    throw new VerifyError("issuer_unavailable", "Google discovery document unavailable");
+    // Not logged here: the caller reports it once (startup fails with one
+    // error line; the degraded-start loader warns per attempt).
+    throw new VerifyError("issuer_unavailable", `Google discovery document unavailable (${describeFailure(error)})`);
   }
   if (!res.ok) {
     throw new Error(`Google discovery document request failed with HTTP ${res.status}`);

@@ -100,11 +100,17 @@ export class Readiness {
 /**
  * The production readiness checks: `db` runs `select 1` on a dedicated
  * short-lived client (see `DatabaseService.ping`), never the pool. A
- * rejection counts as `failing`.
+ * rejection counts as `failing`. `extra` checks (e.g. auth's) are
+ * registered after it; `opts` is passed to `Readiness`.
  */
-export function buildReadiness(db: Pick<DatabaseService, "ping">): Readiness {
-  const readiness = new Readiness();
+export function buildReadiness(
+  db: Pick<DatabaseService, "ping">,
+  extra: ReadinessCheck[] = [],
+  opts?: ConstructorParameters<typeof Readiness>[0],
+): Readiness {
+  const readiness = new Readiness(opts);
   readiness.register({ name: "db", check: async () => (await db.ping(2000), "ready") });
+  for (const c of extra) readiness.register(c);
   return readiness;
 }
 

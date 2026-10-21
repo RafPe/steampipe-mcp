@@ -1,49 +1,15 @@
 #!/usr/bin/env node
 
-import type { Server as HttpServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DatabaseService } from "./services/database.js";
 import { configureTypeParser } from "./services/database-config.js";
 import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
 import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
-import { buildHttpApp } from "./http/app.js";
-import { buildReadiness } from "./http/ready.js";
-import { authMiddleware, type AuthMiddleware } from "./auth/index.js";
-import { closeHttpServerGracefully } from "./shutdown.js";
+import { AuthInitError, serveHttp } from "./http/compose.js";
+import { setupShutdownHandlers } from "./shutdown.js";
 
 let serverStartTime: Date;
-
-// Handle graceful shutdown: stop accepting HTTP requests first (when
-// serving HTTP), then close the database pool. `httpServer.close()` alone
-// can hang indefinitely on a connection that never drains (e.g. a client
-// holding the Streamable HTTP response open), so it is bounded by a 10s
-// forced-close timeout (Task 9 / Task 5 review). That matches - not safely
-// beats - docker's and docker compose's own default 10s stop grace period,
-// so a caller relying on the default would still have SIGKILL land at
-// roughly the same moment this timeout fires, with no guarantee the
-// `db.close()` step below ever runs. Deployments (see
-// docker-compose.example.yml) should raise their own stop timeout past 10s
-// (e.g. `docker stop -t 15`, or compose's `stop_grace_period: 15s`) so this
-// handler has room to finish on its own.
-function setupShutdownHandlers(db: DatabaseService, httpServer?: HttpServer) {
-  const gracefulShutdown = async () => {
-    if (httpServer) {
-      await closeHttpServerGracefully(httpServer);
-    }
-    if (db) {
-      try {
-        await db.close();
-      } catch (error) {
-        // Note: Avoid logging during shutdown as it may interfere with MCP protocol
-        process.exit(1);
-      }
-    }
-    process.exit(0);
-  };
-  process.on('SIGTERM', gracefulShutdown);
-  process.on('SIGINT', gracefulShutdown);
-}
 
 export function getServerStartTime(): Date {
   return serverStartTime;
@@ -113,23 +79,30 @@ export async function startServer() {
   }
 }
 
+// Shutdown (see `setupShutdownHandlers` / `gracefulShutdown`): dispose
+// auth's background work, stop accepting HTTP requests, then close the
+// database pool. `httpServer.close()` alone can hang indefinitely on a
+// connection that never drains (e.g. a client holding the Streamable HTTP
+// response open), so it is bounded by a 10s forced-close timeout (Task 9 /
+// Task 5 review). That matches - not safely beats - docker's and docker
+// compose's own default 10s stop grace period, so a caller relying on the
+// default would still have SIGKILL land at roughly the same moment this
+// timeout fires, with no guarantee the `db.close()` step ever runs.
+// Deployments (see docker-compose.example.yml) should raise their own stop
+// timeout past 10s (e.g. `docker stop -t 15`, or compose's
+// `stop_grace_period: 15s`) so the handler has room to finish on its own.
 async function startHttp(cfg: ServerConfig, db: DatabaseService) {
-  let auth: AuthMiddleware;
   try {
-    auth = await authMiddleware(cfg);
+    await serveHttp(cfg, db);
   } catch (error) {
-    // Fail closed: never serve without the configured auth. The message
-    // names the failure (e.g. Google metadata unreachable), never a token.
-    logger.error(`Failed to initialise STEAMPIPE_MCP_AUTH_MODE=${cfg.auth.mode}:`, error instanceof Error ? error.message : String(error));
-    process.exit(1);
+    // Fail closed: never serve without the configured auth. composeHttp has
+    // already logged the cause once.
+    if (error instanceof AuthInitError) {
+      process.exit(1);
+    }
+    throw error;
   }
-  logger.info(`HTTP auth mode: ${cfg.auth.mode}`);
   const { host, port, path } = cfg.http;
-  const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters, buildReadiness(db));
-  const httpServer = await new Promise<HttpServer>((resolve, reject) => {
-    const s = app.listen(port, host, (error?: Error) => (error ? reject(error) : resolve(s)));
-  });
-  setupShutdownHandlers(db, httpServer);
   logger.info(`Streamable HTTP server listening on http://${host.includes(':') ? `[${host}]` : host}:${port}${path}`);
 }
 
