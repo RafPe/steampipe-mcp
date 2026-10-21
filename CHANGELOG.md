@@ -22,6 +22,7 @@ _Behaviour changes_
 * Token mode: the static verifier no longer reports a rolling one-hour `expiresAt`.
 * Google mode: the RFC 9728 Protected Resource Metadata document at `/.well-known/oauth-protected-resource/<path>` is now rendered by the server instead of the SDK's `mcpAuthMetadataRouter`. It gains `"bearer_methods_supported":["header"]`, is served with `Cache-Control: max-age=300`, and answers only `GET`/`HEAD` (anything else, `OPTIONS` included, gets `405` with `Allow: GET, HEAD`). `resource` and `authorization_servers` are written exactly as configured, so the issuer stays `https://accounts.google.com` with no trailing slash.
 * Google mode: the copy of Google's metadata at `/.well-known/oauth-authorization-server` is gone (`404`). MCP clients fetch authorization-server metadata from the server named in `authorization_servers`, i.e. from Google.
+* Google mode: the tokeninfo call and the startup discovery fetch go through the restricted identity-provider fetch: only `oauth2.googleapis.com` and `accounts.google.com` over https, no redirects followed, bodies capped at 64 KiB, 5 s for headers and body together. A refusal (another host, any `3xx`, an oversized body, a timeout or a network error) answers `503 temporarily_unavailable` with `Retry-After: 5`, never `401`; at startup it fails the start as before.
 
 ## 0.2.1 [2026-10-21]
 

@@ -323,7 +323,8 @@ describe("google debug email logs", () => {
       allowedEmails: [],
       allowedDomains: ["corp.com"],
       publicUrl: new URL("https://mcp.example"),
-      tokeninfoUrl: "https://tokeninfo.invalid",
+      // Loopback http passes the fetch guard, which then calls the spied fetch.
+      tokeninfoUrl: "http://127.0.0.1:1/tokeninfo",
     });
   }
 

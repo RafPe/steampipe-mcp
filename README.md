@@ -174,6 +174,10 @@ Protected Resource Metadata at `/.well-known/oauth-protected-resource/<path>`
 (`GET`/`HEAD`, `Cache-Control: max-age=300`). It names
 `https://accounts.google.com` as the authorization server; the server does not
 mirror Google's metadata at `/.well-known/oauth-authorization-server`.
+Calls to Google (tokeninfo per token, discovery at startup) go only to
+`oauth2.googleapis.com` and `accounts.google.com` over https, never follow
+redirects, and refuse bodies over 64 KiB; any such refusal is a `503`, never a
+`401`.
 
 ## Prompting Guide
 

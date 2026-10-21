@@ -68,8 +68,9 @@ Steampipe instances or workspaces.
 - *Static token compromise* (token mode). One shared secret, no identity, no
   expiry. Rotate it by changing `STEAMPIPE_MCP_AUTH_TOKEN` and restarting.
 - *Google availability* (google mode). If tokeninfo is unreachable, slower
-  than 5 seconds, or answers `429`/`5xx`, requests fail closed with `503`
-  `temporarily_unavailable` and `Retry-After: 5`. They are never accepted.
+  than 5 seconds, answers `429`/`5xx` or a redirect, or sends a body over
+  64 KiB, requests fail closed with `503` `temporarily_unavailable` and
+  `Retry-After: 5`. They are never accepted.
   The server also refuses to start if it cannot fetch Google's discovery
   document.
 
@@ -237,9 +238,12 @@ character set (no quotes, backslashes, control characters or non-ASCII) and
 How each token is validated:
 
 1. POST `access_token=<token>` (form body) to
-   `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout.
-2. A network error, a timeout, or a `429`/`5xx` answer → `503
-   temporarily_unavailable` with `Retry-After: 5`.
+   `https://oauth2.googleapis.com/tokeninfo`, with a 5s timeout covering
+   headers and body. Like the startup discovery fetch, this goes through a
+   restricted fetch: https to `oauth2.googleapis.com` or `accounts.google.com`
+   only, redirects never followed, bodies capped at 64 KiB.
+2. A network error, a timeout, a `429`/`5xx` answer, any redirect, or a body
+   over 64 KiB → `503 temporarily_unavailable` with `Retry-After: 5`.
 3. Any other non-200 response, a body that is not a JSON object, `aud`
    different from `GOOGLE_CLIENT_ID` (`azp` is not consulted), or `exp`
    missing or in the past → `401 invalid_token`.

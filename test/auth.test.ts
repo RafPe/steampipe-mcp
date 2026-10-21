@@ -4,6 +4,7 @@ import {
   request as httpRequest,
   type IncomingMessage,
   type Server as HttpServer,
+  type ServerResponse,
 } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -16,6 +17,7 @@ import { authMiddleware } from "../src/auth/index.js";
 import { createStaticTokenVerifier } from "../src/auth/verifiers.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "../src/auth/google.js";
 import { prmPath } from "../src/auth/prm.js";
+import { GOOGLE_FETCH_POLICY } from "../src/auth/fetch-guard.js";
 import { testDbUrl } from "./helpers/db.js";
 
 // No test here talks to Google: tokeninfo and the discovery document are
@@ -797,6 +799,119 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     clock += 2_000;
     await v.verify("t");
     expect(google.requests).toHaveLength(2);
+  });
+});
+
+/** An HTTP server that counts TCP connections, not just parsed requests. */
+async function countingServer(
+  handler: (req: IncomingMessage, res: ServerResponse) => void,
+): Promise<{ base: string; port: number; connections: () => number; requests: string[] }> {
+  let connections = 0;
+  const requests: string[] = [];
+  const server = createNodeServer((req, res) => {
+    requests.push(`${req.method} ${req.url}`);
+    req.resume();
+    req.on("end", () => handler(req, res));
+  });
+  server.on("connection", () => connections++);
+  const port = await listen(server);
+  return { base: `http://127.0.0.1:${port}`, port, connections: () => connections, requests };
+}
+
+const UNAVAILABLE = { error: "temporarily_unavailable", error_description: "Token validation unavailable" };
+
+describe("Google identity calls go through the restricted fetch (R3)", () => {
+  it("refuses a tokeninfo URL on a non-allowlisted https host with 503, before connecting", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(tokeninfo().body));
+    });
+    const port = await startApp(googleConfig(), `https://127.0.0.1:${target.port}/tokeninfo`);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+    expect(target.connections()).toBe(0);
+    expect(target.requests).toHaveLength(0);
+  });
+
+  for (const status of [302, 307]) {
+    it(`answers 503, not 401 or 200, when tokeninfo answers ${status}, and never follows it`, async () => {
+      const valid = await countingServer((_req, res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(tokeninfo().body));
+      });
+      const redirecting = await countingServer((_req, res) => {
+        res.writeHead(status, { Location: `${valid.base}/tokeninfo` });
+        res.end();
+      });
+      const port = await startApp(googleConfig(), `${redirecting.base}/tokeninfo`);
+      const res = await toolsList(port, "t");
+      expect(res.status).toBe(503);
+      expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+      expect(redirecting.requests).toEqual(["POST /tokeninfo"]);
+      expect(valid.connections()).toBe(0);
+    });
+  }
+
+  it("answers 503 when a tokeninfo 200 body is larger than maxBytes", async () => {
+    const big = { ...(tokeninfo().body as object), padding: "x".repeat(GOOGLE_FETCH_POLICY.maxBytes) };
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(big));
+    });
+    const port = await startApp(googleConfig(), `${target.base}/tokeninfo`);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
+    expect(target.requests).toEqual(["POST /tokeninfo"]);
+  });
+
+  it("still classifies a well-formed but non-object 200 as malformed after the guard", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end("[1,2]");
+    });
+    const v = createGoogleVerifier({
+      clientId: CLIENT,
+      allowedEmails: [],
+      allowedDomains: ["corp.com"],
+      publicUrl: new URL(PUBLIC_URL),
+      tokeninfoUrl: `${target.base}/tokeninfo`,
+    });
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("malformed");
+  });
+
+  it("refuses a discovery URL on a non-allowlisted https host as issuer_unavailable, before connecting", async () => {
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(FAKE_GOOGLE_METADATA));
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`https://127.0.0.1:${target.port}/discovery`))).resolves.toBe(
+      "issuer_unavailable",
+    );
+    expect(target.connections()).toBe(0);
+  });
+
+  it("refuses a discovery redirect as issuer_unavailable without following it", async () => {
+    const valid = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(FAKE_GOOGLE_METADATA));
+    });
+    const redirecting = await countingServer((_req, res) => {
+      res.writeHead(302, { Location: `${valid.base}/discovery` });
+      res.end();
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`${redirecting.base}/discovery`))).resolves.toBe("issuer_unavailable");
+    expect(valid.connections()).toBe(0);
+  });
+
+  it("refuses a discovery document larger than maxBytes as issuer_unavailable", async () => {
+    const big = { ...FAKE_GOOGLE_METADATA, padding: "x".repeat(GOOGLE_FETCH_POLICY.maxBytes) };
+    const target = await countingServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(big));
+    });
+    await expect(reasonFrom(fetchGoogleMetadata(`${target.base}/discovery`))).resolves.toBe("issuer_unavailable");
   });
 });
 
