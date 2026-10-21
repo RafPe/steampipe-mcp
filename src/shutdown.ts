@@ -42,15 +42,16 @@ export interface ShutdownDeps {
 /**
  * The graceful shutdown sequence, returning the process exit code. Auth's
  * background work (the degraded-start discovery retry) is disposed first,
- * then HTTP stops accepting requests, then the database pool closes. Only a
- * failed `db.close()` gives exit code 1; a throwing `dispose()` is ignored
- * so the rest of the sequence still runs.
+ * then HTTP stops accepting requests, then the database pool closes. A
+ * failing step never stops the later ones, but any failure (a throwing
+ * `dispose()` or a failed `db.close()`) makes the exit code 1.
  */
 export async function gracefulShutdown(deps: ShutdownDeps): Promise<number> {
+  let code = 0;
   try {
     deps.auth?.dispose();
   } catch {
-    // Not actionable during shutdown.
+    code = 1;
   }
   if (deps.httpServer) {
     await closeHttpServerGracefully(deps.httpServer);
@@ -59,8 +60,31 @@ export async function gracefulShutdown(deps: ShutdownDeps): Promise<number> {
     try {
       await deps.db.close();
     } catch {
-      return 1;
+      code = 1;
     }
   }
-  return 0;
+  return code;
+}
+
+/** The slice of `process` that `setupShutdownHandlers` uses (a test seam). */
+export interface SignalTarget {
+  on(event: "SIGTERM" | "SIGINT", listener: () => void): unknown;
+  exit(code: number): void;
+}
+
+/**
+ * Run `gracefulShutdown` on SIGTERM and SIGINT, then exit with its code.
+ * No logging: during shutdown it may interfere with the MCP protocol.
+ */
+export function setupShutdownHandlers(
+  db: ShutdownDeps["db"],
+  httpServer?: ClosableHttpServer,
+  auth?: ShutdownDeps["auth"],
+  proc: SignalTarget = process,
+): void {
+  const shutdown = async () => {
+    proc.exit(await gracefulShutdown({ httpServer, auth, db }));
+  };
+  proc.on("SIGTERM", shutdown);
+  proc.on("SIGINT", shutdown);
 }

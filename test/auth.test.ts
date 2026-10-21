@@ -910,9 +910,10 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       "issuer_unavailable",
     );
     expect(target.connections()).toBe(0);
-    expect(errorLog.mock.calls).toEqual([
-      ["Google discovery request failed", "policy: https host 127.0.0.1 is not in the allowed identity-provider hosts"],
-    ]);
+    // fetchGoogleMetadata no longer logs; the caller reports the cause,
+    // which the error message carries (scheme and host only).
+    await expect(fetchGoogleMetadata(`https://127.0.0.1:${target.port}/discovery`)).rejects.toThrow("(policy: https host 127.0.0.1 is not in the allowed identity-provider hosts)");
+    expect(errorLog).not.toHaveBeenCalled();
   });
 
   it("refuses a discovery redirect as issuer_unavailable without following it", async () => {
@@ -926,9 +927,10 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
     });
     await expect(reasonFrom(fetchGoogleMetadata(`${redirecting.base}/discovery`))).resolves.toBe("issuer_unavailable");
     expect(valid.connections()).toBe(0);
-    expect(errorLog.mock.calls).toEqual([
-      ["Google discovery request failed", `redirect: redirect from ${redirecting.base} refused`],
-    ]);
+    // fetchGoogleMetadata no longer logs; the caller reports the cause,
+    // which the error message carries (scheme and host only).
+    await expect(fetchGoogleMetadata(`${redirecting.base}/discovery`)).rejects.toThrow(`(redirect: redirect from ${redirecting.base} refused)`);
+    expect(errorLog).not.toHaveBeenCalled();
   });
 
   it("refuses a discovery document larger than maxBytes as issuer_unavailable", async () => {
@@ -938,9 +940,10 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       res.end(JSON.stringify(big));
     });
     await expect(reasonFrom(fetchGoogleMetadata(`${target.base}/discovery`))).resolves.toBe("issuer_unavailable");
-    expect(errorLog.mock.calls).toEqual([
-      ["Google discovery request failed", `too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes`],
-    ]);
+    // fetchGoogleMetadata no longer logs; the caller reports the cause,
+    // which the error message carries (scheme and host only).
+    await expect(fetchGoogleMetadata(`${target.base}/discovery`)).rejects.toThrow(`(too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes)`);
+    expect(errorLog).not.toHaveBeenCalled();
   });
 });
 

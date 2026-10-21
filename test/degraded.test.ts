@@ -16,6 +16,8 @@ import { fetchGoogleMetadata } from "../src/auth/google.js";
 import { buildHttpApp } from "../src/http/app.js";
 import { buildReadiness } from "../src/http/ready.js";
 import { gracefulShutdown } from "../src/shutdown.js";
+import { serveHttp } from "../src/http/compose.js";
+import { EventEmitter } from "node:events";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
 import { testDbUrl } from "./helpers/db.js";
@@ -561,6 +563,23 @@ describe("authMiddleware: google with the flag off (default)", () => {
   });
 });
 
+describe("fetchGoogleMetadata: logging", () => {
+  it("does not log a guard refusal itself; the cause (scheme and host only) is in the thrown error", async () => {
+    let thrown: unknown;
+    try {
+      await fetchGoogleMetadata("https://evil.example/discovery?secret=1");
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toBeInstanceOf(VerifyError);
+    expect((thrown as Error).message).toBe(
+      "Google discovery document unavailable (policy: https host evil.example is not in the allowed identity-provider hosts)",
+    );
+    expect(error).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
 describe("fetchGoogleMetadata: caller abort", () => {
   it("passes the signal to the guarded fetch and does not log an aborted request as a failure", async () => {
     vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
@@ -611,9 +630,9 @@ describe("gracefulShutdown", () => {
     expect(order).toEqual(["dispose", "http", "db"]);
   });
 
-  it("still closes the HTTP server and database when dispose throws", async () => {
+  it("still closes the HTTP server and database when dispose throws, then exits 1", async () => {
     const { order, deps: d } = deps({ disposeThrows: true });
-    expect(await gracefulShutdown(d)).toBe(0);
+    expect(await gracefulShutdown(d)).toBe(1);
     expect(order).toEqual(["dispose", "http", "db"]);
   });
 
@@ -626,5 +645,91 @@ describe("gracefulShutdown", () => {
     const { order, deps: d } = deps();
     expect(await gracefulShutdown({ db: d.db })).toBe(0);
     expect(order).toEqual(["db"]);
+  });
+});
+
+// --- Production composition: what startHttp actually runs ------------------
+
+class FakeProcess extends EventEmitter {
+  exit = vi.fn();
+}
+
+const REFUSED = () => fetchGoogleMetadata("https://evil.example/discovery");
+
+async function serve(
+  cfg: ServerConfig,
+  opts: { metadataFetcher: (signal?: AbortSignal) => Promise<OAuthMetadata>; sleep?: ReturnType<typeof manualSleep> },
+) {
+  const db = newDb();
+  vi.spyOn(db, "ping").mockResolvedValue(undefined);
+  const close = vi.spyOn(db, "close").mockResolvedValue(undefined);
+  const proc = new FakeProcess();
+  const served = await serveHttp({ ...cfg, http: { ...cfg.http, port: 0 } }, db, {
+    metadataFetcher: opts.metadataFetcher,
+    tokeninfoUrl: await fakeTokeninfo(),
+    discoveryRetry: opts.sleep && { sleep: opts.sleep.sleep },
+    readiness: { cacheMs: 0 },
+    proc,
+  });
+  servers.push(served.server);
+  auths.push(served.auth);
+  return { ...served, db, close, proc, port: (served.server.address() as AddressInfo).port };
+}
+
+describe("serveHttp (the composition startHttp uses)", () => {
+  it("registers auth's readiness check: degraded google with a refusing fetcher gives /readyz 503 auth=pending", async () => {
+    const s = manualSleep();
+    const { port } = await serve(googleConfig(DEGRADED), { metadataFetcher: REFUSED, sleep: s });
+    await flush();
+    const res = await send(port, { method: "GET", path: "/readyz" });
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ status: "not_ready", checks: { db: "ready", auth: "pending" } });
+    expect((await send(port, { method: "GET", path: PRM })).status).toBe(503);
+    expect((await toolsList(port, "good")).status).toBe(200);
+  });
+
+  it("logs each degraded retry once, as a warning from the loader, and never as an error", async () => {
+    const s = manualSleep();
+    await serve(googleConfig(DEGRADED), { metadataFetcher: REFUSED, sleep: s });
+    await flush();
+    await s.release();
+    expect(warn.mock.calls).toEqual([
+      [
+        expect.stringMatching(/^Google discovery failed \(attempt 1\); retrying in \d+ms$/),
+        "Google discovery document unavailable (policy: https host evil.example is not in the allowed identity-provider hosts)",
+      ],
+      [expect.stringMatching(/^Google discovery failed \(attempt 2\); retrying in \d+ms$/), expect.any(String)],
+    ]);
+    expect(error).not.toHaveBeenCalled();
+  });
+
+  it("fails fast with the flag off: one clear error, nothing served, no signal handlers", async () => {
+    const proc = new FakeProcess();
+    const db = newDb();
+    await expect(serveHttp(googleConfig(), db, { metadataFetcher: REFUSED, proc })).rejects.toThrow(
+      "Google discovery document unavailable",
+    );
+    expect(error.mock.calls).toEqual([
+      [
+        "Failed to initialise STEAMPIPE_MCP_AUTH_MODE=google:",
+        "Google discovery document unavailable (policy: https host evil.example is not in the allowed identity-provider hosts)",
+      ],
+    ]);
+    expect(warn).not.toHaveBeenCalled();
+    expect(proc.listenerCount("SIGTERM")).toBe(0);
+  });
+
+  it("on SIGTERM disposes auth before closing the database, then exits 0", async () => {
+    const s = manualSleep();
+    const served = await serve(googleConfig(DEGRADED), { metadataFetcher: REFUSED, sleep: s });
+    const dispose = vi.spyOn(served.auth, "dispose");
+    expect(served.proc.listenerCount("SIGINT")).toBe(1);
+    served.proc.emit("SIGTERM");
+    await vi.waitFor(() => expect(served.proc.exit).toHaveBeenCalled());
+    expect(served.proc.exit).toHaveBeenCalledWith(0);
+    expect(dispose).toHaveBeenCalledTimes(1);
+    expect(served.close).toHaveBeenCalledTimes(1);
+    expect(dispose.mock.invocationCallOrder[0]).toBeLessThan(served.close.mock.invocationCallOrder[0]);
+    expect(served.server.listening).toBe(false);
   });
 });
