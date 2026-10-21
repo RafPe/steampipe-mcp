@@ -36,6 +36,8 @@ Add Steampipe MCP to your AI assistant's configuration file:
 }
 ```
 
+> **Note:** `npx -y @turbot/steampipe-mcp` installs the upstream npm package (`0.1.2`), which only supports stdio. This fork is not published to npm: the HTTP transport, auth modes, row cap, and other hardening described below are only available when you run it [from a clone](#clone-and-setup) or from the [Docker image](#run-as-a-remote-mcp-docker).
+
 By default, this connects to your local Steampipe installation at `postgresql://steampipe@localhost:9193/steampipe`. Make sure to run `steampipe service start` first.
 
 To connect to a [Turbot Pipes](https://turbot.com/pipes) workspace instead, add your connection string to the args:
@@ -69,18 +71,23 @@ Save the configuration file and restart your AI assistant for the changes to tak
 Besides stdio (the default), the server can serve [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) so clients can reach it over the network:
 
 ```sh
-STEAMPIPE_MCP_TRANSPORT=http npx -y @turbot/steampipe-mcp
+git clone https://github.com/RafPe/steampipe-mcp.git
+cd steampipe-mcp
+npm ci && npm run build
+STEAMPIPE_MCP_TRANSPORT=http node dist/index.js
 # Streamable HTTP server listening on http://127.0.0.1:27123/mcp
 ```
 
-The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string.
+Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.2.0` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
+
+The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string, and `steampipe_query` returns at most `STEAMPIPE_MCP_MAX_ROWS` rows (default `10000`).
 
 Built-in protections:
 
 - **Loopback by default.** The server binds `127.0.0.1`. Binding a non-loopback address without auth is refused unless `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true`.
 - **Origin validation (always on).** A request with an `Origin` header that is not exactly listed in `STEAMPIPE_MCP_ALLOWED_ORIGINS` gets `403`. Requests without an `Origin` header (non-browser clients) pass. `Origin: null` is rejected unless the literal `null` is listed.
 - **Host validation (DNS rebinding).** On a loopback bind only `localhost`, `127.0.0.1` and `[::1]` are accepted as `Host`. On a non-loopback bind the `Host` hostname must be in `STEAMPIPE_MCP_ALLOWED_HOSTS`, or else match the hostname of `STEAMPIPE_MCP_PUBLIC_URL`; if neither is set, Host validation is skipped and a warning is logged at startup.
-- **Body size cap.** Request bodies larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` get `413`; bodies that are not `application/json` get `415`.
+- **Body size cap.** Request bodies larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` get `413`; bodies that are not `application/json` get `415`, and an empty `application/json` body gets `400`.
 - **Authentication.** `STEAMPIPE_MCP_AUTH_MODE=token` requires a static bearer token; `STEAMPIPE_MCP_AUTH_MODE=google` accepts Google OAuth access tokens for allowlisted users. See [docs/remote-deployment.md](docs/remote-deployment.md).
 
 Quick check with curl (clients must accept both `application/json` and `text/event-stream`):
@@ -92,7 +99,59 @@ curl -s http://127.0.0.1:27123/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
-When connecting from a browser-based client such as the MCP Inspector in direct mode, add its origin to `STEAMPIPE_MCP_ALLOWED_ORIGINS` (or use the Inspector's proxy mode).
+To try the server with the MCP Inspector, use the Inspector's proxy mode, where the Inspector's local proxy (not the browser) connects to the server; or use curl as above. Direct mode, where the browser connects itself, does not work: the server sends no CORS headers and answers the `OPTIONS` preflight with `404` (or `403` if the origin is not in `STEAMPIPE_MCP_ALLOWED_ORIGINS`).
+
+### Run as a remote MCP (Docker)
+
+A multi-arch (`linux/amd64`, `linux/arm64`) image is published to
+`ghcr.io/rafpe/steampipe-mcp`. It runs as a non-root user, defaults to
+`STEAMPIPE_MCP_TRANSPORT=http` on `0.0.0.0:27123`, and has a built-in
+`HEALTHCHECK` against `GET /healthz`. Because of the bind guard above, it
+refuses to start unless `STEAMPIPE_MCP_AUTH_MODE` is `token` or `google` (or
+`STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true` is set).
+
+Token mode, pointed at a Turbot Pipes workspace:
+
+```sh
+TOKEN=$(openssl rand -hex 32)
+docker run -d --name steampipe-mcp -p 27123:27123 \
+  -e STEAMPIPE_MCP_AUTH_MODE=token \
+  -e STEAMPIPE_MCP_AUTH_TOKEN="$TOKEN" \
+  -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
+  ghcr.io/rafpe/steampipe-mcp:0.2.0
+echo "Token: $TOKEN"   # save this - you'll need it below
+```
+
+Or bring your own Steampipe container with
+[`docker-compose.example.yml`](docker-compose.example.yml), which also needs
+a database password (Steampipe requires one for connections from another
+container):
+
+```sh
+cp docker-compose.example.yml docker-compose.yml
+TOKEN=$(openssl rand -hex 32)
+{
+  echo "STEAMPIPE_MCP_AUTH_TOKEN=$TOKEN"
+  echo "STEAMPIPE_PASSWORD=$(openssl rand -hex 20)"
+} > .env
+docker compose up -d
+```
+
+Connect Claude Code to either:
+
+```sh
+claude mcp add --transport http steampipe http://localhost:27123/mcp \
+  --header "Authorization: Bearer $TOKEN"
+```
+
+Stop the container with a grace period longer than its 10s forced-close
+shutdown timeout, e.g. `docker stop -t 15 steampipe-mcp` (the compose example
+sets `stop_grace_period: 15s` for the same reason; docker/compose's own
+default stop grace period is 10s).
+
+See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
+mode, the threat model, and reverse-proxy/TLS guidance (the server itself
+speaks plain HTTP).
 
 ## Prompting Guide
 
@@ -182,7 +241,7 @@ Remember to:
 - **status**
   - Represents the current state of the Steampipe connection
   - Properties include:
-    - connection_string: The current database connection string
+    - connection_string: The current database connection string, password masked (stdio only; never included in HTTP mode)
     - status: The connection state (connected/disconnected)
 
 This resource enables AI tools to check and verify the connection status to your Steampipe instance.
@@ -193,7 +252,7 @@ This resource enables AI tools to check and verify the connection status to your
 
 1. Clone the repository and navigate to the directory:
 ```sh
-git clone https://github.com/turbot/steampipe-mcp.git
+git clone https://github.com/RafPe/steampipe-mcp.git
 cd steampipe-mcp
 ```
 
@@ -237,7 +296,14 @@ The following environment variables can be used to configure the MCP server:
 - `STEAMPIPE_MCP_LOG_LEVEL`: Control server logging verbosity (default: `info`)
 - `STEAMPIPE_MCP_WORKSPACE_DATABASE`: Override the default Steampipe connection string (default: `postgresql://steampipe@localhost:9193/steampipe`)
 
-HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
+Query limits (both transports):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STEAMPIPE_MCP_MAX_ROWS` | `0` on stdio, `10000` on http | Maximum rows `steampipe_query` returns; `0` means unlimited. When the cap cuts a result short, the tool returns `{"rows": [...], "truncated": true}` instead of a plain array |
+| `STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS` | `120000` | Per-connection Postgres `statement_timeout` (and `idle_in_transaction_session_timeout`) in milliseconds; minimum `1` |
+
+HTTP transport settings. Some are validated in every mode, so a malformed value fails startup even on stdio: the numeric settings, `TRANSPORT`, `AUTH_MODE`, `ALLOW_INSECURE_REMOTE`, `TRUST_PROXY`, and the syntax of `PUBLIC_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS`. The policy checks (the non-loopback bind guard, the `token`/`google` auth requirements, and `https` for a non-loopback `PUBLIC_URL`) apply only when `STEAMPIPE_MCP_TRANSPORT=http`:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -246,8 +312,8 @@ HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
 | `STEAMPIPE_MCP_HTTP_PORT` | `27123` | Port to bind |
 | `STEAMPIPE_MCP_HTTP_PATH` | `/mcp` | Path of the MCP endpoint |
 | `STEAMPIPE_MCP_PUBLIC_URL` | _(unset)_ | Public URL clients use (must be `https` unless loopback); its hostname is the Host-validation fallback |
-| `STEAMPIPE_MCP_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated exact `Origin` values to accept; any other present `Origin` gets `403` |
-| `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames accepted in the `Host` header on a non-loopback bind (ports and case are ignored) |
+| `STEAMPIPE_MCP_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated origins to accept (e.g. `https://app.example.com`); each entry is normalised to its origin, so case, a trailing slash, or a default port don't matter. The literal `null` allows `Origin: null`. Any other present `Origin` gets `403` |
+| `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames (optionally `host:port`) accepted in the `Host` header on a non-loopback bind; ports and case are ignored. Entries with a scheme or path (e.g. `https://x`) are rejected at startup |
 | `STEAMPIPE_MCP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes; larger bodies get `413` |
 | `STEAMPIPE_MCP_RATE_LIMIT_PER_MIN` | `60` | Per-principal (authenticated `sub`, or client IP in `none` mode) requests per rolling 60s window; over-limit requests get `429`. A coarser, IP-only limit at 10x this value also applies ahead of auth, so an unauthenticated flood can't reach the token verifier |
 | `STEAMPIPE_MCP_TRUST_PROXY` | _(unset)_ | Passed to Express's `trust proxy` setting (a hop count, or `true`) so rate limiting sees the real client IP behind a reverse proxy. Only set this when every request actually goes through that trusted proxy: it makes `X-Forwarded-For` authoritative, so setting it without one lets a client spoof its own rate-limit key and bypass the limit |

@@ -379,6 +379,54 @@ describe("loadConfig", () => {
     });
   });
 
+  describe("ALLOWED_ORIGINS / ALLOWED_HOSTS", () => {
+    it("normalises origin entries to the exact form a browser sends", () => {
+      const cfg = loadConfig(
+        envWith({
+          STEAMPIPE_MCP_ALLOWED_ORIGINS: "https://App.example.com/, https://b.example:443, http://c.example:8080/x",
+        }),
+        EMPTY_ARGV,
+      );
+      expect(cfg.http.allowedOrigins).toEqual(["https://app.example.com", "https://b.example", "http://c.example:8080"]);
+    });
+
+    it("keeps the literal null origin as-is", () => {
+      const cfg = loadConfig(envWith({ STEAMPIPE_MCP_ALLOWED_ORIGINS: "null" }), EMPTY_ARGV);
+      expect(cfg.http.allowedOrigins).toEqual(["null"]);
+    });
+
+    it("throws for an unparsable origin entry, naming the variable", () => {
+      const env = envWith({ STEAMPIPE_MCP_ALLOWED_ORIGINS: "app.example.com" });
+      expect(() => loadConfig(env, EMPTY_ARGV)).toThrow(ConfigError);
+      expect(() => loadConfig(env, EMPTY_ARGV)).toThrow(/STEAMPIPE_MCP_ALLOWED_ORIGINS/);
+    });
+
+    it("throws for an entry with an opaque origin rather than silently allowlisting null", () => {
+      // new URL("app.example.com:443").origin is "null" (non-special scheme).
+      for (const entry of ["app.example.com:443", "file:///tmp/x"]) {
+        expect(() => loadConfig(envWith({ STEAMPIPE_MCP_ALLOWED_ORIGINS: entry }), EMPTY_ARGV)).toThrow(
+          /STEAMPIPE_MCP_ALLOWED_ORIGINS/,
+        );
+      }
+    });
+
+    it("accepts host entries with or without a port", () => {
+      const cfg = loadConfig(
+        envWith({ STEAMPIPE_MCP_ALLOWED_HOSTS: "mcp.example.com, MCP.example.com:443" }),
+        EMPTY_ARGV,
+      );
+      expect(cfg.http.allowedHosts).toEqual(["mcp.example.com", "MCP.example.com:443"]);
+    });
+
+    it("throws for a host entry that is a URL or contains a path, naming the variable", () => {
+      for (const entry of ["https://x", "mcp.example.com/mcp"]) {
+        const env = envWith({ STEAMPIPE_MCP_ALLOWED_HOSTS: entry });
+        expect(() => loadConfig(env, EMPTY_ARGV)).toThrow(ConfigError);
+        expect(() => loadConfig(env, EMPTY_ARGV)).toThrow(/STEAMPIPE_MCP_ALLOWED_HOSTS/);
+      }
+    });
+  });
+
   describe("TRUST_PROXY", () => {
     it("is undefined when unset", () => {
       expect(loadConfig(EMPTY_ENV, EMPTY_ARGV).http.trustProxy).toBeUndefined();

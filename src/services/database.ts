@@ -301,6 +301,11 @@ export class DatabaseService {
 
   /**
    * Execute an internal, parameterised query in a read-only transaction.
+   *
+   * For internal static or parameterised SQL only - never pass user input.
+   * With an empty `params` array pg uses the simple query protocol, which
+   * accepts multiple semicolon-separated statements. User-supplied SQL must
+   * go through executeUserQuery, which enforces a single statement.
    */
   async executeQuery(query: string, params: any[] = []): Promise<any[]> {
     try {

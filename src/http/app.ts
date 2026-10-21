@@ -18,6 +18,14 @@ function jsonRpcError(status: number, code: number, message: string): { status: 
 }
 
 /**
+ * True when the Content-Type media type is exactly `application/json` (any
+ * parameters ignored), i.e. the same type express.json() parses by default.
+ */
+function isJsonContentType(header: string | undefined): boolean {
+  return header?.split(";")[0].trim().toLowerCase() === "application/json";
+}
+
+/**
  * Normalise a configured host entry to the shape the SDK middleware compares
  * against: `new URL("http://" + Host).hostname`, i.e. lowercased, port-free,
  * IPv6 kept in brackets. Without this, `ALLOWED_HOSTS=MCP.example.com:443`
@@ -132,6 +140,17 @@ export function buildHttpApp(
     rejectBatch(),
     auditMiddleware(),
     async (req, res) => {
+      // An application/json POST with no body: express.json() leaves
+      // req.body undefined when there is no Content-Length at all, and sets
+      // it to {} for Content-Length: 0. Say so plainly rather than answering
+      // 415 or a transport parse error. req.is() cannot detect this: it
+      // returns null whenever the request has no body.
+      const emptyBody = req.body === undefined || req.headers["content-length"] === "0";
+      if (emptyBody && isJsonContentType(req.headers["content-type"])) {
+        const reply = jsonRpcError(400, -32600, "Request body is empty");
+        res.status(reply.status).json(reply.body);
+        return;
+      }
       // express.json() only parses application/json. Refuse anything it
       // skipped, so the transport never reads an unparsed (and so uncapped)
       // body stream itself.
