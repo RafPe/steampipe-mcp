@@ -4,6 +4,10 @@ _What's new_
 
 * Declarative identity policy (`STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`, `STEAMPIPE_MCP_SUBJECT_PREFIXES`): required claim values, an exact subject allowlist, and subject prefixes, parsed and validated at startup in `http` mode. All default to empty (no policy). This release adds the policy core and its configuration only; the verifiers enforce it in a later change.
 
+_Security_
+
+* Untrusted text written to logs (the audit line's `sub`, `clientId`, `method` and `tool`, HTTP/MCP request error messages, database driver error messages, and the Google principal email at debug level) is now stripped of control, line-separator and bidi characters and capped at 256 characters with a `…(+N)` suffix; the debug-level SQL line gets the same stripping with an 8192-character cap, so a client cannot forge extra log lines or flood the log.
+
 ## 0.2.1 [2026-10-21]
 
 _Fixes_

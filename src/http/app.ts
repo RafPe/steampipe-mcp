@@ -7,6 +7,7 @@ import {
 import type { ServerConfig } from "../config.js";
 import { createServer } from "../server.js";
 import type { DatabaseService } from "../services/database.js";
+import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 import { isLoopback } from "../services/ssl.js";
 import { auditMiddleware } from "./audit.js";
@@ -70,7 +71,7 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   } else if (typeof err?.status === "number" && err.status >= 400 && err.status < 500) {
     reply = jsonRpcError(err.status, -32000, "Bad request");
   } else {
-    logger.error("HTTP request failed", err instanceof Error ? err.message : String(err));
+    logger.error("HTTP request failed", boundForLog(err instanceof Error ? err.message : err));
     reply = jsonRpcError(500, -32603, "Internal server error");
   }
   if (res.headersSent) {
@@ -175,7 +176,7 @@ export function buildHttpApp(
         await server.connect(transport);
         await transport.handleRequest(req, res, req.body);
       } catch (error) {
-        logger.error("MCP request failed", error instanceof Error ? error.message : String(error));
+        logger.error("MCP request failed", boundForLog(error instanceof Error ? error.message : error));
         if (!res.headersSent) {
           const reply = jsonRpcError(500, -32603, "Internal server error");
           res.status(reply.status).json(reply.body);

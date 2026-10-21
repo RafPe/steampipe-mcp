@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type { RequestHandler } from "express";
+import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 
 export interface AuditEvent {
@@ -43,11 +44,14 @@ interface JsonRpcBody {
  * `params.arguments.sql` from the parsed JSON-RPC body only - never from
  * headers, so the bearer token can never leak into it. `sub`/`clientId`
  * come from `req.auth` (set by the bearer middleware upstream), defaulting
- * to `"anonymous"`/`"none"` in `none` mode. A 401/403 never reaches this
- * middleware: bearer auth rejects those first.
+ * to `"anonymous"`/`"none"` in `none` mode. Those are token claims and
+ * `method`/`tool` are client-supplied, so all four pass through
+ * `boundForLog` first. A 401/403 never reaches this middleware: bearer auth
+ * rejects those first.
  *
  * The SQL text itself is logged separately, at debug level only, so it
- * never appears at the default `info` level.
+ * never appears at the default `info` level. It is stripped of control and
+ * bidi characters and capped at 8192 characters.
  */
 export function auditMiddleware(): RequestHandler {
   return (req, res, next) => {
@@ -58,15 +62,15 @@ export function auditMiddleware(): RequestHandler {
     const sql = typeof body?.params?.arguments?.sql === "string" ? body.params.arguments.sql : undefined;
 
     if (toolName === "steampipe_query" && sql !== undefined) {
-      logger.debug(`steampipe_query SQL (tool=${toolName}): ${sql}`);
+      logger.debug(`steampipe_query SQL (tool=${toolName}): ${boundForLog(sql, 8192)}`);
     }
 
     res.on("finish", () => {
       auditLog({
-        sub: (req.auth?.extra?.sub as string | undefined) ?? "anonymous",
-        clientId: req.auth?.clientId ?? "none",
-        method,
-        ...(toolName !== undefined ? { tool: toolName } : {}),
+        sub: boundForLog((req.auth?.extra?.sub as string | undefined) ?? "anonymous"),
+        clientId: boundForLog(req.auth?.clientId ?? "none"),
+        method: boundForLog(method),
+        ...(toolName !== undefined ? { tool: boundForLog(toolName) } : {}),
         durationMs: Date.now() - start,
         status: res.statusCode,
         ...(toolName === "steampipe_query" && sql !== undefined ? { sqlSha256: sqlSha256(sql) } : {}),
