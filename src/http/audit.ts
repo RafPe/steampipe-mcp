@@ -5,6 +5,7 @@ import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 
 export interface AuditEvent {
+  iss?: string;
   sub: string;
   clientId: string;
   method: string;
@@ -66,10 +67,11 @@ interface JsonRpcBody {
  * `params.arguments.sql` from the parsed JSON-RPC body only - never from
  * headers, so the bearer token can never leak into it. `sub`/`clientId`
  * come from `req.auth` (set by the bearer middleware upstream), defaulting
- * to `"anonymous"`/`"none"` in `none` mode. Those are token claims and
- * `method`/`tool` are client-supplied, so all four pass through
- * `boundForLog` first. A 401/403/503 from bearer auth never reaches this
- * middleware; those are logged by `auditAuthReject` instead.
+ * to `"anonymous"`/`"none"` in `none` mode; `iss` is added when the
+ * principal has one (jwt mode). Those are token claims and `method`/`tool`
+ * are client-supplied, so all of them pass through `boundForLog` first. A
+ * 401/403/503 from bearer auth never reaches this middleware; those are
+ * logged by `auditAuthReject` instead.
  *
  * The SQL text itself is logged separately, at debug level only, so it
  * never appears at the default `info` level. It is stripped of control and
@@ -88,7 +90,9 @@ export function auditMiddleware(): RequestHandler {
     }
 
     res.on("finish", () => {
+      const iss = req.auth?.extra?.iss;
       auditLog({
+        ...(typeof iss === "string" ? { iss: boundForLog(iss) } : {}),
         sub: boundForLog((req.auth?.extra?.sub as string | undefined) ?? "anonymous"),
         clientId: boundForLog(req.auth?.clientId ?? "none"),
         method: boundForLog(method),
