@@ -1,4 +1,5 @@
 import type { RequestHandler } from "express";
+import type { DatabaseService } from "../services/database.js";
 import { logger } from "../services/logger.js";
 
 export type CheckStatus = "ready" | "pending" | "failing";
@@ -93,6 +94,17 @@ export class Readiness {
       clearTimeout(timer);
     }
   }
+}
+
+/**
+ * The production readiness checks: `db` runs `select 1` on a dedicated
+ * short-lived client (see `DatabaseService.ping`), never the pool. A
+ * rejection counts as `failing`.
+ */
+export function buildReadiness(db: Pick<DatabaseService, "ping">): Readiness {
+  const readiness = new Readiness();
+  readiness.register({ name: "db", check: async () => (await db.ping(2000), "ready") });
+  return readiness;
 }
 
 /**

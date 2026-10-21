@@ -5,7 +5,7 @@ import { createServer as createTcpServer, type AddressInfo, type Server as TcpSe
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import { DatabaseService } from "../src/services/database.js";
 import { buildHttpApp } from "../src/http/app.js";
-import { Readiness, type CheckStatus } from "../src/http/ready.js";
+import { buildReadiness, Readiness, type CheckStatus } from "../src/http/ready.js";
 import { describeDb, testDbUrl } from "./helpers/db.js";
 
 function newDb(connectionString = testDbUrl() || "postgresql://steampipe@localhost:9193/steampipe"): DatabaseService {
@@ -36,8 +36,8 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-async function start(readiness: Readiness, cfg: ServerConfig = httpConfig()): Promise<number> {
-  const app = buildHttpApp(cfg, newDb(), [], [], readiness);
+async function start(readiness: Readiness, cfg: ServerConfig = httpConfig(), db: DatabaseService = newDb()): Promise<number> {
+  const app = buildHttpApp(cfg, db, [], [], readiness);
   const server = await new Promise<HttpServer>((resolve) => {
     const s = app.listen(0, "127.0.0.1", () => resolve(s));
   });
@@ -202,6 +202,9 @@ describe("GET /readyz", () => {
 
   it("only answers GET", async () => {
     const port = await start(new Readiness());
+    const ok = await get(port);
+    expect(ok.status).toBe(200);
+    expect(JSON.parse(ok.body)).toEqual({ status: "ready", checks: {} });
     const res = await new Promise<number>((resolve, reject) => {
       const req = httpRequest({ host: "127.0.0.1", port, method: "POST", path: "/readyz", agent: false }, (r) => {
         r.resume();
@@ -331,21 +334,31 @@ function noTlsUrl(): string {
   return url.toString();
 }
 
-describeDb("DatabaseService.ping (real database)", () => {
-  function dbCheck(db: DatabaseService) {
-    return {
-      name: "db",
-      check: async (): Promise<CheckStatus> => {
-        try {
-          await db.ping(2000);
-          return "ready";
-        } catch {
-          return "failing";
-        }
-      },
-    };
-  }
+describe("buildReadiness (production checks)", () => {
+  it("registers exactly a db check that pings with a 2000 ms timeout and reports ready", async () => {
+    const calls: number[] = [];
+    const r = buildReadiness({ ping: async (ms: number) => { calls.push(ms); } });
+    await expect(r.evaluate()).resolves.toEqual({ ready: true, checks: { db: "ready" } });
+    expect(calls).toEqual([2000]);
+  });
 
+  it("maps a ping rejection to db failing", async () => {
+    const r = buildReadiness({ ping: async () => { throw new Error("down"); } });
+    await expect(r.evaluate()).resolves.toEqual({ ready: false, checks: { db: "failing" } });
+  });
+
+  it("buildHttpApp with buildReadiness serves 503 db failing for a dead database, without its connection string", async () => {
+    const db = newDb("postgresql://x:topsecret@127.0.0.1:1/x?sslmode=disable");
+    const port = await start(buildReadiness(db), httpConfig(), db);
+    const res = await get(port);
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ status: "not_ready", checks: { db: "failing" } });
+    expect(res.body).not.toContain("topsecret");
+    await db.close();
+  });
+});
+
+describeDb("DatabaseService.ping (real database)", () => {
   it("resolves against the test database without using the pool", async () => {
     const db = newDb(noTlsUrl());
     await expect(db.ping(2000)).resolves.toBeUndefined();
@@ -353,23 +366,19 @@ describeDb("DatabaseService.ping (real database)", () => {
     await db.close();
   });
 
-  it("reports db ready against the test database", async () => {
+  it("buildReadiness reports db ready against the test database", async () => {
     const db = newDb(noTlsUrl());
-    const r = new Readiness();
-    r.register(dbCheck(db));
-    const port = await start(r);
+    const port = await start(buildReadiness(db), httpConfig(), db);
     const res = await get(port);
     expect(res.status).toBe(200);
     expect(JSON.parse(res.body)).toEqual({ status: "ready", checks: { db: "ready" } });
+    expect((db as unknown as { pool: unknown }).pool).toBeNull();
     await db.close();
   });
 
-  it("reports db failing for an unreachable database and never echoes the connection string", async () => {
-    const conn = "postgresql://x:topsecret@127.0.0.1:1/x";
-    const db = newDb(conn);
-    const r = new Readiness();
-    r.register(dbCheck(db));
-    const port = await start(r);
+  it("buildReadiness reports db failing for an unreachable database and never echoes the connection string", async () => {
+    const db = newDb("postgresql://x:topsecret@127.0.0.1:1/x");
+    const port = await start(buildReadiness(db), httpConfig(), db);
     const res = await get(port);
     expect(res.status).toBe(503);
     expect(JSON.parse(res.body)).toEqual({ status: "not_ready", checks: { db: "failing" } });
