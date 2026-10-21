@@ -413,3 +413,27 @@ canonical `STEAMPIPE_MCP_PUBLIC_URL` and `authorization_servers` set to
 `[STEAMPIPE_MCP_JWT_ISSUER]` exactly as written. Audit lines carry the
 token's `iss`, and the per-principal rate limit keys on `iss|sub`, so the same
 `sub` from different issuers never shares a quota.
+
+**Several issuers.** To trust more than one issuer behind the same header, set
+`STEAMPIPE_MCP_JWT_ISSUERS` instead of `STEAMPIPE_MCP_JWT_ISSUER`:
+
+```sh
+STEAMPIPE_MCP_JWT_ISSUERS='[
+  {"issuer": "https://idp.example.com/realms/platform"},
+  {"issuer": "https://login.example.net/tenant-1/v2.0", "acceptedTyp": ["JWT"],
+   "audiences": ["api://steampipe-mcp"], "advertise": false}
+]'
+```
+
+Each entry accepts `issuer` (required), `audiences`, `algorithms`,
+`acceptedTyp`, `clockSkewS`, `maxTokenAgeS` and `advertise`; a missing field
+takes the matching single-issuer variable. The server reads the token's `iss`
+without verifying it, only to pick the entry whose `issuer` matches exactly;
+the token is then verified with that issuer's JWKS and settings alone, so a
+token claiming one issuer but signed by another fails its signature check. A
+token whose `iss` matches no entry is refused (`401`) without any network call.
+Every issuer is discovered at startup, each with its own fetch policy (its own
+host plus `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`), and the server refuses to start if
+any discovery fails. `authorization_servers` lists the entries with
+`"advertise": true` (the default), in array order, so an issuer used only by
+machine clients can stay unlisted; at least one entry must be advertised.
