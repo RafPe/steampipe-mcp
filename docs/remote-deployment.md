@@ -500,11 +500,15 @@ example `azp` or `roles`) where you can.
 
 A token is accepted only if all of these hold:
 
-- its header `typ` is in `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` (case-insensitive).
-  The default, `at+jwt`, keeps ID tokens and other generic JWTs out. Add `JWT`
-  only for issuers that put `typ: "JWT"` on otherwise RFC 9068 access tokens:
-  it widens the `typ` check only, and the claims below are still required.
-  A token with no `typ` at all is always rejected.
+- its header `typ` is in the issuer's accepted list (case-insensitive): the
+  entry's `acceptedTyp`, else `STEAMPIPE_MCP_JWT_ACCEPTED_TYP`. Under the
+  default profile the default, `at+jwt` (or `application/at+jwt`), keeps ID
+  tokens and other generic JWTs out. Add `JWT` only for issuers that put
+  `typ: "JWT"` on otherwise RFC 9068 access tokens: it widens the `typ` check
+  only, and the claims below are still required. For a
+  [lenient](#lenient-profile-opt-in-per-issuer) issuer the default list also
+  holds `JWT` (unless `acceptedTyp` or `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` is
+  set). A token with no `typ` at all is always rejected, under either profile.
 - its `alg` is in `STEAMPIPE_MCP_JWT_ALGORITHMS`. `none` and `HS*` are refused
   at startup, so neither `alg:none` nor an HMAC key made from the public key
   works.
