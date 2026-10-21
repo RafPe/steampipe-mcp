@@ -13,7 +13,7 @@ export function originValidation(allowed: string[]): RequestHandler {
   return (req, res, next) => {
     const origin = req.headers.origin;
     if (origin !== undefined && !allowedSet.has(origin)) {
-      res.status(403).json({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden origin" } });
+      res.status(403).json({ jsonrpc: "2.0", error: { code: -32000, message: "Forbidden origin" }, id: null });
       return;
     }
     next();

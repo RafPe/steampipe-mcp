@@ -114,6 +114,49 @@ function parseCsv(env: NodeJS.ProcessEnv, name: string): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+/**
+ * Normalise each ALLOWED_ORIGINS entry to the serialised origin a browser
+ * sends (`https://App.example.com/` -> `https://app.example.com`), so the
+ * exact-match Origin check is not defeated by case, a trailing slash or a
+ * default port. The literal `null` is kept as-is. An entry whose origin is
+ * opaque (`new URL("app.example.com:443").origin` is "null") is rejected
+ * rather than silently allowlisting `Origin: null`.
+ */
+function parseOrigins(env: NodeJS.ProcessEnv): string[] {
+  return parseCsv(env, "ALLOWED_ORIGINS").map((entry) => {
+    if (entry === "null") {
+      return entry;
+    }
+    let origin: string;
+    try {
+      origin = new URL(entry).origin;
+    } catch {
+      origin = "null";
+    }
+    if (origin === "null") {
+      throw new ConfigError(
+        `${PREFIX}ALLOWED_ORIGINS entries must be origins like "https://app.example.com" (or the literal null), ` +
+          `got ${JSON.stringify(entry)}`,
+      );
+    }
+    return origin;
+  });
+}
+
+/** ALLOWED_HOSTS entries are `host` or `host:port`, never URLs or paths. */
+function parseHosts(env: NodeJS.ProcessEnv): string[] {
+  const hosts = parseCsv(env, "ALLOWED_HOSTS");
+  for (const entry of hosts) {
+    if (entry.includes("://") || entry.includes("/")) {
+      throw new ConfigError(
+        `${PREFIX}ALLOWED_HOSTS entries must be a hostname or hostname:port without a scheme or path, ` +
+          `got ${JSON.stringify(entry)}`,
+      );
+    }
+  }
+  return hosts;
+}
+
 function parseCsvLower(env: NodeJS.ProcessEnv, name: string): string[] {
   return parseCsv(env, name).map((entry) => entry.toLowerCase());
 }
@@ -222,8 +265,8 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
     port: parsePort(env, "HTTP_PORT", DEFAULT_HTTP_PORT),
     path: raw(env, "HTTP_PATH") ?? DEFAULT_HTTP_PATH,
     publicUrl,
-    allowedOrigins: parseCsv(env, "ALLOWED_ORIGINS"),
-    allowedHosts: parseCsv(env, "ALLOWED_HOSTS"),
+    allowedOrigins: parseOrigins(env),
+    allowedHosts: parseHosts(env),
     // R12: 0 would silently accept unbounded bodies / disable rate limiting,
     // so the minimum is 1.
     maxBodyBytes: parseIntWithMin(env, "MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES, 1),

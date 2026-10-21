@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect, type AddressInfo } from "node:net";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
@@ -72,6 +72,24 @@ function send(
     req.on("error", reject);
     if (opts.body !== undefined) req.write(opts.body);
     req.end();
+  });
+}
+
+// Raw socket for requests node:http cannot produce (e.g. a POST with neither
+// Content-Length nor Transfer-Encoding). `request` must ask for
+// Connection: close so the server ends the socket after replying.
+function sendRaw(port: number, request: string): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const socket = connect(port, "127.0.0.1", () => socket.write(request));
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.on("data", (chunk) => (data += chunk));
+    socket.on("error", reject);
+    socket.on("end", () => {
+      socket.destroy();
+      const [head, ...rest] = data.split("\r\n\r\n");
+      resolve({ status: Number(head.split(" ")[1]), body: rest.join("\r\n\r\n") });
+    });
   });
 }
 
@@ -160,7 +178,7 @@ describe("buildHttpApp: stateless Streamable HTTP", () => {
 });
 
 describe("buildHttpApp: Origin validation", () => {
-  const FORBIDDEN = { jsonrpc: "2.0", error: { code: -32000, message: "Forbidden origin" } };
+  const FORBIDDEN = { jsonrpc: "2.0", error: { code: -32000, message: "Forbidden origin" }, id: null };
 
   it("rejects a foreign Origin with 403", async () => {
     const port = await start(httpConfig());
@@ -194,6 +212,12 @@ describe("buildHttpApp: Origin validation", () => {
       const res = await rpc(port, TOOLS_LIST, { Origin: origin });
       expect(res.status).toBe(403);
     }
+  });
+
+  it("matches a browser Origin against a non-canonical ALLOWED_ORIGINS entry", async () => {
+    const port = await start(httpConfig({ STEAMPIPE_MCP_ALLOWED_ORIGINS: "https://App.example.com/" }));
+    const res = await rpc(port, TOOLS_LIST, { Origin: "https://app.example.com" });
+    expect(res.status).toBe(200);
   });
 
   it("lets a request without an Origin header through", async () => {
@@ -294,13 +318,39 @@ describe("buildHttpApp: request body limits", () => {
   it("rejects a non-JSON Content-Type with 415 rather than letting the transport read the raw body", async () => {
     const port = await start(httpConfig({ STEAMPIPE_MCP_MAX_BODY_BYTES: "2048" }));
     for (const contentType of ["text/plain", "application/json-patch+json"]) {
+      // A small body, well under MAX_BODY_BYTES, so only the Content-Type
+      // check can reject it.
       const res = await send(port, {
         headers: { ...MCP_HEADERS, "Content-Type": contentType },
-        body: JSON.stringify({ ...TOOLS_LIST, params: { _meta: { pad: "x".repeat(4096) } } }),
+        body: JSON.stringify(TOOLS_LIST),
       });
-      expect([413, 415]).toContain(res.status);
+      expect(res.status).toBe(415);
+      expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32000 }, id: null });
       expect(res.body).not.toContain("steampipe_query");
     }
+  });
+
+  it("answers an empty application/json body with 400 Invalid Request, not 415", async () => {
+    const port = await start(httpConfig());
+    const EMPTY = { jsonrpc: "2.0", error: { code: -32600, message: "Request body is empty" }, id: null };
+    // Content-Length: 0 (what node:http sends for a bodyless POST)
+    const withLength = await send(port, { headers: { ...MCP_HEADERS, "Content-Length": "0" } });
+    expect(withLength.status).toBe(400);
+    expect(JSON.parse(withLength.body)).toEqual(EMPTY);
+    // No Content-Length and no Transfer-Encoding at all (e.g. curl -X POST)
+    const raw = await sendRaw(
+      port,
+      "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n" +
+        "Accept: application/json, text/event-stream\r\nConnection: close\r\n\r\n",
+    );
+    expect(raw.status).toBe(400);
+    expect(JSON.parse(raw.body)).toEqual(EMPTY);
+  });
+
+  it("still answers an empty non-JSON body with 415", async () => {
+    const port = await start(httpConfig());
+    const res = await send(port, { headers: { ...MCP_HEADERS, "Content-Type": "text/plain", "Content-Length": "0" } });
+    expect(res.status).toBe(415);
   });
 
   it("answers malformed JSON with 400 and a JSON-RPC parse error, not an HTML page", async () => {
