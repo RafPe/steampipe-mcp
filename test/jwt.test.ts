@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
-import { createRemoteJWKSet, errors, generateKeyPair, type JWTVerifyGetKey } from "jose";
+import { createLocalJWKSet, createRemoteJWKSet, errors, generateKeyPair, type JWTVerifyGetKey } from "jose";
 import { authMiddleware } from "../src/auth/index.js";
 import type { RejectEvent } from "../src/auth/bearer.js";
 import { VerifyError, type Reason } from "../src/auth/errors.js";
@@ -330,11 +330,13 @@ describe("jwt: algorithm confusion (Review Focus 1)", () => {
 });
 
 describe("jwt: key rotation with a warm cache (Review Focus 3)", () => {
-  async function warm(): Promise<{ iss: TestIssuer; app: { port: number; rejects: RejectEvent[] } }> {
+  async function warm(
+    env: Record<string, string> = {},
+  ): Promise<{ iss: TestIssuer; app: { port: number; rejects: RejectEvent[] } }> {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(NOW_MS);
     const iss = await issuerFor();
-    const app = await startJwt(iss, {}, () => Date.now());
+    const app = await startJwt(iss, env, () => Date.now());
     await expectAccepted(app, await iss.sign(claims(iss)));
     expect(iss.jwksRequests()).toBe(1);
     return { iss, app };
@@ -351,6 +353,19 @@ describe("jwt: key rotation with a warm cache (Review Focus 3)", () => {
 
     vi.setSystemTime(NOW_MS + 31_000);
     await expectAccepted(app, await iss.sign(claims(iss, { iat: NOW_S + 31 })));
+    expect(iss.jwksRequests()).toBe(2);
+  });
+
+  it("honours JWT_JWKS_COOLDOWN_S=5: a new kid is refused at +3 s and accepted at +6 s", async () => {
+    const { iss, app } = await warm({ STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S: "5" });
+    await iss.rotate();
+
+    vi.setSystemTime(NOW_MS + 3_000);
+    await expectRejected(app, await iss.sign(claims(iss, { iat: NOW_S + 3 })), "signature", 401);
+    expect(iss.jwksRequests()).toBe(1);
+
+    vi.setSystemTime(NOW_MS + 6_000);
+    await expectAccepted(app, await iss.sign(claims(iss, { iat: NOW_S + 6 })));
     expect(iss.jwksRequests()).toBe(2);
   });
 
@@ -397,6 +412,21 @@ describe("jwt: claims", () => {
     const app = await startJwt(iss);
     for (const name of ["exp", "iat", "jti", "client_id"]) {
       await expectRejected(app, await iss.sign(claims(iss, { [name]: undefined })), "malformed");
+    }
+  });
+
+  it("rejects a non-string or empty jti, a non-string iss, and a non-string aud or aud member as malformed", async () => {
+    const iss = await issuerFor();
+    const app = await startJwt(iss);
+    for (const bad of [
+      { jti: null },
+      { jti: 42 },
+      { jti: "" },
+      { aud: [AUD, 42] },
+      { aud: 42 },
+      { iss: 42 },
+    ]) {
+      await expectRejected(app, await iss.sign(claims(iss, bad)), "malformed");
     }
   });
 
@@ -598,6 +628,31 @@ describe("discoverJwks", () => {
     }
   });
 
+  it("requires the discovery document's issuer to equal the configured issuer byte for byte", async () => {
+    const configured = "https://issuer.example/t1";
+    const docFor = (docIssuer: string) =>
+      (async () => Response.json({ issuer: docIssuer, jwks_uri: "https://issuer.example/jwks" })) as typeof fetch;
+    await expect(discoverJwks(configured, docFor(configured), policyFor(configured))).resolves.toMatchObject({
+      issuer: configured,
+    });
+    for (const variant of [
+      "https://issuer.example/t1/",
+      "HTTPS://ISSUER.EXAMPLE/t1",
+      "https://issuer.example:443/t1",
+    ]) {
+      await expect(discoverJwks(configured, docFor(variant), policyFor(configured))).rejects.toThrow(
+        /different issuer/,
+      );
+    }
+  });
+
+  it("rejects startup when the discovery issuer differs only by a trailing slash or case", async () => {
+    for (const variant of [(i: string) => `${i}/`, (i: string) => i.replace("http://", "HTTP://")]) {
+      const iss = await issuerFor({ discoveryIssuer: variant });
+      await expect(startJwt(iss)).rejects.toThrow(/different issuer/);
+    }
+  });
+
   it("still accepts a loopback-http jwks_uri for a loopback-http issuer", async () => {
     const iss = await issuerFor();
     const d = await discoverJwks(iss.issuer, fetch, policyFor(iss.issuer));
@@ -663,6 +718,37 @@ describe("createJwtVerifier", () => {
         claims: claims(iss, { scope: "mcp.read  mcp.write", client_id: "c-1", jti: "j-1" }),
       },
     });
+  });
+
+  it("matches the token iss to the configured issuer as an exact string", async () => {
+    const configured = "https://issuer.example/t1";
+    const iss = await issuerFor();
+    const keys = createLocalJWKSet(await (await fetch(`${iss.issuer}/jwks`)).json());
+    const verifier = createJwtVerifier({
+      issuers: [
+        {
+          issuer: configured,
+          audiences: [AUD],
+          algorithms: ["RS256"],
+          acceptedTyp: ["at+jwt"],
+          clockSkewS: 0,
+          maxTokenAgeS: 0,
+        },
+      ],
+      publicUrl: new URL(PUBLIC_URL),
+      keys: new Map([[configured, keys]]),
+      now: () => NOW_MS,
+    });
+    // The exact string is accepted...
+    await expect(verifier.verify(await iss.sign(claims(iss, { iss: configured })))).resolves.toBeDefined();
+    // ...and URL-equivalent but byte-different spellings are not.
+    for (const variant of [
+      "https://issuer.example/t1/",
+      "HTTPS://ISSUER.EXAMPLE/t1",
+      "https://issuer.example:443/t1",
+    ]) {
+      expect(await reasonOf(verifier.verify(await iss.sign(claims(iss, { iss: variant }))))).toBe("unknown_issuer");
+    }
   });
 
   it("returns no scopes when scope is absent", async () => {

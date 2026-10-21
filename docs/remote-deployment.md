@@ -384,7 +384,8 @@ A token is accepted only if all of these hold:
 
 - its header `typ` is in `STEAMPIPE_MCP_JWT_ACCEPTED_TYP` (case-insensitive).
   The default, `at+jwt`, keeps ID tokens and other generic JWTs out. Add `JWT`
-  only for issuers that do not stamp `typ` (e.g. Entra v2).
+  only for issuers that put `typ: "JWT"` on their access tokens (e.g. Entra v2).
+  A token with no `typ` at all is always rejected.
 - its `alg` is in `STEAMPIPE_MCP_JWT_ALGORITHMS`. `none` and `HS*` are refused
   at startup, so neither `alg:none` nor an HMAC key made from the public key
   works.

@@ -58,6 +58,10 @@ function decodeObject(segment: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function isAudience(value: unknown): boolean {
+  return typeof value === "string" || (Array.isArray(value) && value.every((v) => typeof v === "string"));
+}
+
 function isTimestamp(value: unknown): boolean {
   return typeof value === "number" && Number.isFinite(value) && Math.abs(value) <= MAX_TIMESTAMP_S;
 }
@@ -143,14 +147,15 @@ function classify(error: unknown): VerifyError {
  *    `unknown_issuer`); header `typ` in the issuer's `acceptedTyp`
  *    (case-insensitive, so an ID token or generic JWT is refused unless the
  *    operator allows its type); `exp`/`nbf`/`iat`, when present, finite
- *    numbers within ±2^40.
+ *    numbers within ±2^40; `aud`, when present, a string or an array of
+ *    strings.
  * 2. `jwtVerify`: algorithm allowlist (checked before any key lookup, so
  *    `none` and HS* never reach the JWKS), signature, exact issuer, any of
  *    the audiences, `exp`/`nbf` with `clockSkewS` and no other leeway,
  *    optional maximum age from `iat`, and the RFC 9068 §2.2 claims present.
  * 3. `sub` a non-empty string of at most 256 characters
- *    (`subject_missing`); `client_id` a non-empty string and `scope` absent
- *    or a string (`malformed`).
+ *    (`subject_missing`); `client_id` and `jti` non-empty strings and
+ *    `scope` absent or a string (`malformed`).
  *
  * Error messages are fixed strings: they reach `error_description`, so they
  * never quote a claim.
@@ -194,6 +199,11 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
           throw malformed();
         }
       }
+      // RFC 7519 §4.1.3: a string or an array of strings. Checked here because
+      // jose reports a non-string aud as an audience mismatch.
+      if ("aud" in unverified && !isAudience(unverified.aud)) {
+        throw malformed();
+      }
 
       let payload: JWTPayload;
       try {
@@ -210,11 +220,14 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
         throw classify(error);
       }
 
-      const { sub, client_id: clientId, scope } = payload as JWTPayload & { client_id?: unknown; scope?: unknown };
+      const { sub, jti, client_id: clientId, scope } = payload as JWTPayload & { client_id?: unknown; scope?: unknown };
       if (typeof sub !== "string" || sub.length === 0 || sub.length > MAX_SUB_LENGTH) {
         throw new VerifyError("subject_missing", "Access token has no subject");
       }
       if (typeof clientId !== "string" || clientId.length === 0) {
+        throw malformed();
+      }
+      if (typeof jti !== "string" || jti.length === 0) {
         throw malformed();
       }
       if (scope !== undefined && typeof scope !== "string") {
