@@ -16,6 +16,10 @@ _Behaviour changes_
 * The audit line gains an `iss` field when the principal has an issuer (jwt mode), bounded like the other token-derived fields.
 * Rejected auth attempts (`auth_reject` audit lines) are now also written in `jwt` mode. Once a token has been routed to a configured issuer, the line carries that issuer (the configured string, never an unverified value) as `iss`; a token whose `iss` is missing or unconfigured gets none.
 
+_Fixes_
+
+* `jwt` mode: a JWKS key with the right shape but unusable key material (RSA without `n`/`e`, EC without `x`/`y` or off the curve, OKP without `x`, a private key, or an RSA modulus under 2048 bits) answered `500` for every token that selected it, and kept doing so after the issuer repaired its JWKS until jose's 10-minute cache expired. Such a key now answers `503` (`issuer_unavailable`) with `Retry-After: 5`, the JWKS counts as a failed fetch for the backoff (cause `invalid key material`), and once the window is over the next such request fetches the JWKS again, so a repaired JWKS is served within one retry. Other keys in the same JWKS keep working from the cache.
+
 ## 0.3.1 [2026-10-21]
 
 _Fixes_

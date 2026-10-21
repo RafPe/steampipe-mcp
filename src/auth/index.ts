@@ -9,7 +9,7 @@ import { discoverJwks } from "./discovery.js";
 import { VerifyError } from "./errors.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, guardedFetch, type FetchPolicy } from "./fetch-guard.js";
 import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
-import { createJwtVerifier, jwksBackoff } from "./jwt.js";
+import { createJwtVerifier, jwksBackoff, reloadOnUnusableKeys } from "./jwt.js";
 import { prmPath, prmRouter, type PrmOptions } from "./prm.js";
 import { createRetryLoader, type RetryLoaderOptions } from "./retry-loader.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
@@ -159,11 +159,13 @@ export async function authMiddleware(
       const fetchImpl = guardedFetch(policy);
       const discoveryFetch: typeof fetch = signal ? (input, init) => fetchImpl(input, { ...init, signal }) : fetchImpl;
       const { jwksUri } = await discoverJwks(issuer, discoveryFetch, policy);
-      return createRemoteJWKSet(jwksUri, {
+      const gate = jwksBackoff(fetchImpl, new URL(issuer).origin, opts.now);
+      const keySet = createRemoteJWKSet(jwksUri, {
         timeoutDuration: JWKS_TIMEOUT_MS,
         cooldownDuration: jwt.jwksCooldownS * 1000,
-        [customFetch]: jwksBackoff(fetchImpl, new URL(issuer).origin, opts.now),
+        [customFetch]: gate,
       });
+      return reloadOnUnusableKeys(keySet, gate);
     };
     // Same canonical href for the PRM resource, the expected token
     // resource and the default audience (R12).

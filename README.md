@@ -385,7 +385,7 @@ JWKS fetch for https://idp.example.com failed (2 consecutive failures, cause: HT
 JWKS fetch for https://idp.example.com recovered after 2 consecutive failures
 ```
 
-The issuer is named by its origin only, never its path. The cause is one of `network`, `timeout`, `too_large`, `redirect`, `policy` (the restricted fetch refused the request), `fetch error`, `HTTP <status>`, or `invalid key set` (a `200` that is not a JSON object with a `keys` array of objects). With `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`, issuer discovery retries are logged as `JWT issuer #<n> (<origin>) discovery failed (attempt <k>); retrying in <ms>ms`, where `<n>` matches `auth:<n>`; the discovery error that follows on the same line can name the discovery URLs tried, path included.
+The issuer is named by its origin only, never its path. The cause is one of `network`, `timeout`, `too_large`, `redirect`, `policy` (the restricted fetch refused the request), `fetch error`, `HTTP <status>`, `invalid key set` (a `200` that is not a JSON object with a `keys` array of objects), or `invalid key material` (a `200` with a signing key that cannot be used: key data that does not import, a private key, or an RSA modulus under 2048 bits). With `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`, issuer discovery retries are logged as `JWT issuer #<n> (<origin>) discovery failed (attempt <k>); retrying in <ms>ms`, where `<n>` matches `auth:<n>`; the discovery error that follows on the same line can name the discovery URLs tried, path included.
 
 ## Open Source & Contributing
 

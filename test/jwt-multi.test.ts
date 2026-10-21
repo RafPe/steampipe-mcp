@@ -865,6 +865,28 @@ describe("jwt multi-issuer: lenient profile (R27)", () => {
     await expectRejected(app, await b.sign(claims(a.issuer)), "signature");
   });
 
+  it("answers 503 for a lenient issuer's unusable key material, backs off, and recovers after the window (Codex I-1)", async () => {
+    let clock = NOW_MS;
+    const b = await issuerFor();
+    b.setJwksKeys([{ kty: "RSA", kid: b.kid(), alg: "RS256", use: "sig" }]);
+    const app = await startMulti(
+      [{ issuer: b.issuer, profile: "lenient", subjectPrefixes: ["repo:acme/"] }],
+      {},
+      { now: () => clock },
+    );
+    const token = await b.sign(lenientShaped(b.issuer), { typ: "JWT" });
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(b.jwksRequests()).toBe(1);
+
+    b.setJwksKeys(undefined);
+    clock += 999;
+    await expectRejected(app, token, "issuer_unavailable", 503);
+    expect(b.jwksRequests()).toBe(1);
+    clock += 1;
+    await expectAccepted(app, token);
+    expect(b.jwksRequests()).toBe(2);
+  });
+
   it("writes the azp fallback as clientId in the audit line", async () => {
     const b = await issuerFor();
     const app = await startMulti(

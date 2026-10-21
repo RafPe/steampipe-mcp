@@ -1,5 +1,5 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { errors, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
+import { errors, importJWK, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import { logger } from "../services/logger.js";
 import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
@@ -56,6 +56,37 @@ class KeysUnavailable extends Error {
   }
 }
 
+/** jose returned a key it will refuse inside `jwtVerify` (see `assertUsableKey`). */
+class KeyUnusable extends Error {
+  constructor() {
+    super("JWKS key unusable");
+    this.name = "KeyUnusable";
+  }
+}
+
+// jose refuses smaller RSA keys only inside `jwtVerify`, with a TypeError.
+const MIN_RSA_MODULUS_BITS = 2048;
+
+/** Refuse, as `KeyUnusable`, an RSA key that jose would reject for its size. */
+function assertUsableKey(key: unknown): void {
+  const algorithm = (key as { algorithm?: { modulusLength?: unknown } } | null)?.algorithm;
+  if (typeof algorithm?.modulusLength === "number" && algorithm.modulusLength < MIN_RSA_MODULUS_BITS) {
+    throw new KeyUnusable();
+  }
+}
+
+/**
+ * The issuer's JWKS holds a key that matched the token but cannot be used:
+ * Web Crypto refused its key data (a `DOMException`, e.g. RSA without
+ * `n`/`e` or an EC point off the curve), jose refused it (a private key,
+ * `JWKSInvalid`), or `assertUsableKey` did. Never caused by the token alone:
+ * a healthy key imports for every algorithm jose lets the token select it
+ * with.
+ */
+function isKeyMaterialError(error: unknown): boolean {
+  return error instanceof DOMException || error instanceof errors.JWKSInvalid || error instanceof KeyUnusable;
+}
+
 function malformed(): VerifyError {
   return new VerifyError("malformed", "Malformed access token");
 }
@@ -89,7 +120,9 @@ function isTimestamp(value: unknown): boolean {
 function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
   return async (header, token) => {
     try {
-      return await getKey(header, token);
+      const key = await getKey(header, token);
+      assertUsableKey(key);
+      return key;
     } catch (error) {
       if (
         error instanceof errors.JWKSNoMatchingKey ||
@@ -99,8 +132,14 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
         throw error;
       }
       // JWKSTimeout, a non-200 or non-JSON JWKS (generic JOSEError), an
-      // invalid key set, or the fetch guard refusing the request.
-      if (error instanceof FetchRefused || error instanceof VerifyError || error instanceof errors.JOSEError) {
+      // invalid key set, a key that cannot be used, or the fetch guard
+      // refusing the request.
+      if (
+        error instanceof FetchRefused ||
+        error instanceof VerifyError ||
+        error instanceof errors.JOSEError ||
+        isKeyMaterialError(error)
+      ) {
         throw new KeysUnavailable();
       }
       throw error;
@@ -112,8 +151,9 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * Wrap the `fetch` an issuer's JWKS is loaded with (jose's `customFetch`)
  * in a backoff (R16). jose retries a cold or stale cache on every request,
  * so without this each request during a JWKS outage would wait for its own
- * failing fetch. After a failure (a throw, a non-200 answer, or a 200 whose
- * body is not a JSON object with a `keys` array of objects) every call is
+ * failing fetch. After a failure (a throw, a non-200 answer, a 200 whose
+ * body is not a JSON object with a `keys` array of objects, or a 200 with a
+ * signing key that does not import, see `signingKeyUsable`) every call is
  * refused with `issuer_unavailable` and no network I/O until a window has
  * passed: 1 s, doubling after each further failure up to 60 s (the retry
  * loader's schedule, without jitter). The first call after the window
@@ -128,14 +168,20 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * network are refused. Once the cache is stale every request needs a
  * refetch, and gets 503 until the JWKS is back.
  *
+ * jose keeps a 200 with an unusable key, so `reloadOnUnusableKeys` asks
+ * for it again once the window is over; `unusableKeys()` is how it reports
+ * a key that failed in use although its set looked usable.
+ *
  * Each window opened logs one warning, and the first usable 200 after
  * failures logs one info line. Both name the issuer by `origin` only and
  * the cause by a fixed word (the `FetchRefused` cause or the HTTP status),
  * never a URL path or an error message.
  */
-export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => number = Date.now): typeof fetch {
+export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => number = Date.now): JwksFetch {
   let failures = 0;
   let retryAt = 0;
+  // The last 200 (or a key from it) was unusable, and already counted.
+  let keysUnusable = false;
   const failed = (cause: string) => {
     const delay = Math.min(DEFAULT_INITIAL_DELAY_MS * 2 ** failures, DEFAULT_MAX_DELAY_MS);
     retryAt = now() + delay;
@@ -153,25 +199,31 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
       throw error;
     }
     // A 200 counts only if jose can use it: a JSON object whose `keys` is an
-    // array of objects. Anything else fails in jose as `issuer_unavailable`
-    // too, so it backs off like an error status. The guarded fetch buffers
-    // the body, so the clone costs no network I/O.
-    let usable = false;
+    // array of objects, each signing key of which imports. Anything else
+    // fails in jose as `issuer_unavailable` too, so it backs off like an
+    // error status. The guarded fetch buffers the body, so the clone costs
+    // no network I/O.
+    let cause: string | undefined = `HTTP ${res.status}`;
     if (res.status === 200) {
+      cause = "invalid key set";
       try {
         const body: unknown = await res.clone().json();
-        usable = isObject(body) && Array.isArray(body.keys) && body.keys.every(isObject);
+        if (isObject(body) && Array.isArray(body.keys) && body.keys.every(isObject)) {
+          cause = (await everyAsync(body.keys, signingKeyUsable)) ? undefined : "invalid key material";
+        }
       } catch {
-        usable = false;
+        // Not JSON: "invalid key set".
       }
     }
-    if (usable) {
+    if (cause === undefined) {
       if (failures > 0) {
         logger.info(`JWKS fetch for ${origin} recovered after ${plural(failures, "consecutive failure")}`);
       }
       failures = 0;
+      keysUnusable = false;
     } else {
-      failed(res.status === 200 ? "invalid key set" : `HTTP ${res.status}`);
+      keysUnusable = res.status === 200;
+      failed(cause);
     }
     return res;
   };
@@ -179,7 +231,7 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
   // burst at the end of a window sends a single probe and counts as a single
   // failure. jose already merges its own reloads; this does not rely on it.
   let inFlight: Promise<Response> | undefined;
-  return async (input, init) => {
+  const gated: typeof fetch = async (input, init) => {
     if (failures > 0 && now() < retryAt) {
       throw new VerifyError("issuer_unavailable", "Token validation unavailable");
     }
@@ -191,6 +243,114 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
     // Each caller reads its own copy of the (buffered) body.
     return (await inFlight).clone();
   };
+  return Object.assign(gated, {
+    unusableKeys() {
+      if (!keysUnusable) {
+        keysUnusable = true;
+        failed("invalid key material");
+      }
+    },
+  });
+}
+
+/** `jwksBackoff`'s fetch, plus the hook `reloadOnUnusableKeys` reports to. */
+export type JwksFetch = typeof fetch & {
+  /**
+   * A key from the last usable 200 failed in use: count it as a failed
+   * fetch, unless that set was already counted as unusable.
+   */
+  unusableKeys(): void;
+};
+
+/** jose's remote key set: a resolver with a forced refetch. */
+export type RemoteKeySet = JWTVerifyGetKey & { reload(): Promise<void> };
+
+/**
+ * Wrap jose's remote key set so that a JWKS whose key cannot be used is
+ * fetched again after the backoff window, instead of being served from
+ * jose's cache until `cacheMaxAge` (10 minutes) runs out. On a key material
+ * failure (see `isKeyMaterialError`) the set is reported to `gate` and
+ * reloaded through it: inside the window that refuses at once
+ * (`issuer_unavailable`, no network I/O); after it, one shared probe
+ * refetches, and a repaired set serves the same request. A set that is
+ * still unusable leaves the error for `guardKeys` (503).
+ */
+export function reloadOnUnusableKeys(keySet: RemoteKeySet, gate: JwksFetch): JWTVerifyGetKey {
+  const resolve: JWTVerifyGetKey = async (header, token) => {
+    const key = await keySet(header, token);
+    assertUsableKey(key);
+    return key;
+  };
+  return async (header, token) => {
+    try {
+      return await resolve(header, token);
+    } catch (error) {
+      if (!isKeyMaterialError(error)) {
+        throw error;
+      }
+      gate.unusableKeys();
+    }
+    await keySet.reload();
+    try {
+      return await resolve(header, token);
+    } catch (error) {
+      if (isKeyMaterialError(error)) {
+        gate.unusableKeys();
+      }
+      throw error;
+    }
+  };
+}
+
+const EC_ALGORITHMS: Record<string, string> = { "P-256": "ES256", "P-384": "ES384", "P-521": "ES512" };
+
+/**
+ * The algorithm to test-import a signing key with, by `kty` (and `crv`),
+ * and the `alg` values jose lets select that key; `undefined` for a key
+ * type jose has no signature algorithm for.
+ */
+function importAlgorithm(jwk: Record<string, unknown>): { alg: string; selects: string[] } | undefined {
+  switch (jwk.kty) {
+    case "RSA":
+      return { alg: "RS256", selects: ["RS256", "RS384", "RS512", "PS256", "PS384", "PS512"] };
+    case "EC": {
+      if (typeof jwk.crv !== "string" || !Object.hasOwn(EC_ALGORITHMS, jwk.crv)) return undefined;
+      const alg = EC_ALGORITHMS[jwk.crv];
+      return { alg, selects: [alg] };
+    }
+    case "OKP":
+      return jwk.crv === "Ed25519" ? { alg: "Ed25519", selects: ["EdDSA", "Ed25519"] } : undefined;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Whether jose could verify with `jwk` when a token selects it. Keys jose
+ * never selects for a signature (`use` other than `sig`, `key_ops` without
+ * `verify`, a non-signature `alg`, or a `kty`/`crv` it has no signature
+ * algorithm for) are not checked. A private key, key data that does not
+ * import, or an RSA modulus under 2048 bits is unusable.
+ */
+async function signingKeyUsable(jwk: Record<string, unknown>): Promise<boolean> {
+  if (jwk.use !== undefined && jwk.use !== "sig") return true;
+  if (Array.isArray(jwk.key_ops) && !jwk.key_ops.includes("verify")) return true;
+  const spec = importAlgorithm(jwk);
+  if (!spec || (jwk.alg !== undefined && !spec.selects.includes(jwk.alg as string))) return true;
+  if (jwk.d !== undefined || jwk.priv !== undefined) return false;
+  try {
+    assertUsableKey(await importJWK(jwk, spec.alg));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function everyAsync<T>(items: T[], test: (item: T) => Promise<boolean>): Promise<boolean> {
+  for (const item of items) {
+    if (!(await test(item))) return false;
+  }
+  return true;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
