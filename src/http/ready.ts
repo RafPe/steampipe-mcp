@@ -7,11 +7,18 @@ export type CheckStatus = "ready" | "pending" | "failing";
 
 export interface ReadinessCheck {
   name: string;
+  /**
+   * Checks sharing a group are alternatives: the group needs only one
+   * `ready` member. A check without a group must itself be `ready`.
+   */
+  group?: string;
   check(signal: AbortSignal): Promise<CheckStatus>;
 }
 
 export interface ReadinessResult {
   ready: boolean;
+  /** Present (and true) only when ready while some check is not `ready`. */
+  degraded?: true;
   checks: Record<string, CheckStatus>;
 }
 
@@ -25,6 +32,9 @@ const STATUSES: ReadonlySet<string> = new Set<CheckStatus>(["ready", "pending", 
  * once. Each check gets an `AbortSignal` that fires at `timeoutMs`; a check
  * that has not settled by then counts as `failing`, so an evaluation never
  * takes much longer than `timeoutMs` however wedged a dependency is.
+ *
+ * Ready means every ungrouped check is `ready` and every group has at least
+ * one `ready` member; ready with any check not `ready` is `degraded`.
  */
 export class Readiness {
   private readonly timeoutMs: number;
@@ -64,10 +74,16 @@ export class Readiness {
   private async run(): Promise<ReadinessResult> {
     const statuses = await Promise.all(this.checks.map((c) => this.runCheck(c)));
     const checks: Record<string, CheckStatus> = {};
+    const groups = new Map<string, boolean>();
+    let ready = true;
     this.checks.forEach((c, i) => {
       checks[c.name] = statuses[i];
+      if (c.group === undefined) ready &&= statuses[i] === "ready";
+      else groups.set(c.group, (groups.get(c.group) ?? false) || statuses[i] === "ready");
     });
-    return { ready: statuses.every((s) => s === "ready"), checks };
+    ready &&= [...groups.values()].every(Boolean);
+    const degraded = ready && statuses.some((s) => s !== "ready");
+    return { ready, ...(degraded && { degraded: true as const }), checks };
   }
 
   private async runCheck(c: ReadinessCheck): Promise<CheckStatus> {
@@ -115,7 +131,8 @@ export function buildReadiness(
 }
 
 /**
- * `GET /readyz`: 200 `{"status":"ready","checks":{...}}` or 503
+ * `GET /readyz`: 200 `{"status":"ready","checks":{...}}` (plus
+ * `"degraded":true` when a grouped check is not ready) or 503
  * `{"status":"not_ready","checks":{...}}`. Only check names and statuses are
  * reported, never error details.
  */
@@ -128,6 +145,10 @@ export function readyHandler(r: Readiness): RequestHandler {
       result = { ready: false, checks: {} };
     }
     res.set("Cache-Control", "no-store");
-    res.status(result.ready ? 200 : 503).json({ status: result.ready ? "ready" : "not_ready", checks: result.checks });
+    res.status(result.ready ? 200 : 503).json({
+      status: result.ready ? "ready" : "not_ready",
+      ...(result.degraded && { degraded: true }),
+      checks: result.checks,
+    });
   };
 }
