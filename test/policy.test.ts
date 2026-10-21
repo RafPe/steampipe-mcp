@@ -27,27 +27,31 @@ function violation(p: IdentityPolicy, claims: Record<string, unknown>, subject =
 const HD = policy({ requiredClaims: { hd: ["corp.com", "other.com"] } });
 const HD_DENIED = 'required claim "hd" not satisfied';
 
+const EV = policy({ requiredClaims: { email_verified: ["true"] } });
+const EV_DENIED = 'required claim "email_verified" not satisfied';
+
+// Every row pairs a claim set that must pass with one that must be denied,
+// so neither a no-op nor an always-deny evaluator can satisfy any row.
 describe("checkPolicy: required claims", () => {
-  it.each<[string, IdentityPolicy, Record<string, unknown>, string | undefined]>([
-    ["string equal to an allowed value passes", HD, { hd: "corp.com" }, undefined],
-    ["string equal to the second allowed value passes", HD, { hd: "other.com" }, undefined],
-    ["string not in the allowed values fails", HD, { hd: "evil.com" }, HD_DENIED],
-    ["string match is exact (case-sensitive)", HD, { hd: "CORP.com" }, HD_DENIED],
-    ["array intersecting the allowed values passes", HD, { hd: ["x", "corp.com"] }, undefined],
-    ["array with no allowed value fails", HD, { hd: ["x", "y"] }, HD_DENIED],
-    ["empty array fails", HD, { hd: [] }, HD_DENIED],
-    ["array ignores non-string elements but still matches a string", HD, { hd: [1, null, "corp.com"] }, undefined],
-    ["array whose only match is a non-string element fails", policy({ requiredClaims: { n: ["1"] } }), { n: [1] }, 'required claim "n" not satisfied'],
-    ["boolean true matches \"true\"", policy({ requiredClaims: { email_verified: ["true"] } }), { email_verified: true }, undefined],
-    ["boolean false does not match \"true\"", policy({ requiredClaims: { email_verified: ["true"] } }), { email_verified: false }, 'required claim "email_verified" not satisfied'],
-    ["number matches its String()", policy({ requiredClaims: { level: ["3"] } }), { level: 3 }, undefined],
-    ["absent claim fails", HD, {}, HD_DENIED],
-    ["null claim fails", HD, { hd: null }, HD_DENIED],
-    ["object claim fails", HD, { hd: { value: "corp.com" } }, HD_DENIED],
-    ["object whose String() would match fails", policy({ requiredClaims: { o: ["[object Object]"] } }), { o: {} }, 'required claim "o" not satisfied'],
-    ["undefined claim fails", HD, { hd: undefined }, HD_DENIED],
-  ])("%s", (_name, p, claims, want) => {
-    expect(violation(p, claims)).toBe(want);
+  it.each<[string, IdentityPolicy, Record<string, unknown>, Record<string, unknown>, string]>([
+    ["string equal to an allowed value passes, any other string fails", HD, { hd: "corp.com" }, { hd: "evil.com" }, HD_DENIED],
+    ["string equal to the second allowed value passes", HD, { hd: "other.com" }, { hd: "another.com" }, HD_DENIED],
+    ["string match is exact (case-sensitive)", HD, { hd: "corp.com" }, { hd: "CORP.com" }, HD_DENIED],
+    ["array intersecting the allowed values passes, one with no allowed value fails", HD, { hd: ["x", "corp.com"] }, { hd: ["x", "y"] }, HD_DENIED],
+    ["empty array fails", HD, { hd: ["corp.com"] }, { hd: [] }, HD_DENIED],
+    ["array ignores non-string elements but still matches a string", HD, { hd: [1, null, "corp.com"] }, { hd: [1, null, {}] }, HD_DENIED],
+    ["array whose only match is a non-string element fails", policy({ requiredClaims: { n: ["1"] } }), { n: ["1"] }, { n: [1] }, 'required claim "n" not satisfied'],
+    ["boolean true matches \"true\"", EV, { email_verified: true }, { email_verified: false }, EV_DENIED],
+    ["boolean false does not match \"true\"", EV, { email_verified: "true" }, { email_verified: false }, EV_DENIED],
+    ["number matches its String()", policy({ requiredClaims: { level: ["3"] } }), { level: 3 }, { level: 4 }, 'required claim "level" not satisfied'],
+    ["absent claim fails", HD, { hd: "corp.com" }, {}, HD_DENIED],
+    ["null claim fails", HD, { hd: "corp.com" }, { hd: null }, HD_DENIED],
+    ["object claim fails", HD, { hd: "corp.com" }, { hd: { value: "corp.com" } }, HD_DENIED],
+    ["object whose String() would match fails", policy({ requiredClaims: { o: ["[object Object]"] } }), { o: "[object Object]" }, { o: {} }, 'required claim "o" not satisfied'],
+    ["undefined claim fails", HD, { hd: "corp.com" }, { hd: undefined }, HD_DENIED],
+  ])("%s", (_name, p, passing, failing, denied) => {
+    expect(violation(p, passing)).toBeUndefined();
+    expect(violation(p, failing)).toBe(denied);
   });
 
   it("every required claim must be satisfied", () => {
@@ -66,52 +70,48 @@ describe("checkPolicy: required claims", () => {
     const p = policy({ requiredClaims: { polluted: ["yes"] } });
     const claims = Object.create({ polluted: "yes" }) as Record<string, unknown>;
     expect(violation(p, claims)).toBe('required claim "polluted" not satisfied');
+    expect(violation(p, { polluted: "yes" })).toBeUndefined();
   });
 });
 
 describe("checkPolicy: subjects", () => {
   const SUBJECT_DENIED = "subject not allowed";
 
-  it.each<[string, IdentityPolicy, string, string | undefined]>([
-    ["subject on the allowlist passes", policy({ allowedSubjects: new Set(["alice", "bob"]) }), "bob", undefined],
-    ["subject not on the allowlist fails", policy({ allowedSubjects: new Set(["alice"]) }), "mallory", SUBJECT_DENIED],
-    ["allowlist match is exact, not a prefix", policy({ allowedSubjects: new Set(["alice"]) }), "alice2", SUBJECT_DENIED],
-    ["subject starting with a prefix passes", policy({ subjectPrefixes: ["platform-"] }), "platform-ci", undefined],
-    ["\"platform\" does not match prefix \"platform-\"", policy({ subjectPrefixes: ["platform-"] }), "platform", SUBJECT_DENIED],
-    ["subject with no matching prefix fails", policy({ subjectPrefixes: ["platform-", "ops-"] }), "sales-1", SUBJECT_DENIED],
-    ["second prefix matches", policy({ subjectPrefixes: ["platform-", "ops-"] }), "ops-1", undefined],
-    [
-      "with both lists set, an allowlisted subject passes",
-      policy({ allowedSubjects: new Set(["alice"]), subjectPrefixes: ["platform-"] }),
-      "alice",
-      undefined,
-    ],
-    [
-      "with both lists set, a prefixed subject passes",
-      policy({ allowedSubjects: new Set(["alice"]), subjectPrefixes: ["platform-"] }),
-      "platform-x",
-      undefined,
-    ],
-    [
-      "with both lists set, a subject in neither fails",
-      policy({ allowedSubjects: new Set(["alice"]), subjectPrefixes: ["platform-"] }),
-      "mallory",
-      SUBJECT_DENIED,
-    ],
-    ["empty subject lists allow any subject", policy({ requiredClaims: { hd: ["corp.com"] } }), "anyone", undefined],
-  ])("%s", (_name, p, subject, want) => {
-    expect(violation(p, { hd: "corp.com" }, subject)).toBe(want);
+  const BOTH = policy({ allowedSubjects: new Set(["alice"]), subjectPrefixes: ["platform-"] });
+
+  // Every row pairs a subject that must pass with one that must be denied.
+  it.each<[string, IdentityPolicy, string, string]>([
+    ["subject on the allowlist passes, one off it fails", policy({ allowedSubjects: new Set(["alice", "bob"]) }), "bob", "mallory"],
+    ["allowlist match is exact, not a prefix", policy({ allowedSubjects: new Set(["alice"]) }), "alice", "alice2"],
+    ["subject starting with a prefix passes", policy({ subjectPrefixes: ["platform-"] }), "platform-ci", "sales-1"],
+    ["\"platform\" does not match prefix \"platform-\"", policy({ subjectPrefixes: ["platform-"] }), "platform-", "platform"],
+    ["second prefix matches", policy({ subjectPrefixes: ["platform-", "ops-"] }), "ops-1", "sales-1"],
+    ["with both lists set, an allowlisted subject passes", BOTH, "alice", "mallory"],
+    ["with both lists set, a prefixed subject passes", BOTH, "platform-x", "platform"],
+  ])("%s", (_name, p, passing, failing) => {
+    expect(violation(p, { hd: "corp.com" }, passing)).toBeUndefined();
+    expect(violation(p, { hd: "corp.com" }, failing)).toBe(SUBJECT_DENIED);
+  });
+
+  it("empty subject lists allow any subject; required claims still apply", () => {
+    const p = policy({ requiredClaims: { hd: ["corp.com"] } });
+    expect(violation(p, { hd: "corp.com" }, "anyone")).toBeUndefined();
+    expect(violation(p, { hd: "corp.com" }, "")).toBeUndefined();
+    expect(violation(p, { hd: "evil.com" }, "anyone")).toBe(HD_DENIED);
   });
 
   it("checks required claims before subjects", () => {
     const p = policy({ requiredClaims: { hd: ["corp.com"] }, allowedSubjects: new Set(["alice"]) });
     expect(violation(p, { hd: "evil.com" }, "mallory")).toBe(HD_DENIED);
+    expect(violation(p, { hd: "corp.com" }, "mallory")).toBe("subject not allowed");
+    expect(violation(p, { hd: "corp.com" }, "alice")).toBeUndefined();
   });
 });
 
 describe("empty policy", () => {
   it("isEmptyPolicy is true for a policy with no rules", () => {
     expect(isEmptyPolicy(policy())).toBe(true);
+    expect(isEmptyPolicy(policy({ subjectPrefixes: ["platform-"] }))).toBe(false);
   });
 
   it.each<[string, IdentityPolicy]>([
@@ -120,6 +120,7 @@ describe("empty policy", () => {
     ["a subject prefix", policy({ subjectPrefixes: ["platform-"] })],
   ])("isEmptyPolicy is false with %s", (_name, p) => {
     expect(isEmptyPolicy(p)).toBe(false);
+    expect(isEmptyPolicy(policy())).toBe(true);
   });
 
   it.each<[Record<string, unknown>, string]>([
@@ -128,6 +129,8 @@ describe("empty policy", () => {
     [{ groups: { nested: true } }, "platform"],
   ])("passes everything (%j, %j)", (claims, subject) => {
     expect(violation(policy(), claims, subject)).toBeUndefined();
+    // Control: the same identity is denied once any rule exists.
+    expect(violation(policy({ requiredClaims: { hd: ["corp.com"] } }), claims, subject)).toBe(HD_DENIED);
   });
 });
 
@@ -172,10 +175,13 @@ describe("parsePolicyConfig", () => {
     expect(p.allowedSubjects).toBeInstanceOf(Set);
     expect(p.subjectPrefixes).toEqual([]);
     expect(Object.keys(p.requiredClaims)).toEqual([]);
+    // Control: the same parser returns a non-empty policy when configured.
+    expect(isEmptyPolicy(parsePolicyConfig({ [SP]: '["platform-"]' }))).toBe(false);
   });
 
   it("treats empty-string variables as unset", () => {
     expect(isEmptyPolicy(parsePolicyConfig({ [RC]: "", [AS]: "", [SP]: "" }))).toBe(true);
+    expect(isEmptyPolicy(parsePolicyConfig({ [RC]: "", [AS]: '["alice"]', [SP]: "" }))).toBe(false);
   });
 
   it("parses all three variables", () => {
@@ -244,15 +250,37 @@ describe("parsePolicyConfig", () => {
     const at = (n: number) => "a".repeat(n);
     const many = (n: number) => JSON.stringify(Array.from({ length: n }, (_, i) => `s${i}`));
 
-    it.each<[string, string, string]>([
-      ["a 256-character subject", AS, JSON.stringify([at(256)])],
-      ["a 256-character prefix", SP, JSON.stringify([at(256)])],
-      ["a 256-character claim value", RC, JSON.stringify({ hd: [at(256)] })],
-      ["a 256-character claim key", RC, JSON.stringify({ [at(256)]: ["x"] })],
-      ["1024 subjects", AS, many(1024)],
-      ["64 prefixes", SP, many(64)],
-    ])("accepts %s", (_name, name, value) => {
-      expect(() => parsePolicyConfig({ [name]: value })).not.toThrow();
+    it("accepts a 256-character subject and keeps it", () => {
+      const p = parsePolicyConfig({ [AS]: JSON.stringify([at(256)]) });
+      expect(p.allowedSubjects.has(at(256))).toBe(true);
+      expect(p.allowedSubjects.size).toBe(1);
+    });
+
+    it("accepts a 256-character prefix and keeps it", () => {
+      expect(parsePolicyConfig({ [SP]: JSON.stringify([at(256)]) }).subjectPrefixes).toEqual([at(256)]);
+    });
+
+    it("accepts a 256-character claim value and keeps it", () => {
+      const p = parsePolicyConfig({ [RC]: JSON.stringify({ hd: [at(256)] }) });
+      expect(p.requiredClaims).toEqual({ hd: [at(256)] });
+    });
+
+    it("accepts a 256-character claim key and keeps it", () => {
+      const p = parsePolicyConfig({ [RC]: JSON.stringify({ [at(256)]: ["x"] }) });
+      expect(p.requiredClaims).toEqual({ [at(256)]: ["x"] });
+    });
+
+    it("accepts 1024 subjects and keeps them all", () => {
+      const p = parsePolicyConfig({ [AS]: many(1024) });
+      expect(p.allowedSubjects.size).toBe(1024);
+      expect(p.allowedSubjects.has("s0")).toBe(true);
+      expect(p.allowedSubjects.has("s1023")).toBe(true);
+    });
+
+    it("accepts 64 prefixes and keeps them all", () => {
+      const p = parsePolicyConfig({ [SP]: many(64) });
+      expect(p.subjectPrefixes).toHaveLength(64);
+      expect(p.subjectPrefixes[63]).toBe("s63");
     });
 
     it.each<[string, string, string]>([
@@ -287,6 +315,9 @@ describe("loadConfig wiring", () => {
     const cfg = loadConfig(HTTP, EMPTY_ARGV);
     expect(cfg.policy).toBeDefined();
     expect(isEmptyPolicy(cfg.policy!)).toBe(true);
+    // Control: a configured variable makes it non-empty.
+    const configured = loadConfig({ ...HTTP, STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]' }, EMPTY_ARGV);
+    expect(configured.policy?.allowedSubjects.has("alice")).toBe(true);
   });
 
   it("rejects an invalid policy variable in http mode with ConfigError", () => {
@@ -299,5 +330,7 @@ describe("loadConfig wiring", () => {
   it("ignores policy variables in stdio mode, like every other auth setting", () => {
     const cfg = loadConfig({ STEAMPIPE_MCP_ALLOWED_SUBJECTS: "not json" }, EMPTY_ARGV);
     expect(cfg.policy).toBeUndefined();
+    // Control: the same value is parsed, and rejected, in http mode.
+    expect(() => loadConfig({ ...HTTP, STEAMPIPE_MCP_ALLOWED_SUBJECTS: "not json" }, EMPTY_ARGV)).toThrow(ConfigError);
   });
 });
