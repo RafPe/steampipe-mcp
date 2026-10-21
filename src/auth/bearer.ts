@@ -8,7 +8,11 @@ export interface TokenVerifier {
   verify(token: string): Promise<AuthInfo>;
 }
 
-/** One refused request. Never carries the token or any claim value beyond `iss`/`sub`. */
+/**
+ * One refused request. Never carries the token or any claim value beyond
+ * `iss`/`sub`; `iss` is the configured issuer the verifier routed the token
+ * to (`VerifyError.iss`), absent when it routed it to none.
+ */
 export interface RejectEvent {
   reason: Reason;
   status: number;
@@ -127,7 +131,13 @@ export function bearerAuth(o: BearerOptions): RequestHandler {
   function reject(res: Response, err: VerifyError, ip: string | undefined, start: number): void {
     const status = statusFor(err.reason);
     try {
-      o.onReject?.({ reason: err.reason, status, ip, durationMs: Date.now() - start });
+      o.onReject?.({
+        reason: err.reason,
+        status,
+        ip,
+        ...(err.iss !== undefined && { iss: err.iss }),
+        durationMs: Date.now() - start,
+      });
     } catch (hookError) {
       logger.error("bearerAuth onReject hook failed", hookError instanceof Error ? hookError.name : "unknown error");
     }

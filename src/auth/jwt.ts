@@ -1,5 +1,6 @@
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { errors, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
+import { logger } from "../services/logger.js";
 import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
 import { FetchRefused } from "./fetch-guard.js";
@@ -105,7 +106,7 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * in a backoff (R16). jose retries a cold or stale cache on every request,
  * so without this each request during a JWKS outage would wait for its own
  * failing fetch. After a failure (a throw, a non-200 answer, or a 200 whose
- * body is not a JSON object with a `keys` array) every call is refused with
+ * body is not a JSON object with a `keys` array of objects) every call is refused with
  * `issuer_unavailable` and no network I/O until a window has passed: 1 s, doubling after each further failure up to 60 s (the retry
  * loader's schedule, without jitter). The first call after the window
  * fetches again (jose merges concurrent reloads into that one); a usable 200
@@ -116,13 +117,22 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * key is cached keep working during an outage: only requests that need the
  * network are refused. Once the cache is stale every request needs a
  * refetch, and gets 503 until the JWKS is back.
+ *
+ * Each window opened logs one warning, and the first usable 200 after
+ * failures logs one info line. Both name the issuer by `origin` only and
+ * the cause by a fixed word (the `FetchRefused` cause or the HTTP status),
+ * never a URL path or an error message.
  */
-export function jwksBackoff(fetchImpl: typeof fetch, now: () => number = Date.now): typeof fetch {
+export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => number = Date.now): typeof fetch {
   let failures = 0;
   let retryAt = 0;
-  const failed = () => {
-    retryAt = now() + Math.min(DEFAULT_INITIAL_DELAY_MS * 2 ** failures, DEFAULT_MAX_DELAY_MS);
+  const failed = (cause: string) => {
+    const delay = Math.min(DEFAULT_INITIAL_DELAY_MS * 2 ** failures, DEFAULT_MAX_DELAY_MS);
+    retryAt = now() + delay;
     failures++;
+    logger.warn(
+      `JWKS fetch for ${origin} failed (${plural(failures, "consecutive failure")}, cause: ${cause}); backing off ${delay}ms`,
+    );
   };
   return async (input, init) => {
     if (failures > 0 && now() < retryAt) {
@@ -132,29 +142,40 @@ export function jwksBackoff(fetchImpl: typeof fetch, now: () => number = Date.no
     try {
       res = await fetchImpl(input, init);
     } catch (error) {
-      failed();
+      failed(error instanceof FetchRefused ? error.cause_ : "fetch error");
       throw error;
     }
-    // A 200 counts only if jose can use it: a JSON object with a `keys`
-    // array. Anything else fails in jose as `issuer_unavailable` too, so it
-    // backs off like an error status. The guarded fetch buffers the body,
-    // so the clone costs no network I/O.
+    // A 200 counts only if jose can use it: a JSON object whose `keys` is an
+    // array of objects. Anything else fails in jose as `issuer_unavailable`
+    // too, so it backs off like an error status. The guarded fetch buffers
+    // the body, so the clone costs no network I/O.
     let usable = false;
     if (res.status === 200) {
       try {
         const body: unknown = await res.clone().json();
-        usable = typeof body === "object" && body !== null && Array.isArray((body as { keys?: unknown }).keys);
+        usable = isObject(body) && Array.isArray(body.keys) && body.keys.every(isObject);
       } catch {
         usable = false;
       }
     }
     if (usable) {
+      if (failures > 0) {
+        logger.info(`JWKS fetch for ${origin} recovered after ${plural(failures, "consecutive failure")}`);
+      }
       failures = 0;
     } else {
-      failed();
+      failed(res.status === 200 ? "invalid key set" : `HTTP ${res.status}`);
     }
     return res;
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
 /** Map a `jwtVerify` failure to a `VerifyError`; anything unknown is rethrown (500). */
@@ -219,6 +240,13 @@ function enforcePolicy(policy: IdentityPolicy, payload: JWTPayload, sub: string)
   }
 }
 
+interface RoutedIssuer {
+  cfg: IssuerConfig;
+  getKey: JWTVerifyGetKey;
+  acceptedTyp: Set<string>;
+  policy: IdentityPolicy | undefined;
+}
+
 /**
  * Verifier for RFC 9068 JWT access tokens from one or more issuers, each
  * checked against its own JWKS. In order:
@@ -244,11 +272,12 @@ function enforcePolicy(policy: IdentityPolicy, payload: JWTPayload, sub: string)
  *    global one as a whole; it is never merged with it.
  *
  * Error messages are fixed strings: they reach `error_description`, so they
- * never quote a claim.
+ * never quote a claim. Every refusal after step 1 has routed the token
+ * carries the configured issuer as `VerifyError.iss`.
  */
 export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
   const now = o.now ?? Date.now;
-  const issuers = new Map(
+  const issuers = new Map<string, RoutedIssuer>(
     o.issuers.map((cfg) => {
       const getKey = o.keys.get(cfg.issuer);
       if (!getKey) {
@@ -282,64 +311,77 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
       if (!entry) {
         throw new VerifyError("unknown_issuer", "Access token issuer is not trusted");
       }
-      const { cfg, getKey, acceptedTyp, policy } = entry;
-      const header = decodeObject(segments[0]);
-      const unverified = decodeObject(segments[1]);
-      if (typeof header.typ !== "string" || !acceptedTyp.has(header.typ.toLowerCase())) {
-        throw malformed();
-      }
-      for (const name of ["exp", "nbf", "iat"]) {
-        if (name in unverified && !isTimestamp(unverified[name])) {
-          throw malformed();
-        }
-      }
-      // RFC 7519 §4.1.3: a string or an array of strings. Checked here because
-      // jose reports a non-string aud as an audience mismatch.
-      if ("aud" in unverified && !isAudience(unverified.aud)) {
-        throw malformed();
-      }
-
-      let payload: JWTPayload;
       try {
-        ({ payload } = await jwtVerify(token, getKey, {
-          issuer: cfg.issuer,
-          audience: cfg.audiences,
-          algorithms: cfg.algorithms,
-          clockTolerance: cfg.clockSkewS,
-          maxTokenAge: cfg.maxTokenAgeS || undefined,
-          currentDate: new Date(now()),
-          requiredClaims: REQUIRED_CLAIMS,
-        }));
+        return await verifyRouted(token, segments, entry);
       } catch (error) {
-        throw classify(error);
+        // From here on the issuer is known: tag the refusal with the
+        // configured string so the reject audit line can name it.
+        if (error instanceof VerifyError) {
+          throw new VerifyError(error.reason, error.message, entry.cfg.issuer);
+        }
+        throw error;
       }
-
-      const { sub, jti, client_id: clientId, scope } = payload as JWTPayload & { client_id?: unknown; scope?: unknown };
-      if (typeof sub !== "string" || sub.length === 0 || sub.length > MAX_SUB_LENGTH) {
-        throw new VerifyError("subject_missing", "Access token has no subject");
-      }
-      if (typeof clientId !== "string" || clientId.length === 0) {
-        throw malformed();
-      }
-      if (typeof jti !== "string" || jti.length === 0) {
-        throw malformed();
-      }
-      if (scope !== undefined && typeof scope !== "string") {
-        throw malformed();
-      }
-      if (policy) {
-        enforcePolicy(policy, payload, sub);
-      }
-
-      const info: AuthInfo = {
-        token,
-        clientId,
-        scopes: typeof scope === "string" ? scope.split(" ").filter((s) => s.length > 0) : [],
-        expiresAt: payload.exp,
-        resource: o.publicUrl,
-        extra: { iss: cfg.issuer, sub, principal: `${cfg.issuer}|${sub}`, claims: payload },
-      };
-      return info;
     },
   };
+
+  async function verifyRouted(token: string, segments: string[], entry: RoutedIssuer): Promise<AuthInfo> {
+    const { cfg, getKey, acceptedTyp, policy } = entry;
+    const header = decodeObject(segments[0]);
+    const unverified = decodeObject(segments[1]);
+    if (typeof header.typ !== "string" || !acceptedTyp.has(header.typ.toLowerCase())) {
+      throw malformed();
+    }
+    for (const name of ["exp", "nbf", "iat"]) {
+      if (name in unverified && !isTimestamp(unverified[name])) {
+        throw malformed();
+      }
+    }
+    // RFC 7519 §4.1.3: a string or an array of strings. Checked here because
+    // jose reports a non-string aud as an audience mismatch.
+    if ("aud" in unverified && !isAudience(unverified.aud)) {
+      throw malformed();
+    }
+
+    let payload: JWTPayload;
+    try {
+      ({ payload } = await jwtVerify(token, getKey, {
+        issuer: cfg.issuer,
+        audience: cfg.audiences,
+        algorithms: cfg.algorithms,
+        clockTolerance: cfg.clockSkewS,
+        maxTokenAge: cfg.maxTokenAgeS || undefined,
+        currentDate: new Date(now()),
+        requiredClaims: REQUIRED_CLAIMS,
+      }));
+    } catch (error) {
+      throw classify(error);
+    }
+
+    const { sub, jti, client_id: clientId, scope } = payload as JWTPayload & { client_id?: unknown; scope?: unknown };
+    if (typeof sub !== "string" || sub.length === 0 || sub.length > MAX_SUB_LENGTH) {
+      throw new VerifyError("subject_missing", "Access token has no subject");
+    }
+    if (typeof clientId !== "string" || clientId.length === 0) {
+      throw malformed();
+    }
+    if (typeof jti !== "string" || jti.length === 0) {
+      throw malformed();
+    }
+    if (scope !== undefined && typeof scope !== "string") {
+      throw malformed();
+    }
+    if (policy) {
+      enforcePolicy(policy, payload, sub);
+    }
+
+    const info: AuthInfo = {
+      token,
+      clientId,
+      scopes: typeof scope === "string" ? scope.split(" ").filter((s) => s.length > 0) : [],
+      expiresAt: payload.exp,
+      resource: o.publicUrl,
+      extra: { iss: cfg.issuer, sub, principal: `${cfg.issuer}|${sub}`, claims: payload },
+    };
+    return info;
+  }
 }

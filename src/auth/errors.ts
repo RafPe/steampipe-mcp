@@ -16,11 +16,16 @@ export type Reason =
   | "subject_missing"
   | "not_allowed";
 
-/** A verifier's refusal. Anything else a verifier throws is a programming error (500). */
+/**
+ * A verifier's refusal. Anything else a verifier throws is a programming
+ * error (500). `iss` is the configured issuer the token was routed to, when
+ * there was one; never an unverified value from the token.
+ */
 export class VerifyError extends Error {
   constructor(
     readonly reason: Reason,
     message: string,
+    readonly iss?: string,
   ) {
     super(message);
     this.name = "VerifyError";

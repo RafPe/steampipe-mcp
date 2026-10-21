@@ -162,7 +162,7 @@ export async function authMiddleware(
       return createRemoteJWKSet(jwksUri, {
         timeoutDuration: JWKS_TIMEOUT_MS,
         cooldownDuration: jwt.jwksCooldownS * 1000,
-        [customFetch]: jwksBackoff(fetchImpl, opts.now),
+        [customFetch]: jwksBackoff(fetchImpl, new URL(issuer).origin, opts.now),
       });
     };
     // Same canonical href for the PRM resource, the expected token
@@ -185,12 +185,14 @@ export async function authMiddleware(
       // One retry loader per issuer: an issuer that cannot be discovered
       // yet answers 503 and is left out of the PRM, without holding back
       // the others.
+      // Log lines name an issuer by position (as in `auth:<n>`) and origin,
+      // never its full URL, whose path can carry a tenant ID.
       const loaders = new Map(
-        jwt.issuers.map(({ issuer }) => [
+        jwt.issuers.map(({ issuer }, index) => [
           issuer,
           createRetryLoader((signal) => loadKeys(issuer, signal), {
             ...opts.discoveryRetry,
-            name: `JWT issuer ${issuer} discovery`,
+            name: `JWT issuer #${index + 1} (${new URL(issuer).origin}) discovery`,
           }),
         ]),
       );

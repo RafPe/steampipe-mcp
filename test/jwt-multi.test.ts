@@ -530,6 +530,25 @@ describe("jwt multi-issuer config", () => {
     expect(err.message).not.toContain("hunter2");
   });
 
+  it("caps each entry's clockSkewS at 300 seconds (M-6)", () => {
+    const cfg = load(issuersEnv([{ issuer: "https://a.example", clockSkewS: 300 }]));
+    expect(cfg.auth.jwt?.issuers[0].clockSkewS).toBe(300);
+    expectConfigError(
+      issuersEnv([{ issuer: "https://a.example" }, { issuer: "https://b.example", clockSkewS: 301 }]),
+      /^STEAMPIPE_MCP_JWT_ISSUERS\[1\]\.clockSkewS must be an integer between 0 and 300$/,
+    );
+    // maxTokenAgeS is not capped.
+    expect(load(issuersEnv([{ issuer: "https://a.example", maxTokenAgeS: 86400 }])).auth.jwt?.issuers[0].maxTokenAgeS).toBe(86400);
+  });
+
+  it("refuses an entry's issuer containing '|', without echoing it (M-3)", () => {
+    const err = expectConfigError(
+      issuersEnv([{ issuer: "https://a.example" }, { issuer: "https://b.example/t|x" }]),
+      /^STEAMPIPE_MCP_JWT_ISSUERS\[1\]\.issuer must not contain "\|"$/,
+    );
+    expect(err.message).not.toContain("b.example");
+  });
+
   it("validates each entry's settings", () => {
     const bad: Record<string, unknown>[] = [
       { audiences: [] },
