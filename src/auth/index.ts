@@ -5,6 +5,7 @@ import {
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { ServerConfig } from "../config.js";
+import { auditAuthReject } from "../http/audit.js";
 import { bearerAuth } from "./bearer.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "./google.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
@@ -40,7 +41,7 @@ export async function authMiddleware(
     }
     return {
       rootRouters: [],
-      mcpMiddleware: [bearerAuth({ verifier: createStaticTokenVerifier(auth.token) })],
+      mcpMiddleware: [bearerAuth({ verifier: createStaticTokenVerifier(auth.token), onReject: auditAuthReject })],
     };
   }
 
@@ -75,6 +76,7 @@ export async function authMiddleware(
           expectedResource: publicUrl.href,
           resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(publicUrl),
           challengeScope: ["openid", "email"],
+          onReject: auditAuthReject,
         }),
       ],
     };
