@@ -4,6 +4,7 @@ _What's new_
 
 * Declarative identity policy (`STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`, `STEAMPIPE_MCP_SUBJECT_PREFIXES`): required claim values, an exact subject allowlist, and subject prefixes, parsed and validated at startup in `http` mode. All default to empty (no policy). This release adds the policy core and its configuration only; the verifiers enforce it in a later change.
 * `GET /readyz` readiness probe for HTTP mode, separate from `/healthz` (which still never touches the database). It returns `200 {"status":"ready","checks":{...}}` or `503 {"status":"not_ready","checks":{...}}` with check names and statuses only, answers within about 2 s even when the database is wedged, and coalesces concurrent probes into one evaluation cached for 1 s. The `db` check runs `select 1` on a dedicated short-lived connection, never a pooled one, with 2 s connect, query and cleanup timeouts (so the connection itself lives at most about 6 s). Like `/healthz`, it is exempt from Host/Origin validation so Kubernetes probes work.
+* Rejected auth attempts are audited: in `token` and `google` mode, each request refused by the bearer check writes one info-level `{"event":"auth_reject","reason","status","ip","durationMs"}` line (plus `iss`/`sub` when known) with a typed reason such as `missing`, `invalid`, `audience`, `expired`, `not_allowed` or `issuer_unavailable`. `ip`, `iss` and `sub` are sanitised and capped like other logged values; the line never contains the token.
 
 _Security_
 

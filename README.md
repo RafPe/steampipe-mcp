@@ -347,6 +347,14 @@ HTTP transport settings. Some are validated in every mode, so a malformed value 
 
 Logs go to stderr. Values in log lines that come from clients, tokens, or the database (the audit line's `sub`, `clientId`, `method` and `tool`, request and driver error messages, and the Google principal email at debug level) are sanitised: control, line-separator and bidi characters are stripped, and each value is capped at 256 characters, with a `…(+N)` suffix giving the number of characters cut. The debug-level SQL line is sanitised the same way, with a cap of 8192 characters.
 
+In `token` and `google` mode, every request the bearer check refuses writes one info-level line:
+
+```
+{"event":"auth_reject","reason":"expired","status":401,"ip":"203.0.113.7","durationMs":42}
+```
+
+`reason` says why, for example `missing`, `malformed`, `invalid`, `audience`, `expired`, `not_allowed` (status `403`) or `issuer_unavailable` (status `503`). `ip` is the client address as Express sees it (with `STEAMPIPE_MCP_TRUST_PROXY` set, it comes from `X-Forwarded-For`), or `"unknown"`; `iss` and `sub` appear only when known. `ip`, `iss` and `sub` are sanitised like the values above. The line never contains the token, the `Authorization` header or an error message. A refused request writes no normal audit line, and an accepted one writes no `auth_reject` line.
+
 ## Open Source & Contributing
 
 This repository is published under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0). Please see our [code of conduct](https://github.com/turbot/.github/blob/main/CODE_OF_CONDUCT.md). We look forward to collaborating with you!
