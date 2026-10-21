@@ -835,12 +835,17 @@ describe("jwt config", () => {
     const cfg = load({ STEAMPIPE_MCP_JWT_ISSUER: ISSUER, STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com" });
     expect(cfg.auth.mode).toBe("jwt");
     expect(cfg.auth.jwt).toEqual({
-      issuer: ISSUER,
-      audiences: ["https://mcp.example.com/"],
-      algorithms: ["RS256", "ES256"],
-      acceptedTyp: ["at+jwt", "application/at+jwt"],
-      clockSkewS: 0,
-      maxTokenAgeS: 0,
+      issuers: [
+        {
+          issuer: ISSUER,
+          audiences: ["https://mcp.example.com/"],
+          algorithms: ["RS256", "ES256"],
+          acceptedTyp: ["at+jwt", "application/at+jwt"],
+          clockSkewS: 0,
+          maxTokenAgeS: 0,
+          advertise: true,
+        },
+      ],
       jwksCooldownS: 30,
       scopesSupported: [],
       challengeScope: [],
@@ -862,12 +867,17 @@ describe("jwt config", () => {
       STEAMPIPE_MCP_JWT_ALLOWED_HOSTS: "keys.example.com",
     });
     expect(cfg.auth.jwt).toEqual({
-      issuer: "http://127.0.0.1:8080",
-      audiences: ["a", "b"],
-      algorithms: ["PS256", "EdDSA"],
-      acceptedTyp: ["at+jwt", "jwt"],
-      clockSkewS: 15,
-      maxTokenAgeS: 3600,
+      issuers: [
+        {
+          issuer: "http://127.0.0.1:8080",
+          audiences: ["a", "b"],
+          algorithms: ["PS256", "EdDSA"],
+          acceptedTyp: ["at+jwt", "jwt"],
+          clockSkewS: 15,
+          maxTokenAgeS: 3600,
+          advertise: true,
+        },
+      ],
       jwksCooldownS: 3600,
       scopesSupported: ["mcp.read", "mcp.write"],
       challengeScope: ["mcp.read"],

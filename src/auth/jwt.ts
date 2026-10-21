@@ -3,6 +3,7 @@ import { errors, jwtVerify, type JWTPayload, type JWTVerifyGetKey } from "jose";
 import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
 import { FetchRefused } from "./fetch-guard.js";
+import { peekIssuer } from "./issuer-peek.js";
 
 export interface IssuerConfig {
   issuer: string;
@@ -139,12 +140,14 @@ function classify(error: unknown): VerifyError {
 }
 
 /**
- * Verifier for RFC 9068 JWT access tokens, checked against each issuer's
- * JWKS. In order:
+ * Verifier for RFC 9068 JWT access tokens from one or more issuers, each
+ * checked against its own JWKS. In order:
  *
- * 1. Pre-checks, all `malformed`: three non-empty base64url segments; JSON
- *    object header and payload; a string `iss` (an unconfigured one is
- *    `unknown_issuer`); header `typ` in the issuer's `acceptedTyp`
+ * 1. Pre-checks, all `malformed`: three non-empty base64url segments; an
+ *    `iss` that `peekIssuer` can read (an unconfigured one is
+ *    `unknown_issuer`, with no network I/O; otherwise only that issuer's
+ *    keys and settings are used); JSON object header and payload; header
+ *    `typ` in the issuer's `acceptedTyp`
  *    (case-insensitive, so an ID token or generic JWT is refused unless the
  *    operator allows its type); `exp`/`nbf`/`iat`, when present, finite
  *    numbers within ±2^40; `aud`, when present, a string or an array of
@@ -181,16 +184,19 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
       if (segments.length !== 3 || !segments.every((s) => SEGMENT.test(s))) {
         throw malformed();
       }
-      const header = decodeObject(segments[0]);
-      const unverified = decodeObject(segments[1]);
-      if (typeof unverified.iss !== "string") {
+      // The unverified iss only chooses the issuer; an unconfigured one is
+      // refused here, before any key lookup or other network I/O.
+      const iss = peekIssuer(token);
+      if (iss === undefined) {
         throw malformed();
       }
-      const entry = issuers.get(unverified.iss);
+      const entry = issuers.get(iss);
       if (!entry) {
         throw new VerifyError("unknown_issuer", "Access token issuer is not trusted");
       }
       const { cfg, getKey, acceptedTyp } = entry;
+      const header = decodeObject(segments[0]);
+      const unverified = decodeObject(segments[1]);
       if (typeof header.typ !== "string" || !acceptedTyp.has(header.typ.toLowerCase())) {
         throw malformed();
       }

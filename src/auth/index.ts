@@ -42,8 +42,9 @@ const JWKS_TIMEOUT_MS = 5000;
  * Build the auth layer for `cfg.auth.mode` (R15). In google mode this
  * fetches Google's discovery document up front and rejects if that fails,
  * so the server refuses to start when Google is unreachable or answers as
- * another issuer. jwt mode does the same with the configured issuer's
- * discovery document, which must name a `jwks_uri` the fetch policy allows.
+ * another issuer. jwt mode does the same with every configured issuer's
+ * discovery document, each of which must name a `jwks_uri` that issuer's
+ * fetch policy allows.
  *
  * With `cfg.auth.allowDegradedStart` in google mode, discovery instead runs
  * in the background through a retry loader: the PRM answers 503 with
@@ -130,43 +131,34 @@ export async function authMiddleware(
     const publicUrl = cfg.http.publicUrl;
     const jwt = auth.jwt;
     if (!publicUrl || !jwt) {
-      throw new Error("STEAMPIPE_MCP_PUBLIC_URL and STEAMPIPE_MCP_JWT_ISSUER are required when STEAMPIPE_MCP_AUTH_MODE=jwt");
+      throw new Error(
+        "STEAMPIPE_MCP_PUBLIC_URL and STEAMPIPE_MCP_JWT_ISSUER or STEAMPIPE_MCP_JWT_ISSUERS are required when STEAMPIPE_MCP_AUTH_MODE=jwt",
+      );
     }
-    // The issuer is operator-configured and trusted; anything discovery
-    // points at must be on its host or JWT_ALLOWED_HOSTS.
-    const policy: FetchPolicy = {
-      allowedHosts: [new URL(jwt.issuer).hostname, ...jwt.allowedHosts],
-      insecureAuthorities: [],
-      timeoutMs: DEFAULT_TIMEOUT_MS,
-      maxBytes: DEFAULT_MAX_BYTES,
-    };
-    const fetchImpl = guardedFetch(policy);
-    const { jwksUri } = await discoverJwks(jwt.issuer, fetchImpl, policy);
-    const keys = new Map([
-      [
-        jwt.issuer,
-        createRemoteJWKSet(jwksUri, {
-          timeoutDuration: JWKS_TIMEOUT_MS,
-          cooldownDuration: jwt.jwksCooldownS * 1000,
-          [customFetch]: fetchImpl,
+    // Each issuer gets its own fetch policy, discovery and key set. Issuers
+    // are operator-configured and trusted; anything an issuer's discovery
+    // points at must be on that issuer's host or JWT_ALLOWED_HOSTS.
+    const keys = new Map(
+      await Promise.all(
+        jwt.issuers.map(async ({ issuer }) => {
+          const policy: FetchPolicy = {
+            allowedHosts: [new URL(issuer).hostname, ...jwt.allowedHosts],
+            insecureAuthorities: [],
+            timeoutMs: DEFAULT_TIMEOUT_MS,
+            maxBytes: DEFAULT_MAX_BYTES,
+          };
+          const fetchImpl = guardedFetch(policy);
+          const { jwksUri } = await discoverJwks(issuer, fetchImpl, policy);
+          const getKey = createRemoteJWKSet(jwksUri, {
+            timeoutDuration: JWKS_TIMEOUT_MS,
+            cooldownDuration: jwt.jwksCooldownS * 1000,
+            [customFetch]: fetchImpl,
+          });
+          return [issuer, getKey] as const;
         }),
-      ],
-    ]);
-    const verifier = createJwtVerifier({
-      issuers: [
-        {
-          issuer: jwt.issuer,
-          audiences: jwt.audiences,
-          algorithms: jwt.algorithms,
-          acceptedTyp: jwt.acceptedTyp,
-          clockSkewS: jwt.clockSkewS,
-          maxTokenAgeS: jwt.maxTokenAgeS,
-        },
-      ],
-      publicUrl,
-      keys,
-      now: opts.now,
-    });
+      ),
+    );
+    const verifier = createJwtVerifier({ issuers: jwt.issuers, publicUrl, keys, now: opts.now });
     // Same canonical href for the PRM resource, the expected token
     // resource and the default audience (R12).
     const resource = publicUrl.href;
@@ -174,7 +166,8 @@ export async function authMiddleware(
       rootRouters: [
         prmRouter({
           resource,
-          authorizationServers: [jwt.issuer],
+          // Advertised issuers only, in config order (config guarantees one).
+          authorizationServers: jwt.issuers.filter((i) => i.advertise).map((i) => i.issuer),
           ...(jwt.scopesSupported.length > 0 && { scopesSupported: jwt.scopesSupported }),
           resourceName: "Steampipe MCP",
         }),
