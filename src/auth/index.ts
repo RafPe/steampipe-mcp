@@ -158,7 +158,7 @@ export async function authMiddleware(
         }),
       ),
     );
-    const verifier = createJwtVerifier({ issuers: jwt.issuers, publicUrl, keys, now: opts.now });
+    const verifier = createJwtVerifier({ issuers: jwt.issuers, policy: cfg.policy, publicUrl, keys, now: opts.now });
     // Same canonical href for the PRM resource, the expected token
     // resource and the default audience (R12).
     const resource = publicUrl.href;

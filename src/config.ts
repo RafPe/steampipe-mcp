@@ -255,12 +255,12 @@ function parseAuthMode(env: NodeJS.ProcessEnv): ServerConfig["auth"]["mode"] {
 
 /**
  * R6: a policy is only worth configuring if something enforces it. Only
- * google mode does; in none or token mode it would be silently ignored, so
- * refuse to start instead. Names the variables that are set, never their
+ * google and jwt mode do; in none or token mode it would be silently
+ * ignored, so refuse to start instead. Names the variables that are set, never their
  * values.
  */
 function assertPolicyEnforceable(policy: PolicyConfig, authMode: ServerConfig["auth"]["mode"]): void {
-  if (isEmptyPolicy(policy) || authMode === "google") {
+  if (isEmptyPolicy(policy) || authMode === "google" || authMode === "jwt") {
     return;
   }
   const names = [
@@ -272,7 +272,7 @@ function assertPolicyEnforceable(policy: PolicyConfig, authMode: ServerConfig["a
     .map((name) => `${PREFIX}${name}`);
   throw new ConfigError(
     `${names.join(", ")} set, but ${PREFIX}AUTH_MODE=${authMode} cannot enforce an identity policy; ` +
-      `use ${PREFIX}AUTH_MODE=google or unset the policy`,
+      `use ${PREFIX}AUTH_MODE=google or jwt, or unset the policy`,
   );
 }
 

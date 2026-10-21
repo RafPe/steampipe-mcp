@@ -29,52 +29,68 @@ function parseJson(env: NodeJS.ProcessEnv, name: string): unknown {
  * is refused because an empty prefix matches every subject. `where` locates
  * the entry by position, since claim keys are part of the value too.
  */
-function assertEntry(name: string, where: string, entry: unknown): asserts entry is string {
+function assertEntry(label: string, where: string, entry: unknown): asserts entry is string {
   if (typeof entry !== "string" || entry.length === 0 || entry.length > MAX_ENTRY_LENGTH) {
-    throw new ConfigError(
-      `${PREFIX}${name} ${where} must be a non-empty string of at most ${MAX_ENTRY_LENGTH} characters`,
-    );
+    throw new ConfigError(`${label} ${where} must be a non-empty string of at most ${MAX_ENTRY_LENGTH} characters`);
   }
 }
 
-function parseStringArray(env: NodeJS.ProcessEnv, name: string, maxEntries: number): string[] {
-  const parsed = parseJson(env, name);
-  if (parsed === undefined) {
-    return [];
+function stringArray(value: unknown, label: string, maxEntries: number): string[] {
+  if (!Array.isArray(value)) {
+    throw new ConfigError(`${label} must be a JSON array of strings`);
   }
-  if (!Array.isArray(parsed)) {
-    throw new ConfigError(`${PREFIX}${name} must be a JSON array of strings`);
+  if (value.length > maxEntries) {
+    throw new ConfigError(`${label} must have at most ${maxEntries} entries, got ${value.length}`);
   }
-  if (parsed.length > maxEntries) {
-    throw new ConfigError(`${PREFIX}${name} must have at most ${maxEntries} entries, got ${parsed.length}`);
-  }
-  parsed.forEach((entry, i) => assertEntry(name, `entry ${i}`, entry));
-  return parsed as string[];
+  value.forEach((entry, i) => assertEntry(label, `entry ${i}`, entry));
+  return value as string[];
 }
 
-function parseRequiredClaims(env: NodeJS.ProcessEnv): Record<string, string[]> {
-  const name = "REQUIRED_CLAIMS";
-  const parsed = parseJson(env, name);
+function requiredClaims(value: unknown, label: string): Record<string, string[]> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ConfigError(`${label} must be a JSON object mapping claim names to arrays of strings`);
+  }
   // A null-prototype record, so a "__proto__" claim key stays an ordinary
   // own key instead of rewriting the prototype.
   const claims: Record<string, string[]> = Object.create(null);
-  if (parsed === undefined) {
-    return claims;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new ConfigError(`${PREFIX}${name} must be a JSON object mapping claim names to arrays of strings`);
-  }
-  Object.entries(parsed).forEach(([key, values], i) => {
-    assertEntry(name, `claim name ${i}`, key);
+  Object.entries(value).forEach(([key, values], i) => {
+    assertEntry(label, `claim name ${i}`, key);
     // An empty list can only ever reject, but reads as "any value will do".
     if (!Array.isArray(values) || values.length === 0) {
-      throw new ConfigError(`${PREFIX}${name} claim ${i} must map to a non-empty JSON array of strings`);
+      throw new ConfigError(`${label} claim ${i} must map to a non-empty JSON array of strings`);
     }
-    values.forEach((v, j) => assertEntry(name, `claim ${i} value ${j}`, v));
+    values.forEach((v, j) => assertEntry(label, `claim ${i} value ${j}`, v));
     claims[key] = values as string[];
   });
   return claims;
 }
+
+/** Already-parsed policy values; `undefined` means unset. */
+export interface PolicyValues {
+  requiredClaims?: unknown;
+  allowedSubjects?: unknown;
+  subjectPrefixes?: unknown;
+}
+
+/**
+ * Validate policy values from any source (env JSON or a `JWT_ISSUERS`
+ * entry) with one set of limits. `label` names each field in errors, which
+ * never echo a value. Unset fields are empty.
+ */
+export function policyFromValues(values: PolicyValues, label: (field: keyof PolicyValues) => string): PolicyConfig {
+  const { requiredClaims: rc, allowedSubjects: as, subjectPrefixes: sp } = values;
+  return {
+    requiredClaims: rc === undefined ? Object.create(null) : requiredClaims(rc, label("requiredClaims")),
+    allowedSubjects: new Set(as === undefined ? [] : stringArray(as, label("allowedSubjects"), MAX_ALLOWED_SUBJECTS)),
+    subjectPrefixes: sp === undefined ? [] : stringArray(sp, label("subjectPrefixes"), MAX_SUBJECT_PREFIXES),
+  };
+}
+
+const ENV_NAMES: Record<keyof PolicyValues, string> = {
+  requiredClaims: "REQUIRED_CLAIMS",
+  allowedSubjects: "ALLOWED_SUBJECTS",
+  subjectPrefixes: "SUBJECT_PREFIXES",
+};
 
 /**
  * Parse the identity policy variables. All three default to empty, which
@@ -82,9 +98,12 @@ function parseRequiredClaims(env: NodeJS.ProcessEnv): Record<string, string[]> {
  * its value.
  */
 export function parsePolicyConfig(env: NodeJS.ProcessEnv): PolicyConfig {
-  return {
-    requiredClaims: parseRequiredClaims(env),
-    allowedSubjects: new Set(parseStringArray(env, "ALLOWED_SUBJECTS", MAX_ALLOWED_SUBJECTS)),
-    subjectPrefixes: parseStringArray(env, "SUBJECT_PREFIXES", MAX_SUBJECT_PREFIXES),
-  };
+  return policyFromValues(
+    {
+      requiredClaims: parseJson(env, ENV_NAMES.requiredClaims),
+      allowedSubjects: parseJson(env, ENV_NAMES.allowedSubjects),
+      subjectPrefixes: parseJson(env, ENV_NAMES.subjectPrefixes),
+    },
+    (field) => `${PREFIX}${ENV_NAMES[field]}`,
+  );
 }

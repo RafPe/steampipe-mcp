@@ -558,3 +558,201 @@ describe("jwt multi-issuer config", () => {
     }
   });
 });
+
+describe("jwt identity policy", () => {
+  const GH_SUB = "repo:RafPe/steampipe-mcp:ref:refs/heads/main";
+
+  async function expectDenied(app: App, token: string, secrets: string[] = []): Promise<void> {
+    const before = app.rejects.length;
+    const res = await toolsList(app.port, token);
+    expect(app.rejects.slice(before).map((e) => e.reason)).toEqual(["not_allowed"]);
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error).toBe("access_denied");
+    // A policy denial is not a scope problem: no challenge to step up.
+    expect(res.headers["www-authenticate"]).toBeUndefined();
+    for (const secret of secrets) {
+      expect(res.body).not.toContain(secret);
+      expect(JSON.stringify(res.headers)).not.toContain(secret);
+    }
+  }
+
+  it("applies the global REQUIRED_CLAIMS to every issuer", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer }, { issuer: b.issuer }], {
+      STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}',
+    });
+    for (const iss of [a, b]) {
+      await expectAccepted(app, await iss.sign(claims(iss.issuer, { groups: ["platform", "x"] })));
+      await expectDenied(app, await iss.sign(claims(iss.issuer, { groups: ["x"] })));
+      await expectDenied(app, await iss.sign(claims(iss.issuer)));
+    }
+  });
+
+  it("applies the global subject rules to the verified sub", async () => {
+    const a = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer }], { STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["svc-1"]' });
+    await expectAccepted(app, await a.sign(claims(a.issuer, { sub: "svc-1" })));
+    await expectDenied(app, await a.sign(claims(a.issuer, { sub: "svc-2" })));
+  });
+
+  it("lets issuer B's override replace the global policy for B only", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti(
+      [{ issuer: a.issuer }, { issuer: b.issuer, requiredClaims: { repository_owner: ["RafPe"] } }],
+      { STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}', STEAMPIPE_MCP_SUBJECT_PREFIXES: '["svc-"]' },
+    );
+    // B: the override alone decides. No groups claim and a sub outside the
+    // global prefixes still pass, so nothing of the global policy is merged in.
+    await expectAccepted(app, await b.sign(claims(b.issuer, { sub: GH_SUB, repository_owner: "RafPe" })));
+    await expectDenied(app, await b.sign(claims(b.issuer, { sub: "svc-1", groups: ["platform"] })));
+    await expectDenied(app, await b.sign(claims(b.issuer, { sub: GH_SUB, repository_owner: "Other" })));
+    // A: still the global policy; B's override does not leak into it.
+    await expectAccepted(app, await a.sign(claims(a.issuer, { sub: "svc-1", groups: ["platform"] })));
+    await expectDenied(app, await a.sign(claims(a.issuer, { sub: "svc-1", repository_owner: "RafPe" })));
+    await expectDenied(app, await a.sign(claims(a.issuer, { sub: GH_SUB, groups: ["platform"] })));
+  });
+
+  it("matches a subject prefix against a GitHub Actions sub", async () => {
+    const a = await issuerFor();
+    const gh = await issuerFor();
+    const app = await startMulti([
+      { issuer: a.issuer },
+      { issuer: gh.issuer, requiredClaims: { repository_owner: ["RafPe"] }, subjectPrefixes: ["repo:RafPe/"] },
+    ]);
+    await expectAccepted(app, await gh.sign(claims(gh.issuer, { sub: GH_SUB, repository_owner: "RafPe" })));
+    await expectAccepted(
+      app,
+      await gh.sign(claims(gh.issuer, { sub: "repo:RafPe/other:environment:prod", repository_owner: "RafPe" })),
+    );
+    // The trailing slash keeps a lookalike owner out.
+    await expectDenied(app, await gh.sign(claims(gh.issuer, { sub: "repo:RafPeEvil/x:ref:refs/heads/main", repository_owner: "RafPe" })));
+    await expectDenied(app, await gh.sign(claims(gh.issuer, { sub: "repo:Other/x:ref:refs/heads/main", repository_owner: "RafPe" })));
+    // No global policy: A is unrestricted.
+    await expectAccepted(app, await a.sign(claims(a.issuer, { sub: "anything" })));
+  });
+
+  it("never echoes a claim value in the denial or the logs", async () => {
+    const a = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer, requiredClaims: { groups: ["platform"] } }], {}, { audit: true });
+    const secret = "claim-secret-5d1e";
+    const res = await toolsList(app.port, await a.sign(claims(a.issuer, { groups: [secret] })));
+    expect(res.status).toBe(403);
+    expect(res.body).not.toContain(secret);
+    expect(JSON.stringify(res.headers)).not.toContain(secret);
+    const logs = logger.getCollectedLogs();
+    expect(logs.some((l) => l.includes('"event":"auth_reject"') && l.includes('"reason":"not_allowed"'))).toBe(true);
+    expect(logs.join("\n")).not.toContain(secret);
+  });
+
+  it("checks the policy only after the token itself is valid", async () => {
+    const a = await issuerFor();
+    const app = await startMulti([{ issuer: a.issuer, requiredClaims: { groups: ["platform"] } }]);
+    await expectRejected(app, await a.sign(claims(a.issuer, { exp: NOW_S - 10 })), "expired");
+  });
+});
+
+describe("jwt identity policy config", () => {
+  const SENTINEL = "sentinel-do-not-echo";
+
+  function load(entry: Record<string, unknown>, env: Record<string, string> = {}): ServerConfig {
+    return loadConfig(multiEnv([{ issuer: "https://a.example", ...entry }], env), ["node", "index.js"]);
+  }
+
+  function configError(entry: Record<string, unknown>): ConfigError {
+    try {
+      load(entry);
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConfigError);
+      return error as ConfigError;
+    }
+    throw new Error("expected loadConfig to throw");
+  }
+
+  it("parses a per-issuer policy, leaving fields it does not set empty", () => {
+    const cfg = load(
+      { requiredClaims: { repository_owner: ["RafPe"] }, subjectPrefixes: ["repo:RafPe/"] },
+      { STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]' },
+    );
+    const policy = cfg.auth.jwt?.issuers[0].policy;
+    expect(policy?.requiredClaims).toEqual({ repository_owner: ["RafPe"] });
+    expect(policy?.subjectPrefixes).toEqual(["repo:RafPe/"]);
+    // Not inherited from the global ALLOWED_SUBJECTS.
+    expect(policy?.allowedSubjects).toEqual(new Set());
+    expect(load({ allowedSubjects: ["bob"] }).auth.jwt?.issuers[0].policy?.allowedSubjects).toEqual(new Set(["bob"]));
+  });
+
+  it("leaves an issuer without policy fields on the global policy", async () => {
+    const a = await issuerFor();
+    const b = await issuerFor();
+    const app = await startMulti(
+      [{ issuer: a.issuer }, { issuer: b.issuer, requiredClaims: { repository_owner: ["RafPe"] } }],
+      { STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}' },
+    );
+    // A has no override, so the global policy decides for it, even though
+    // another issuer carries its own.
+    await expectAccepted(app, await a.sign(claims(a.issuer, { groups: ["platform"] })));
+    const before = app.rejects.length;
+    const res = await toolsList(app.port, await a.sign(claims(a.issuer, { groups: ["x"] })));
+    expect(app.rejects.slice(before).map((e) => e.reason)).toEqual(["not_allowed"]);
+    expect(res.status).toBe(403);
+    expect(JSON.parse(res.body).error).toBe("access_denied");
+    expect(load({}).auth.jwt?.issuers[0].policy).toBeUndefined();
+  });
+
+  it("loads a global policy in jwt mode", () => {
+    const cfg = load({}, { STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}' });
+    expect(cfg.policy?.requiredClaims).toEqual({ groups: ["platform"] });
+  });
+
+  const long = `${SENTINEL}${"a".repeat(257 - SENTINEL.length)}`;
+  const many = (n: number) => Array.from({ length: n }, (_, i) => `${SENTINEL}${i}`);
+
+  it.each<[string, Record<string, unknown>]>([
+    ["requiredClaims as an array", { requiredClaims: [SENTINEL] }],
+    ["requiredClaims as null", { requiredClaims: null }],
+    ["requiredClaims value not an array", { requiredClaims: { [SENTINEL]: "x" } }],
+    ["requiredClaims value as an empty array", { requiredClaims: { [SENTINEL]: [] } }],
+    ["requiredClaims value with an empty string", { requiredClaims: { [SENTINEL]: [""] } }],
+    ["requiredClaims value with a non-string", { requiredClaims: { [SENTINEL]: ["a", 1] } }],
+    ["requiredClaims empty key", { requiredClaims: { "": [SENTINEL] } }],
+    ["requiredClaims 257-character value", { requiredClaims: { k: [long] } }],
+    ["requiredClaims 257-character key", { requiredClaims: { [long]: ["x"] } }],
+    ["allowedSubjects as a string", { allowedSubjects: SENTINEL }],
+    ["allowedSubjects as null", { allowedSubjects: null }],
+    ["allowedSubjects with an empty string", { allowedSubjects: [SENTINEL, ""] }],
+    ["allowedSubjects 257-character entry", { allowedSubjects: [long] }],
+    ["allowedSubjects with 1025 entries", { allowedSubjects: many(1025) }],
+    ["subjectPrefixes as an object", { subjectPrefixes: { [SENTINEL]: 1 } }],
+    ["subjectPrefixes with an empty string (would match every subject)", { subjectPrefixes: [SENTINEL, ""] }],
+    ["subjectPrefixes 257-character entry", { subjectPrefixes: [long] }],
+    ["subjectPrefixes with 65 entries", { subjectPrefixes: many(65) }],
+  ])("refuses %s with the global parser's limits, naming the field without echoing it", (_name, entry) => {
+    const [field] = Object.keys(entry);
+    const err = configError(entry);
+    expect(err.message).toMatch(new RegExp(`STEAMPIPE_MCP_JWT_ISSUERS\\[0\\]\\.${field}\\b`));
+    expect(err.message).not.toContain(SENTINEL);
+  });
+
+  it("accepts entries at the global parser's limits", () => {
+    const at = "a".repeat(256);
+    const policy = load({
+      requiredClaims: { [at]: [at] },
+      allowedSubjects: Array.from({ length: 1024 }, (_, i) => `s${i}`),
+      subjectPrefixes: Array.from({ length: 64 }, (_, i) => `p${i}`),
+    }).auth.jwt?.issuers[0].policy;
+    expect(policy?.allowedSubjects.size).toBe(1024);
+    expect(policy?.subjectPrefixes).toHaveLength(64);
+  });
+
+  it("refuses an override with no rules, which would silently drop the global policy", () => {
+    for (const entry of [{ requiredClaims: {} }, { allowedSubjects: [] }, { subjectPrefixes: [], allowedSubjects: [] }]) {
+      expect(configError(entry).message).toMatch(/STEAMPIPE_MCP_JWT_ISSUERS\[0\]/);
+    }
+  });
+
+  it("still refuses a misspelt policy field", () => {
+    expect(configError({ subjectPrefix: ["repo:RafPe/"] }).message).toMatch(/subjectPrefix/);
+  });
+});
