@@ -169,6 +169,12 @@ See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
 mode, the threat model, and reverse-proxy/TLS guidance (the server itself
 speaks plain HTTP).
 
+In google mode the only metadata the server publishes is its RFC 9728
+Protected Resource Metadata at `/.well-known/oauth-protected-resource/<path>`
+(`GET`/`HEAD`, `Cache-Control: max-age=300`). It names
+`https://accounts.google.com` as the authorization server; the server does not
+mirror Google's metadata at `/.well-known/oauth-authorization-server`.
+
 ## Prompting Guide
 
 First, run the `best_practices` prompt included in the MCP server to teach your LLM how best to work with Steampipe. Then, ask anything!

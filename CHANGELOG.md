@@ -20,6 +20,8 @@ _Behaviour changes_
 * Google mode: a principal outside the allowlist (or with an unverified email or mismatched `hd`) gets `403 access_denied` with **no** `WWW-Authenticate` challenge, instead of `403 insufficient_scope`, so clients do not loop on scope step-up.
 * Bearer tokens longer than 8192 bytes are rejected with `401` before any verification call.
 * Token mode: the static verifier no longer reports a rolling one-hour `expiresAt`.
+* Google mode: the RFC 9728 Protected Resource Metadata document at `/.well-known/oauth-protected-resource/<path>` is now rendered by the server instead of the SDK's `mcpAuthMetadataRouter`. It gains `"bearer_methods_supported":["header"]`, is served with `Cache-Control: max-age=300`, and answers only `GET`/`HEAD` (anything else, `OPTIONS` included, gets `405` with `Allow: GET, HEAD`). `resource` and `authorization_servers` are written exactly as configured, so the issuer stays `https://accounts.google.com` with no trailing slash.
+* Google mode: the copy of Google's metadata at `/.well-known/oauth-authorization-server` is gone (`404`). MCP clients fetch authorization-server metadata from the server named in `authorization_servers`, i.e. from Google.
 
 ## 0.2.1 [2026-10-21]
 

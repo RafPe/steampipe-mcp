@@ -15,6 +15,7 @@ import { buildHttpApp } from "../src/http/app.js";
 import { authMiddleware } from "../src/auth/index.js";
 import { createStaticTokenVerifier } from "../src/auth/verifiers.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "../src/auth/google.js";
+import { prmPath } from "../src/auth/prm.js";
 import { testDbUrl } from "./helpers/db.js";
 
 // No test here talks to Google: tokeninfo and the discovery document are
@@ -268,10 +269,38 @@ describe("authMiddleware: google", () => {
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
     const res = await send(port, { method: "GET", path: "/.well-known/oauth-protected-resource/mcp" });
     expect(res.status).toBe(200);
-    const prm = JSON.parse(res.body);
-    expect(prm.resource).toBe(PUBLIC_URL);
-    expect(prm.authorization_servers).toEqual(["https://accounts.google.com"]);
-    expect(prm.scopes_supported).toEqual(["openid", "email"]);
+    expect(res.headers["cache-control"]).toBe("max-age=300");
+    expect(res.body).toBe(
+      `{"resource":"${PUBLIC_URL}",` +
+        '"authorization_servers":["https://accounts.google.com"],' +
+        '"scopes_supported":["openid","email"],' +
+        '"bearer_methods_supported":["header"],' +
+        '"resource_name":"Steampipe MCP"}',
+    );
+  });
+
+  it("points the 401 resource_metadata at origin + prmPath(resource), where the PRM is served", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const url = new URL(PUBLIC_URL);
+    const challenge = String((await toolsList(port)).headers["www-authenticate"]);
+    expect(challenge).toContain(`resource_metadata="${url.origin}${prmPath(PUBLIC_URL)}"`);
+    expect((await send(port, { method: "GET", path: prmPath(PUBLIC_URL) })).status).toBe(200);
+  });
+
+  it("no longer mirrors Google's metadata at /.well-known/oauth-authorization-server", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const res = await send(port, { method: "GET", path: "/.well-known/oauth-authorization-server" });
+    expect(res.status).toBe(404);
+  });
+
+  it("answers POST on the PRM path with 405", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const res = await send(port, { method: "POST", path: "/.well-known/oauth-protected-resource/mcp" });
+    expect(res.status).toBe(405);
+    expect(res.headers.allow).toBe("GET, HEAD");
   });
 
   it("still applies Origin validation to the well-known routes", async () => {

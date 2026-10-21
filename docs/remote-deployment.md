@@ -210,14 +210,18 @@ At startup the server fetches
 start if that fails or names any issuer other than
 `https://accounts.google.com`. Once running it serves:
 
-- `GET /.well-known/oauth-protected-resource/mcp`: RFC 9728 Protected
-  Resource Metadata. `resource` is your `PUBLIC_URL`, `authorization_servers`
-  is `["https://accounts.google.com"]`, and `scopes_supported` is
-  `["openid","email"]`.
-- `GET /.well-known/oauth-authorization-server`: a copy of Google's metadata,
-  for clients that look for it on the resource host.
+- `GET /.well-known/oauth-protected-resource/mcp` (and `HEAD`): RFC 9728
+  Protected Resource Metadata. `resource` is your `PUBLIC_URL`,
+  `authorization_servers` is `["https://accounts.google.com"]`,
+  `scopes_supported` is `["openid","email"]`, and `bearer_methods_supported`
+  is `["header"]`. It is served with `Cache-Control: max-age=300`; any other
+  method gets `405`.
 
-These are public, but still subject to Host and Origin validation. An
+The server does not mirror Google's metadata at
+`/.well-known/oauth-authorization-server`: clients fetch it from Google, the
+server named in `authorization_servers`.
+
+This endpoint is public, but still subject to Host and Origin validation. An
 unauthenticated `POST /mcp` gets:
 
 ```
@@ -288,8 +292,10 @@ might:
 
 Related: Google publishes its metadata at
 `/.well-known/openid-configuration`, not at
-`/.well-known/oauth-authorization-server`. Spec-compliant clients try both, but
-an older client may not.
+`/.well-known/oauth-authorization-server`, and this server no longer mirrors
+it on the resource host. Spec-compliant clients try both on Google's host, but
+an older client that only looks for `oauth-authorization-server` metadata (on
+either host) will not find any.
 
 **This has not been verified end-to-end with a real Google client.** Before you
 roll google mode out, sign in once with Claude Code against a staging

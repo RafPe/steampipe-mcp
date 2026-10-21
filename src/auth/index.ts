@@ -1,13 +1,10 @@
 import type { RequestHandler } from "express";
-import {
-  getOAuthProtectedResourceMetadataUrl,
-  mcpAuthMetadataRouter,
-} from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { ServerConfig } from "../config.js";
 import { auditAuthReject } from "../http/audit.js";
 import { bearerAuth } from "./bearer.js";
-import { createGoogleVerifier, fetchGoogleMetadata } from "./google.js";
+import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
+import { prmPath, prmRouter } from "./prm.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
 
 export interface AuthMiddleware {
@@ -26,8 +23,9 @@ export interface AuthMiddlewareOptions {
 
 /**
  * Build the auth layer for `cfg.auth.mode` (R15). In google mode this
- * fetches Google's metadata up front and rejects if that fails, so the
- * server refuses to start rather than serve without a working PRM.
+ * fetches Google's discovery document up front and rejects if that fails,
+ * so the server refuses to start when Google is unreachable or answers as
+ * another issuer.
  */
 export async function authMiddleware(
   cfg: ServerConfig,
@@ -52,7 +50,7 @@ export async function authMiddleware(
         "STEAMPIPE_MCP_PUBLIC_URL and STEAMPIPE_MCP_GOOGLE_CLIENT_ID are required when STEAMPIPE_MCP_AUTH_MODE=google",
       );
     }
-    const oauthMetadata = await (opts.metadataFetcher ?? fetchGoogleMetadata)();
+    await (opts.metadataFetcher ?? fetchGoogleMetadata)();
     const verifier = createGoogleVerifier({
       clientId: auth.googleClientId,
       allowedEmails: auth.allowedEmails,
@@ -62,11 +60,14 @@ export async function authMiddleware(
       tokeninfoUrl: opts.tokeninfoUrl,
       timeoutMs: opts.tokeninfoTimeoutMs,
     });
+    // The PRM resource, the expected token resource and AuthInfo.resource
+    // all use the same canonical href.
+    const resource = publicUrl.href;
     return {
       rootRouters: [
-        mcpAuthMetadataRouter({
-          oauthMetadata,
-          resourceServerUrl: publicUrl,
+        prmRouter({
+          resource,
+          authorizationServers: [GOOGLE_ISSUER],
           scopesSupported: ["openid", "email"],
           resourceName: "Steampipe MCP",
         }),
@@ -74,8 +75,8 @@ export async function authMiddleware(
       mcpMiddleware: [
         bearerAuth({
           verifier,
-          expectedResource: publicUrl.href,
-          resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(publicUrl),
+          expectedResource: resource,
+          resourceMetadataUrl: `${publicUrl.origin}${prmPath(resource)}`,
           challengeScope: ["openid", "email"],
           onReject: auditAuthReject,
         }),
