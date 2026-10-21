@@ -447,9 +447,10 @@ starts anyway and retries each failed issuer's discovery in the background (1 s
 doubling to 60 s, ±20% jitter). Until an issuer has been discovered, its tokens
 get `503` with `Retry-After: 5`, it is left out of `authorization_servers` (the
 metadata answers `503` while no advertised issuer has been discovered), and
-`/readyz` reports `"auth:<issuer>":"pending"`; the other issuers are served
-meanwhile. With the flag on, `/readyz` has one `auth:<issuer>` entry per
-configured issuer instead of the single `auth` entry, so it names
-`"advertise": false` issuers too. `authorization_servers` lists the entries with
+`/readyz` reports `"auth:<n>":"pending"`; the other issuers are served
+meanwhile. `<n>` is the issuer's 1-based position in the array (`auth:1` is the
+first entry), never its URL, so the unauthenticated `/readyz` does not reveal
+`"advertise": false` issuers. With the flag on, `/readyz` has one `auth:<n>`
+entry per configured issuer instead of the single `auth` entry. `authorization_servers` lists the entries with
 `"advertise": true` (the default), in array order, so an issuer used only by
 machine clients can stay unlisted; at least one entry must be advertised.

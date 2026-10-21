@@ -21,7 +21,8 @@ export interface AuthMiddleware {
   mcpMiddleware: RequestHandler[];
   /**
    * Checks for `GET /readyz`: one named `auth` in google and jwt mode, or
-   * one `auth:<issuer>` per issuer in jwt mode with degraded start.
+   * one `auth:<n>` per issuer (1-based config position) in jwt mode with
+   * degraded start.
    */
   readiness: ReadinessCheck[];
   /** Stop background work (the degraded-start discovery retries). */
@@ -59,8 +60,8 @@ const JWKS_TIMEOUT_MS = 5000;
  * In jwt mode the flag gives every issuer its own retry loader instead.
  * Until an issuer's discovery succeeds, tokens routed to it get 503
  * (`issuer_unavailable`), it is left out of the PRM (503 while no
- * advertised issuer has resolved), and its `auth:<issuer>` readiness check
- * reports `pending`. The other issuers are served meanwhile.
+ * advertised issuer has resolved), and its `auth:<n>` readiness check (n is
+ * the issuer's 1-based position in the config) reports `pending`. The other issuers are served meanwhile.
  */
 export async function authMiddleware(
   cfg: ServerConfig,
@@ -209,8 +210,11 @@ export async function authMiddleware(
         const resolved = advertised.filter((issuer) => loaders.get(issuer)?.current());
         return resolved.length > 0 ? prm(resolved) : undefined;
       });
-      readiness = [...loaders].map(([issuer, loader]) => ({
-        name: `auth:${issuer}`,
+      // Named by 1-based config position, never by URL: /readyz is
+      // unauthenticated and would otherwise reveal `advertise: false`
+      // issuers (R22).
+      readiness = [...loaders.values()].map((loader, index) => ({
+        name: `auth:${index + 1}`,
         check: async () => loader.status(),
       }));
       dispose = () => {

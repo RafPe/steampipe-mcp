@@ -783,8 +783,9 @@ function checkOf(auth: AuthMiddleware, name: string): () => Promise<string> {
   return () => c.check(new AbortController().signal);
 }
 
-async function untilReady(auth: AuthMiddleware, iss: TestIssuer): Promise<void> {
-  const check = checkOf(auth, `auth:${iss.issuer}`);
+/** Wait until the issuer at 1-based config position `n` reports `ready`. */
+async function untilReady(auth: AuthMiddleware, n: number): Promise<void> {
+  const check = checkOf(auth, `auth:${n}`);
   await vi.waitFor(async () => expect(await check()).toBe("ready"));
 }
 
@@ -797,7 +798,7 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED);
     const auth = await buildJwt(cfg, s);
     const port = await startApp(auth, cfg);
-    await untilReady(auth, b);
+    await untilReady(auth, 2);
     await vi.waitFor(() => expect(s.delays).toHaveLength(1)); // A failed once and is waiting
 
     expect((await toolsList(port, await tokenFor(b))).status).toBe(200);
@@ -809,7 +810,7 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     expect(notReady.status).toBe(503);
     expect(JSON.parse(notReady.body)).toEqual({
       status: "not_ready",
-      checks: { db: "ready", [`auth:${a.issuer}`]: "pending", [`auth:${b.issuer}`]: "ready" },
+      checks: { db: "ready", "auth:1": "pending", "auth:2": "ready" },
     });
 
     const prm = await send(port, { method: "GET", path: PRM });
@@ -818,7 +819,7 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
 
     a.setDiscoveryFailing(false);
     await s.release();
-    await untilReady(auth, a);
+    await untilReady(auth, 1);
 
     // No clock movement: a pending issuer's 503s never start a JWKS backoff.
     expect((await toolsList(port, await tokenFor(a))).status).toBe(200);
@@ -827,7 +828,7 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     expect(ready.status).toBe(200);
     expect(JSON.parse(ready.body)).toEqual({
       status: "ready",
-      checks: { db: "ready", [`auth:${a.issuer}`]: "ready", [`auth:${b.issuer}`]: "ready" },
+      checks: { db: "ready", "auth:1": "ready", "auth:2": "ready" },
     });
     const recovered = await send(port, { method: "GET", path: PRM });
     expect(JSON.parse(recovered.body).authorization_servers).toEqual([a.issuer, b.issuer]);
@@ -862,17 +863,35 @@ describe("authMiddleware: jwt with STEAMPIPE_MCP_ALLOW_DEGRADED_START=true", () 
     const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer, advertise: false }], DEGRADED);
     const auth = await buildJwt(cfg, s);
     const port = await startApp(auth, cfg);
-    await untilReady(auth, b);
+    await untilReady(auth, 2);
     expect((await send(port, { method: "GET", path: PRM })).status).toBe(503);
     expect((await toolsList(port, await tokenFor(b))).status).toBe(200);
   });
 
-  it("exposes one auth:<issuer> readiness check per issuer, in config order", async () => {
+  it("never names an issuer in /readyz: checks are auth:<n> by config position (R22)", async () => {
+    const s = manualSleep();
+    const a = await issuerFor();
+    const b = await issuerFor();
+    a.setDiscoveryFailing(true);
+    const cfg = jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer, advertise: false }], DEGRADED);
+    const auth = await buildJwt(cfg, s);
+    const port = await startApp(auth, cfg);
+    await untilReady(auth, 2);
+    const res = await send(port, { method: "GET", path: "/readyz" });
+    expect(res.status).toBe(503);
+    expect(JSON.parse(res.body)).toEqual({ status: "not_ready", checks: { db: "ready", "auth:1": "pending", "auth:2": "ready" } });
+    for (const iss of [a, b]) {
+      expect(res.body).not.toContain(iss.issuer);
+      expect(res.body).not.toContain(new URL(iss.issuer).host);
+    }
+  });
+
+  it("exposes one auth:<n> readiness check per issuer, numbered in config order", async () => {
     const s = manualSleep();
     const a = await issuerFor();
     const b = await issuerFor();
     const auth = await buildJwt(jwtConfig([{ issuer: a.issuer }, { issuer: b.issuer }], DEGRADED), s);
-    expect(auth.readiness.map((c) => c.name)).toEqual([`auth:${a.issuer}`, `auth:${b.issuer}`]);
+    expect(auth.readiness.map((c) => c.name)).toEqual(["auth:1", "auth:2"]);
   });
 
   it("dispose() stops every issuer's discovery loader", async () => {
