@@ -78,7 +78,7 @@ STEAMPIPE_MCP_TRANSPORT=http node dist/index.js
 # Streamable HTTP server listening on http://127.0.0.1:27123/mcp
 ```
 
-Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.2.0` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
+Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.2.1` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
 
 The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string, and `steampipe_query` returns at most `STEAMPIPE_MCP_MAX_ROWS` rows (default `10000`).
 
@@ -118,7 +118,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_AUTH_MODE=token \
   -e STEAMPIPE_MCP_AUTH_TOKEN="$TOKEN" \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.2.0
+  ghcr.io/rafpe/steampipe-mcp:0.2.1
 echo "Token: $TOKEN"   # save this - you'll need it below
 ```
 

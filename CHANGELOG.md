@@ -1,3 +1,9 @@
+## 0.2.1 - 2026-10-21
+
+_Fixes_
+
+* The runtime Docker image upgrades OpenSSL (`libcrypto3`/`libssl3`, CVE-2026-31789) and drops the bundled npm/corepack/yarn, which carried a vulnerable `node-tar` (CVE-2026-59873); the app's own production dependencies never included `tar`. 0.2.0 was tagged but never published: the GHCR release workflow's pre-push Trivy scan correctly blocked it on these two CRITICAL findings.
+
 ## 0.2.0 [2026-10-21]
 
 _Breaking / security defaults_
