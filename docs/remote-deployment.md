@@ -467,14 +467,22 @@ STEAMPIPE_MCP_JWT_ISSUERS='[
   {"issuer": "https://token.actions.githubusercontent.com",
    "audiences": ["https://mcp.example.com/mcp"],
    "profile": "lenient",
-   "subjectPrefixes": ["repo:example-org/"],
+   "requiredClaims": {"repository_owner": ["example-org"]},
    "advertise": false}
 ]'
-# or, instead of subjectPrefixes: "requiredClaims": {"repository_owner": ["example-org"]}
+# or pin the owner by its numeric ID: "requiredClaims": {"repository_owner_id": ["<owner-id>"]}
 ```
 
-Use the trailing `/` in the prefix, so that `repo:example-org-evil/...` does
-not match. `advertise: false` keeps an issuer used only by CI out of the
+Match on `repository_owner` (or the immutable `repository_owner_id`) rather
+than a `sub` prefix: GitHub issues `sub` in two formats,
+`repo:OWNER/REPO:...` and, for new and renamed or transferred repositories,
+the immutable `repo:OWNER@OWNER-ID/REPO@REPO-ID:...`
+([immutable subject claims](https://docs.github.com/en/actions/reference/security/oidc#immutable-subject-claims)),
+so a prefix such as `repo:example-org/` rejects tokens in the second format.
+If you use `subjectPrefixes`, list a prefix for each format your
+repositories use (`repo:example-org/` and `repo:example-org@<owner-id>/`),
+each with the trailing `/` so that `repo:example-org-evil/...` does not
+match. `advertise: false` keeps an issuer used only by CI out of the
 Protected Resource Metadata; the first entry (your interactive issuer, with
 the default profile) stays advertised, since at least one entry must be.
 
@@ -484,12 +492,15 @@ tokens):
 ```sh
 STEAMPIPE_MCP_JWT_ISSUERS='[
   {"issuer": "https://login.microsoftonline.com/<tenant-id>/v2.0",
-   "audiences": ["<App ID URI or client ID your API exposes>"],
+   "audiences": ["<API application (client) ID GUID>"],
    "profile": "lenient",
    "requiredClaims": {"tid": ["<tenant-id>"]}}
 ]'
 ```
 
+In a v2 access token `aud` is the API application's client ID (a GUID), not
+its App ID URI
+([access token claims](https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference)).
 Check the token's `iss` against the configured string byte for byte: Entra
 issues v1-format tokens (with a different `iss`) unless the API's app
 registration asks for v2 tokens. A `tid` rule alone admits every principal in
