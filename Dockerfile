@@ -23,8 +23,33 @@ WORKDIR /app
 # --ignore-scripts: this package's "prepare" script runs "npm run build",
 # which needs typescript (a devDependency) that --omit=dev does not install.
 # The compiled dist/ below already came from the builder stage.
+#
+# After installing, the base image's Alpine packages and bundled package
+# managers are patched/removed in the same layer, as root (USER node is
+# still below):
+#   - A full `apk upgrade` (every installed package, not just
+#     libcrypto3/libssl3) fixes CVE-2026-31789 and also happens to clear the
+#     other fixed-version CVEs already present in the base image (musl,
+#     zlib) at no extra cost; scoping it down would leave those in place for
+#     no real auditability gain, since apk's own changelog already states
+#     exactly which packages moved.
+#   - npm, corepack, npx and yarn are never invoked at runtime (ENTRYPOINT
+#     runs "node" directly) and npm's own install here is already done, so
+#     removing them drops the bundled, vulnerable node-tar copies
+#     (CVE-2026-59873) entirely instead of patching a tool nothing uses.
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+RUN npm ci --omit=dev --ignore-scripts \
+  && npm cache clean --force \
+  && apk upgrade --no-cache \
+  && rm -rf \
+    /usr/local/lib/node_modules/npm \
+    /usr/local/lib/node_modules/corepack \
+    /usr/local/bin/npm \
+    /usr/local/bin/npx \
+    /usr/local/bin/corepack \
+    /opt/yarn-* \
+    /usr/local/bin/yarn \
+    /usr/local/bin/yarnpkg
 
 COPY --from=builder /app/dist ./dist
 
