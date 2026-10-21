@@ -5,6 +5,7 @@ import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
+import { checkPolicy, isEmptyPolicy, PolicyViolation, type IdentityPolicy } from "./policy.js";
 
 export const GOOGLE_ISSUER = "https://accounts.google.com";
 const DEFAULT_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo";
@@ -19,6 +20,8 @@ export interface GoogleVerifierOptions {
   allowedDomains: string[];
   publicUrl: URL;
   tokeninfoUrl?: string;
+  /** Identity policy applied after the allowlist. Absent or empty: none. */
+  policy?: IdentityPolicy;
   /** tokeninfo request timeout. Default 5000. */
   timeoutMs?: number;
   now?: () => number;
@@ -50,6 +53,10 @@ interface TokenInfo {
  * - email unverified, neither the email nor its domain allowlisted, or
  *   admitted only by domain while `hd` names a different domain:
  *   `not_allowed` (403).
+ * - the identity policy, if any, not satisfied: `not_allowed` (403). It runs
+ *   after the allowlist and both must pass. Its claims are the tokeninfo
+ *   fields sub, email, email_verified, hd, aud, azp and scope, as Google
+ *   sent them; its subject is `sub`.
  *
  * Successful results are cached in memory for at most 60s (and never past
  * the token's own expiry), keyed by the token's sha256. Failures are never
@@ -64,6 +71,7 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
   const allowedDomains = new Set(o.allowedDomains.map((d) => d.toLowerCase()));
   // Map iteration order is insertion order, so the first key is the oldest.
   const cache = new Map<string, { info: AuthInfo; until: number }>();
+  const policy = o.policy && !isEmptyPolicy(o.policy) ? o.policy : undefined;
 
   async function lookup(token: string): Promise<TokenInfo> {
     let res: Response;
@@ -126,6 +134,25 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
     return typeof hd === "string" && hd.toLowerCase() === domain;
   }
 
+  function enforcePolicy(p: IdentityPolicy, info: TokenInfo, email: string): void {
+    // Named fields only: nothing else tokeninfo returns (exp, unknown
+    // fields) can satisfy a rule.
+    const { sub, email_verified, hd, aud, azp, scope } = info;
+    const claims = { sub, email: info.email, email_verified, hd, aud, azp, scope };
+    try {
+      // A missing sub is "", which no subject rule admits (R10 refuses
+      // empty entries).
+      checkPolicy(p, claims, typeof sub === "string" ? sub : "");
+    } catch (error) {
+      if (!(error instanceof PolicyViolation)) {
+        throw error;
+      }
+      // The violation names a claim key at most, never a value.
+      logger.debug("Google principal denied by policy", boundForLog(email), error.message);
+      throw new VerifyError("not_allowed", "Principal not allowed");
+    }
+  }
+
   function copy(info: AuthInfo): AuthInfo {
     return { ...info, scopes: [...info.scopes], extra: { ...info.extra } };
   }
@@ -151,6 +178,9 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
       if (info.email_verified !== "true" || !email || !email.includes("@") || !isAllowed(email, info.hd)) {
         logger.debug("Google principal not allowed", boundForLog(email ?? "(no email)"));
         throw new VerifyError("not_allowed", "Principal not allowed");
+      }
+      if (policy) {
+        enforcePolicy(policy, info, email);
       }
       logger.debug("Google principal authenticated", boundForLog(email));
 

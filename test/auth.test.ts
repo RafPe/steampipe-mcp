@@ -474,6 +474,126 @@ describe("authMiddleware: google", () => {
   });
 });
 
+describe("authMiddleware: google identity policy", () => {
+  /** Asserts the policy-denial shape: 403 access_denied, no challenge, no result. */
+  function expectDenied(res: Response): void {
+    expect(res.status).toBe(403);
+    expect(res.headers["www-authenticate"]).toBeUndefined();
+    expect(JSON.parse(res.body)).toMatchObject({ error: "access_denied" });
+    expect(res.body).not.toContain("result");
+  }
+
+  const HD_POLICY = { STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}' };
+
+  it("rejects a token without the required hd claim with 403 access_denied", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ hd: undefined }) } });
+    const port = await startApp(googleConfig(HD_POLICY), `${google.base}/tokeninfo`);
+    expectDenied(await toolsList(port, "t"));
+  });
+
+  it("accepts a token whose hd satisfies REQUIRED_CLAIMS", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ hd: "corp.com" }) } });
+    const port = await startApp(googleConfig(HD_POLICY), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
+  it("compares claim values exactly: hd=Corp.com does not satisfy corp.com", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ hd: "Corp.com" }) } });
+    const port = await startApp(googleConfig(HD_POLICY), `${google.base}/tokeninfo`);
+    expectDenied(await toolsList(port, "t"));
+  });
+
+  it("rejects a sub outside SUBJECT_PREFIXES with 403, and accepts one inside", async () => {
+    const google = await fakeGoogle({ tokens: { two: tokeninfo({ sub: "2345" }), one: tokeninfo({ sub: "1234" }) } });
+    const port = await startApp(
+      googleConfig({ STEAMPIPE_MCP_SUBJECT_PREFIXES: '["1"]' }),
+      `${google.base}/tokeninfo`,
+    );
+    expectDenied(await toolsList(port, "two"));
+    expect((await toolsList(port, "one")).status).toBe(200);
+  });
+
+  it("rejects a token with no sub when a subject rule is set", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ sub: undefined }) } });
+    const port = await startApp(
+      googleConfig({ STEAMPIPE_MCP_SUBJECT_PREFIXES: '["1"]' }),
+      `${google.base}/tokeninfo`,
+    );
+    expectDenied(await toolsList(port, "t"));
+  });
+
+  it("matches ALLOWED_SUBJECTS against sub", async () => {
+    const google = await fakeGoogle({ tokens: { a: tokeninfo({ sub: "1234" }), b: tokeninfo({ sub: "12345" }) } });
+    const port = await startApp(
+      googleConfig({ STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["1234"]' }),
+      `${google.base}/tokeninfo`,
+    );
+    expect((await toolsList(port, "a")).status).toBe(200);
+    expectDenied(await toolsList(port, "b"));
+  });
+
+  it("still requires the allowlist when the policy is satisfied", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ email: "x@evil.com", hd: "corp.com" }) } });
+    const port = await startApp(googleConfig(HD_POLICY), `${google.base}/tokeninfo`);
+    expectDenied(await toolsList(port, "t"));
+  });
+
+  it("exposes the tokeninfo claims sub, email, email_verified, hd, aud, azp and scope", async () => {
+    const info = tokeninfo({ hd: "corp.com" });
+    const body = info.body as Record<string, string>;
+    const claims = Object.fromEntries(
+      ["sub", "email", "email_verified", "hd", "aud", "azp", "scope"].map((k) => [k, [body[k]]]),
+    );
+    const google = await fakeGoogle({ tokens: { t: info } });
+    const port = await startApp(
+      googleConfig({ STEAMPIPE_MCP_REQUIRED_CLAIMS: JSON.stringify(claims) }),
+      `${google.base}/tokeninfo`,
+    );
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
+  it("does not expose exp (or any other tokeninfo field) as a claim", async () => {
+    const info = tokeninfo({ extra_field: "x" });
+    const exp = (info.body as Record<string, string>).exp;
+    const google = await fakeGoogle({ tokens: { e: info, x: info } });
+    const expPort = await startApp(
+      googleConfig({ STEAMPIPE_MCP_REQUIRED_CLAIMS: JSON.stringify({ exp: [exp] }) }),
+      `${google.base}/tokeninfo`,
+    );
+    expectDenied(await toolsList(expPort, "e"));
+    const extraPort = await startApp(
+      googleConfig({ STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"extra_field":["x"]}' }),
+      `${google.base}/tokeninfo`,
+    );
+    expectDenied(await toolsList(extraPort, "x"));
+  });
+
+  it("leaves behaviour unchanged with an empty policy: no hd and any sub are accepted", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ hd: undefined, sub: "2999" }) } });
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    expect((await toolsList(port, "t")).status).toBe(200);
+  });
+
+  it("returns not_allowed from the verifier, with a generic message naming no claim value", async () => {
+    const google = await fakeGoogle({ tokens: { t: tokeninfo({ hd: "rival.com", email: "bob@partner.example" }) } });
+    const v = createGoogleVerifier({
+      clientId: CLIENT,
+      allowedEmails: ["bob@partner.example"],
+      allowedDomains: [],
+      publicUrl: new URL(PUBLIC_URL),
+      tokeninfoUrl: `${google.base}/tokeninfo`,
+      policy: { requiredClaims: { hd: ["corp.com"] }, allowedSubjects: new Set(), subjectPrefixes: [] },
+    });
+    const err = await v.verify("t").then(
+      () => undefined,
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(VerifyError);
+    expect((err as VerifyError).reason).toBe("not_allowed");
+    expect((err as VerifyError).message).not.toContain("rival.com");
+  });
+});
+
 describe("createGoogleVerifier: malformed tokeninfo", () => {
   async function verifierFor(body: unknown, status = 200) {
     const google = await fakeGoogle({ tokens: { t: { status, body } } });

@@ -300,10 +300,19 @@ describe("parsePolicyConfig", () => {
 
 describe("loadConfig wiring", () => {
   const HTTP = { STEAMPIPE_MCP_TRANSPORT: "http" };
+  // A complete google config: the only mode that enforces a policy (R6).
+  const GOOGLE = {
+    ...HTTP,
+    STEAMPIPE_MCP_AUTH_MODE: "google",
+    STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com",
+    STEAMPIPE_MCP_GOOGLE_CLIENT_ID: "client-id",
+    STEAMPIPE_MCP_ALLOWED_DOMAINS: "corp.com",
+  };
+  const TOKEN = { ...HTTP, STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_AUTH_TOKEN: "t".repeat(40) };
 
   it("exposes the parsed policy on ServerConfig in http mode", () => {
     const cfg = loadConfig(
-      { ...HTTP, STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}', STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]' },
+      { ...GOOGLE, STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}', STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]' },
       EMPTY_ARGV,
     );
     expect(cfg.policy).toBeDefined();
@@ -316,7 +325,7 @@ describe("loadConfig wiring", () => {
     expect(cfg.policy).toBeDefined();
     expect(isEmptyPolicy(cfg.policy!)).toBe(true);
     // Control: a configured variable makes it non-empty.
-    const configured = loadConfig({ ...HTTP, STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]' }, EMPTY_ARGV);
+    const configured = loadConfig({ ...GOOGLE, STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]' }, EMPTY_ARGV);
     expect(configured.policy?.allowedSubjects.has("alice")).toBe(true);
   });
 
@@ -332,5 +341,70 @@ describe("loadConfig wiring", () => {
     expect(cfg.policy).toBeUndefined();
     // Control: the same value is parsed, and rejected, in http mode.
     expect(() => loadConfig({ ...HTTP, STEAMPIPE_MCP_ALLOWED_SUBJECTS: "not json" }, EMPTY_ARGV)).toThrow(ConfigError);
+  });
+
+  describe("refuses a policy the auth mode cannot enforce (R6)", () => {
+    /** The ConfigError loadConfig throws; fails the test if it does not throw one. */
+    function configError(env: NodeJS.ProcessEnv): ConfigError {
+      try {
+        loadConfig(env, EMPTY_ARGV);
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConfigError);
+        return error as ConfigError;
+      }
+      throw new Error("expected loadConfig to throw");
+    }
+
+    it("throws for AUTH_MODE=token with REQUIRED_CLAIMS, naming the variable but not its value", () => {
+      const err = configError({ ...TOKEN, STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["sentinel-corp.com"]}' });
+      expect(err.message).toContain("STEAMPIPE_MCP_REQUIRED_CLAIMS");
+      expect(err.message).toContain("STEAMPIPE_MCP_AUTH_MODE");
+      expect(err.message).not.toContain("sentinel-corp.com");
+      expect(err.message).not.toContain("STEAMPIPE_MCP_SUBJECT_PREFIXES");
+    });
+
+    it("throws for AUTH_MODE=none with SUBJECT_PREFIXES, naming the variable", () => {
+      const err = configError({ ...HTTP, STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]' });
+      expect(err.message).toContain("STEAMPIPE_MCP_SUBJECT_PREFIXES");
+      expect(err.message).not.toContain("platform-");
+    });
+
+    it("throws for AUTH_MODE=none with ALLOWED_SUBJECTS, naming every variable that is set", () => {
+      const err = configError({
+        ...HTTP,
+        STEAMPIPE_MCP_AUTH_MODE: "none",
+        STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]',
+        STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}',
+      });
+      expect(err.message).toContain("STEAMPIPE_MCP_ALLOWED_SUBJECTS");
+      expect(err.message).toContain("STEAMPIPE_MCP_REQUIRED_CLAIMS");
+    });
+
+    it("loads a google config with a policy", () => {
+      const cfg = loadConfig(
+        {
+          ...GOOGLE,
+          STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}',
+          STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]',
+          STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]',
+        },
+        EMPTY_ARGV,
+      );
+      expect(cfg.auth.mode).toBe("google");
+      expect(isEmptyPolicy(cfg.policy!)).toBe(false);
+    });
+
+    it("loads token and none modes with no policy set", () => {
+      expect(loadConfig(TOKEN, EMPTY_ARGV).auth.mode).toBe("token");
+      expect(loadConfig(HTTP, EMPTY_ARGV).auth.mode).toBe("none");
+    });
+
+    it("ignores policy variables on stdio, even with AUTH_MODE=token", () => {
+      const env = { STEAMPIPE_MCP_AUTH_MODE: "token", STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"hd":["corp.com"]}' };
+      const cfg = loadConfig(env, EMPTY_ARGV);
+      expect(cfg.policy).toBeUndefined();
+      // Control: the same policy with a valid token config is refused in http mode.
+      expect(() => loadConfig({ ...TOKEN, ...env }, EMPTY_ARGV)).toThrow(ConfigError);
+    });
   });
 });
