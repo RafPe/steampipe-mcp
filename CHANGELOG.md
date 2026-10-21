@@ -9,6 +9,17 @@ _Security_
 
 * Untrusted text written to logs (the audit line's `sub`, `clientId`, `method` and `tool`, HTTP/MCP request error messages, database driver error messages, and the Google principal email at debug level) is now stripped of control, line-separator and bidi characters and capped at 256 characters with a `…(+N)` suffix; the debug-level SQL line gets the same stripping with an 8192-character cap, so a client cannot forge extra log lines or flood the log.
 
+_Behaviour changes_
+
+* HTTP bearer auth now uses the server's own middleware instead of the SDK's `requireBearerAuth`. Every rejection carries a typed reason internally; responses follow RFC 6750.
+* A request with no `Authorization: Bearer` header (or another scheme) gets `401` with a challenge that has no `error` code (RFC 6750 §3.1): `WWW-Authenticate: Bearer resource_metadata="…"` in google mode, and a bare `WWW-Authenticate: Bearer` in token mode. A rejected token still gets `error="invalid_token"`.
+* `WWW-Authenticate` values are escaped and sanitised: quotes, backslashes, control characters (including CR/LF) and non-ASCII are dropped, and `error_description` is capped at 200 characters.
+* Google mode: when tokeninfo is unreachable, times out, or answers `429`/`5xx`, requests get `503 temporarily_unavailable` with `Retry-After: 5` instead of `500`.
+* Google mode: a `401` now carries the scope hint `scope="openid email"`.
+* Google mode: a principal outside the allowlist (or with an unverified email or mismatched `hd`) gets `403 access_denied` with **no** `WWW-Authenticate` challenge, instead of `403 insufficient_scope`, so clients do not loop on scope step-up.
+* Bearer tokens longer than 8192 bytes are rejected with `401` before any verification call.
+* Token mode: the static verifier no longer reports a rolling one-hour `expiresAt`.
+
 ## 0.2.1 [2026-10-21]
 
 _Fixes_

@@ -1,14 +1,10 @@
 import { createHash } from "node:crypto";
-import {
-  InsufficientScopeError,
-  InvalidTokenError,
-  ServerError,
-} from "@modelcontextprotocol/sdk/server/auth/errors.js";
-import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { OAuthMetadataSchema, type OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
+import type { TokenVerifier } from "./bearer.js";
+import { VerifyError } from "./errors.js";
 
 export const GOOGLE_ISSUER = "https://accounts.google.com";
 const DEFAULT_TOKENINFO_URL = "https://oauth2.googleapis.com/tokeninfo";
@@ -23,6 +19,8 @@ export interface GoogleVerifierOptions {
   allowedDomains: string[];
   publicUrl: URL;
   tokeninfoUrl?: string;
+  /** tokeninfo request timeout. Default 5000. */
+  timeoutMs?: number;
   now?: () => number;
 }
 
@@ -41,21 +39,26 @@ interface TokenInfo {
  * Verifier for Google OAuth access tokens. Google access tokens are opaque,
  * so each one is checked against Google's tokeninfo endpoint:
  *
- * - not a 200, issued to another client (`aud` differs from `clientId`; R17:
- *   a matching `azp` alone is not enough), or expired: `InvalidTokenError`
- *   (401).
+ * - tokeninfo unreachable, timed out (headers or body), dropping the
+ *   connection mid-body, or answering 429/5xx: `issuer_unavailable` (503).
+ *   Never accepted.
+ * - any other non-200 (400/401 for a bad token): `invalid`.
+ * - a 200 whose complete body is not a JSON object: `malformed`.
+ * - issued to another client (`aud` differs from `clientId`; R17: a matching
+ *   `azp` alone is not enough): `audience`.
+ * - `exp` absent, non-numeric or past: `expired`.
  * - email unverified, neither the email nor its domain allowlisted, or
  *   admitted only by domain while `hd` names a different domain:
- *   `InsufficientScopeError` (403).
- * - tokeninfo unreachable or timed out: `ServerError` (500). Never accepted.
+ *   `not_allowed` (403).
  *
  * Successful results are cached in memory for at most 60s (and never past
  * the token's own expiry), keyed by the token's sha256. Failures are never
  * cached. Every call returns a fresh copy, so a caller mutating its
  * AuthInfo cannot change what later requests see.
  */
-export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifier {
+export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
   const tokeninfoUrl = o.tokeninfoUrl ?? DEFAULT_TOKENINFO_URL;
+  const timeoutMs = o.timeoutMs ?? GOOGLE_TIMEOUT_MS;
   const now = o.now ?? Date.now;
   const allowedEmails = new Set(o.allowedEmails.map((e) => e.toLowerCase()));
   const allowedDomains = new Set(o.allowedDomains.map((d) => d.toLowerCase()));
@@ -69,24 +72,39 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
       res = await fetch(tokeninfoUrl, {
         method: "POST",
         body: new URLSearchParams({ access_token: token }),
-        signal: AbortSignal.timeout(GOOGLE_TIMEOUT_MS),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       logger.error("Google tokeninfo request failed", error instanceof Error ? error.name : "unknown error");
-      throw new ServerError("Token validation unavailable");
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+    }
+    if (res.status === 429 || res.status >= 500) {
+      logger.error("Google tokeninfo unavailable", `HTTP ${res.status}`);
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
     }
     if (res.status !== 200) {
-      throw new InvalidTokenError("Invalid token");
+      throw new VerifyError("invalid", "Invalid token");
     }
+    // Read and parse separately: the timeout signal also covers the body,
+    // and a stall or dropped connection mid-body is an outage, not a
+    // malformed answer.
+    let text: string;
     try {
-      const body: unknown = await res.json();
-      if (typeof body !== "object" || body === null) {
-        throw new Error("not an object");
-      }
-      return body as TokenInfo;
-    } catch {
-      throw new InvalidTokenError("Invalid token");
+      text = await res.text();
+    } catch (error) {
+      logger.error("Google tokeninfo body read failed", error instanceof Error ? error.name : "unknown error");
+      throw new VerifyError("issuer_unavailable", "Token validation unavailable");
     }
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new VerifyError("malformed", "Invalid token");
+    }
+    if (typeof body !== "object" || body === null || Array.isArray(body)) {
+      throw new VerifyError("malformed", "Invalid token");
+    }
+    return body as TokenInfo;
   }
 
   function isAllowed(email: string, hd: string | undefined): boolean {
@@ -113,7 +131,7 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
   }
 
   return {
-    async verifyAccessToken(token) {
+    async verify(token) {
       const key = createHash("sha256").update(token, "utf8").digest("hex");
       const cached = cache.get(key);
       if (cached && cached.until > now()) {
@@ -123,16 +141,16 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
 
       const info = await lookup(token);
       if (info.aud !== o.clientId) {
-        throw new InvalidTokenError("Token was not issued to this client");
+        throw new VerifyError("audience", "Token was not issued to this client");
       }
       const expMs = Number(info.exp) * 1000;
       if (!Number.isFinite(expMs) || expMs <= now()) {
-        throw new InvalidTokenError("Token has expired");
+        throw new VerifyError("expired", "Token has expired");
       }
       const email = typeof info.email === "string" ? info.email.toLowerCase() : undefined;
       if (info.email_verified !== "true" || !email || !email.includes("@") || !isAllowed(email, info.hd)) {
         logger.debug("Google principal not allowed", boundForLog(email ?? "(no email)"));
-        throw new InsufficientScopeError("principal not allowed");
+        throw new VerifyError("not_allowed", "Principal not allowed");
       }
       logger.debug("Google principal authenticated", boundForLog(email));
 

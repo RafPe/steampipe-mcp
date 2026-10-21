@@ -8,7 +8,7 @@ import {
 import type { AddressInfo } from "node:net";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { InsufficientScopeError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { VerifyError, type Reason } from "../src/auth/errors.js";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import { DatabaseService } from "../src/services/database.js";
 import { buildHttpApp } from "../src/http/app.js";
@@ -63,6 +63,7 @@ const FAKE_GOOGLE_METADATA: OAuthMetadata = {
 let servers: HttpServer[] = [];
 
 afterEach(async () => {
+  for (const s of servers) s.closeAllConnections();
   await Promise.all(servers.map((s) => new Promise((resolve) => s.close(resolve))));
   servers = [];
   vi.restoreAllMocks();
@@ -116,10 +117,11 @@ async function fakeGoogle(opts: {
   return { base: `http://127.0.0.1:${port}`, requests };
 }
 
-async function startApp(cfg: ServerConfig, tokeninfoUrl?: string): Promise<number> {
+async function startApp(cfg: ServerConfig, tokeninfoUrl?: string, tokeninfoTimeoutMs?: number): Promise<number> {
   const { rootRouters, mcpMiddleware } = await authMiddleware(cfg, {
     metadataFetcher: async () => FAKE_GOOGLE_METADATA,
     tokeninfoUrl,
+    tokeninfoTimeoutMs,
   });
   const app = buildHttpApp(cfg, newDb(), mcpMiddleware, rootRouters);
   const server = await new Promise<HttpServer>((resolve) => {
@@ -164,6 +166,17 @@ function toolsList(port: number, token?: string, path = "/mcp"): Promise<Respons
   return send(port, { path, headers, body: TOOLS_LIST });
 }
 
+/** The VerifyError reason a promise rejects with; fails the test otherwise. */
+async function reasonFrom(p: Promise<unknown>): Promise<Reason> {
+  try {
+    await p;
+  } catch (error) {
+    expect(error).toBeInstanceOf(VerifyError);
+    return (error as VerifyError).reason;
+  }
+  throw new Error("expected a rejection");
+}
+
 function nowSec(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -195,7 +208,15 @@ describe("authMiddleware: static token", () => {
     const port = await startApp(tokenConfig());
     const res = await toolsList(port);
     expect(res.status).toBe(401);
-    expect(String(res.headers["www-authenticate"])).toMatch(/^Bearer error="invalid_token"/);
+    // RFC 6750 §3.1: no credentials means no error code. Token mode has no
+    // PRM document, so there is no resource_metadata and no scope either.
+    expect(res.headers["www-authenticate"]).toBe("Bearer");
+  });
+
+  it("answers a wrong token with an invalid_token challenge and no scope hint", async () => {
+    const port = await startApp(tokenConfig());
+    const res = await toolsList(port, "w".repeat(40));
+    expect(res.headers["www-authenticate"]).toBe('Bearer error="invalid_token", error_description="Invalid token"');
   });
 
   it("rejects a wrong token with 401", async () => {
@@ -224,13 +245,10 @@ describe("authMiddleware: static token", () => {
     }
   });
 
-  it("returns static AuthInfo with an expiry the SDK will accept", async () => {
-    const info = await createStaticTokenVerifier(STATIC_TOKEN).verifyAccessToken(STATIC_TOKEN);
-    expect(info).toMatchObject({ token: STATIC_TOKEN, clientId: "static", scopes: [], extra: { sub: "static" } });
-    expect(info.expiresAt).toBeGreaterThan(nowSec());
-    await expect(createStaticTokenVerifier(STATIC_TOKEN).verifyAccessToken("x")).rejects.toBeInstanceOf(
-      InvalidTokenError,
-    );
+  it("returns static AuthInfo with no expiry, and rejects a wrong token as invalid", async () => {
+    const info = await createStaticTokenVerifier(STATIC_TOKEN).verify(STATIC_TOKEN);
+    expect(info).toEqual({ token: STATIC_TOKEN, clientId: "static", scopes: [], extra: { sub: "static" } });
+    await expect(reasonFrom(createStaticTokenVerifier(STATIC_TOKEN).verify("x"))).resolves.toBe("invalid");
   });
 });
 
@@ -240,8 +258,8 @@ describe("authMiddleware: google", () => {
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
     const res = await toolsList(port);
     expect(res.status).toBe(401);
-    expect(String(res.headers["www-authenticate"])).toContain(
-      'resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp"',
+    expect(res.headers["www-authenticate"]).toBe(
+      'Bearer resource_metadata="http://127.0.0.1/.well-known/oauth-protected-resource/mcp", scope="openid email"',
     );
   });
 
@@ -303,19 +321,32 @@ describe("authMiddleware: google", () => {
     expect((await toolsList(port, "garbage")).status).toBe(401);
   });
 
-  it("rejects a non-allowlisted email with 403 insufficient_scope (Review Focus 4)", async () => {
+  it("rejects a non-allowlisted email with 403 access_denied and no challenge", async () => {
     const google = await fakeGoogle({ tokens: { evil: tokeninfo({ email: "x@evil.com" }) } });
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
     const res = await toolsList(port, "evil");
     expect(res.status).toBe(403);
-    expect(String(res.headers["www-authenticate"])).toContain('error="insufficient_scope"');
+    expect(res.headers["www-authenticate"]).toBeUndefined();
+    expect(JSON.parse(res.body)).toMatchObject({ error: "access_denied" });
     expect(res.body).not.toContain("result");
   });
 
-  it("rejects an unverified email with 403 (Review Focus 4)", async () => {
+  it("rejects an unverified email with 403 access_denied and no challenge", async () => {
     const google = await fakeGoogle({ tokens: { unverified: tokeninfo({ email_verified: "false" }) } });
     const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
-    expect((await toolsList(port, "unverified")).status).toBe(403);
+    const res = await toolsList(port, "unverified");
+    expect(res.status).toBe(403);
+    expect(res.headers["www-authenticate"]).toBeUndefined();
+    expect(JSON.parse(res.body)).toMatchObject({ error: "access_denied" });
+  });
+
+  it("adds the scope hint to a rejected-token 401", async () => {
+    const google = await fakeGoogle({});
+    const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+    const res = await toolsList(port, "garbage");
+    expect(res.status).toBe(401);
+    expect(String(res.headers["www-authenticate"])).toMatch(/^Bearer error="invalid_token", /);
+    expect(String(res.headers["www-authenticate"])).toContain('scope="openid email"');
   });
 
   it("does not treat a domain lookalike as allowlisted", async () => {
@@ -393,14 +424,44 @@ describe("authMiddleware: google", () => {
     expect(calls[0].body).toBe("access_token=secret-token-value");
   });
 
-  it("fails closed with 500 when tokeninfo is unreachable", async () => {
+  it("fails closed with 503 when tokeninfo is unreachable", async () => {
     const closed = createNodeServer();
     const closedPort = await listen(closed);
     await new Promise((resolve) => closed.close(resolve));
     servers = servers.filter((s) => s !== closed);
     const port = await startApp(googleConfig(), `http://127.0.0.1:${closedPort}/tokeninfo`);
-    expect((await toolsList(port, "good")).status).toBe(500);
+    const res = await toolsList(port, "good");
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(res.headers["www-authenticate"]).toBeUndefined();
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Token validation unavailable",
+    });
   });
+
+  it("answers 503 when tokeninfo never answers within the timeout", async () => {
+    const hung = createNodeServer(() => {
+      // Never respond.
+    });
+    const hungPort = await listen(hung);
+    const port = await startApp(googleConfig(), `http://127.0.0.1:${hungPort}/tokeninfo`, 50);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("5");
+  });
+
+  for (const status of [503, 429]) {
+    it(`answers 503 when tokeninfo answers ${status}, and never caches it`, async () => {
+      const google = await fakeGoogle({ tokens: { t: { status, body: { error: "busy" } } } });
+      const port = await startApp(googleConfig(), `${google.base}/tokeninfo`);
+      const res = await toolsList(port, "t");
+      expect(res.status).toBe(503);
+      expect(res.headers["retry-after"]).toBe("5");
+      expect((await toolsList(port, "t")).status).toBe(503);
+      expect(google.requests.filter((r) => r.url === "/tokeninfo")).toHaveLength(2);
+    });
+  }
 
   it("fails startup when the Google metadata cannot be fetched", async () => {
     await expect(
@@ -425,35 +486,119 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     });
   }
 
-  it("rejects a missing exp as invalid_token", async () => {
+  it("rejects a missing exp as expired", async () => {
     const v = await verifierFor({ ...(tokeninfo().body as object), exp: undefined });
-    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("expired");
   });
 
-  it("rejects a non-numeric exp as invalid_token", async () => {
+  it("rejects a non-numeric exp as expired", async () => {
     const v = await verifierFor({ ...(tokeninfo().body as object), exp: "soon" });
-    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("expired");
   });
 
-  it("rejects a missing email as insufficient_scope", async () => {
+  it("rejects a past exp as expired", async () => {
+    const v = await verifierFor({ ...(tokeninfo().body as object), exp: String(nowSec() - 10) });
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("expired");
+  });
+
+  it("rejects a missing email as not_allowed", async () => {
     const v = await verifierFor({ ...(tokeninfo().body as object), email: undefined });
-    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InsufficientScopeError);
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("not_allowed");
   });
 
-  it("rejects a non-JSON 200 body as invalid_token", async () => {
-    const v = await verifierFor("not json at all");
-    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
+  it("rejects a non-allowlisted email, an unverified email, and a mismatched hd as not_allowed", async () => {
+    for (const overrides of [{ email: "x@evil.com" }, { email_verified: "false" }, { hd: "other.com" }]) {
+      const v = await verifierFor({ ...(tokeninfo().body as object), ...overrides });
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("not_allowed");
+    }
   });
 
-  it("rejects aud=foreign with azp=ours as invalid_token (R17: aud must be our client)", async () => {
+  for (const body of ["not json at all", "[1,2]", "null", "42"]) {
+    it(`rejects a 200 body of ${body} as malformed`, async () => {
+      const v = await verifierFor(body);
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("malformed");
+    });
+  }
+
+  for (const status of [400, 401, 403, 404]) {
+    it(`rejects tokeninfo ${status} as invalid`, async () => {
+      const v = await verifierFor({ error: "invalid_token" }, status);
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("invalid");
+    });
+  }
+
+  for (const status of [429, 500, 502, 503]) {
+    it(`rejects tokeninfo ${status} as issuer_unavailable`, async () => {
+      const v = await verifierFor({ error: "busy" }, status);
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("issuer_unavailable");
+    });
+  }
+
+  it("rejects aud=foreign with azp=ours as audience (R17: aud must be our client)", async () => {
     const v = await verifierFor({ ...(tokeninfo().body as object), aud: OTHER_CLIENT, azp: CLIENT });
-    await expect(v.verifyAccessToken("t")).rejects.toBeInstanceOf(InvalidTokenError);
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("audience");
+  });
+
+  it("times out a tokeninfo that never answers as issuer_unavailable (injectable timeoutMs)", async () => {
+    const hung = createNodeServer(() => {
+      // Never respond.
+    });
+    const port = await listen(hung);
+    const v = createGoogleVerifier({
+      clientId: CLIENT,
+      allowedEmails: [],
+      allowedDomains: ["corp.com"],
+      publicUrl: new URL(PUBLIC_URL),
+      tokeninfoUrl: `http://127.0.0.1:${port}/tokeninfo`,
+      timeoutMs: 50,
+    });
+    const started = Date.now();
+    await expect(reasonFrom(v.verify("t"))).resolves.toBe("issuer_unavailable");
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  /** A tokeninfo that sends 200 headers and part of a JSON body, then stalls or drops the connection. */
+  async function partialBodyTokeninfo(then: "stall" | "reset"): Promise<string> {
+    const server = createNodeServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "Content-Type": "application/json", "Content-Length": "500" });
+        res.write('{"aud":"');
+        if (then === "reset") setTimeout(() => res.socket?.destroy(), 10);
+      });
+    });
+    return `http://127.0.0.1:${await listen(server)}/tokeninfo`;
+  }
+
+  for (const then of ["stall", "reset"] as const) {
+    it(`classifies a 200 whose body read fails (${then}) as issuer_unavailable, not malformed`, async () => {
+      const v = createGoogleVerifier({
+        clientId: CLIENT,
+        allowedEmails: [],
+        allowedDomains: ["corp.com"],
+        publicUrl: new URL(PUBLIC_URL),
+        tokeninfoUrl: await partialBodyTokeninfo(then),
+        timeoutMs: 50,
+      });
+      await expect(reasonFrom(v.verify("t"))).resolves.toBe("issuer_unavailable");
+    });
+  }
+
+  it("answers 503 issuer_unavailable at the app when tokeninfo stalls mid-body", async () => {
+    const port = await startApp(googleConfig(), await partialBodyTokeninfo("stall"), 50);
+    const res = await toolsList(port, "t");
+    expect(res.status).toBe(503);
+    expect(res.headers["retry-after"]).toBe("5");
+    expect(JSON.parse(res.body)).toEqual({
+      error: "temporarily_unavailable",
+      error_description: "Token validation unavailable",
+    });
   });
 
   it("accepts aud=ours and reports AuthInfo with clientId = aud", async () => {
     const exp = nowSec() + 3600;
     const v = await verifierFor({ ...(tokeninfo().body as object), azp: OTHER_CLIENT, exp: String(exp) });
-    const info = await v.verifyAccessToken("t");
+    const info = await v.verify("t");
     expect(info).toEqual({
       token: "t",
       clientId: CLIENT,
@@ -477,9 +622,9 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
     };
     // First call is a cache miss, the later ones are cache hits: tamper
     // with both kinds of result.
-    tamper(await v.verifyAccessToken("t"));
-    tamper(await v.verifyAccessToken("t"));
-    const third = await v.verifyAccessToken("t");
+    tamper(await v.verify("t"));
+    tamper(await v.verify("t"));
+    const third = await v.verify("t");
     expect(third.clientId).toBe(CLIENT);
     expect(third.scopes).toEqual(["openid", "https://www.googleapis.com/auth/userinfo.email"]);
     expect(third.extra).toEqual({ sub: "1234", email: "a@corp.com" });
@@ -496,12 +641,12 @@ describe("createGoogleVerifier: malformed tokeninfo", () => {
       tokeninfoUrl: `${google.base}/tokeninfo`,
       now: () => clock,
     });
-    await v.verifyAccessToken("t");
+    await v.verify("t");
     clock += 59_000;
-    await v.verifyAccessToken("t");
+    await v.verify("t");
     expect(google.requests).toHaveLength(1);
     clock += 2_000;
-    await v.verifyAccessToken("t");
+    await v.verify("t");
     expect(google.requests).toHaveLength(2);
   });
 });

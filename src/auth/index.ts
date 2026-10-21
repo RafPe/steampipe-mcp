@@ -1,11 +1,11 @@
 import type { RequestHandler } from "express";
-import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import {
   getOAuthProtectedResourceMetadataUrl,
   mcpAuthMetadataRouter,
 } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { ServerConfig } from "../config.js";
+import { bearerAuth } from "./bearer.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "./google.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
 
@@ -20,6 +20,7 @@ export interface AuthMiddleware {
 export interface AuthMiddlewareOptions {
   metadataFetcher?: () => Promise<OAuthMetadata>;
   tokeninfoUrl?: string;
+  tokeninfoTimeoutMs?: number;
 }
 
 /**
@@ -39,7 +40,7 @@ export async function authMiddleware(
     }
     return {
       rootRouters: [],
-      mcpMiddleware: [requireBearerAuth({ verifier: createStaticTokenVerifier(auth.token) })],
+      mcpMiddleware: [bearerAuth({ verifier: createStaticTokenVerifier(auth.token) })],
     };
   }
 
@@ -57,6 +58,7 @@ export async function authMiddleware(
       allowedDomains: auth.allowedDomains,
       publicUrl,
       tokeninfoUrl: opts.tokeninfoUrl,
+      timeoutMs: opts.tokeninfoTimeoutMs,
     });
     return {
       rootRouters: [
@@ -68,10 +70,11 @@ export async function authMiddleware(
         }),
       ],
       mcpMiddleware: [
-        requireBearerAuth({
+        bearerAuth({
           verifier,
-          expectedResource: publicUrl,
+          expectedResource: publicUrl.href,
           resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(publicUrl),
+          challengeScope: ["openid", "email"],
         }),
       ],
     };

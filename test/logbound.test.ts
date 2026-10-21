@@ -4,7 +4,7 @@ import { request as httpRequest, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import type { Request, RequestHandler, Response as ExpressResponse } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { InsufficientScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { VerifyError } from "../src/auth/errors.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { boundForLog } from "../src/services/logbound.js";
 import { auditMiddleware } from "../src/http/audit.js";
@@ -340,7 +340,7 @@ describe("google debug email logs", () => {
 
   it("sanitises the email of an authenticated principal", async () => {
     tokeninfo(`ann${RLO}\n@corp.com`);
-    await verifier().verifyAccessToken("t1");
+    await verifier().verify("t1");
     const lines = linesWith("Google principal authenticated");
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("ann@corp.com");
@@ -349,7 +349,11 @@ describe("google debug email logs", () => {
 
   it("sanitises the email of a principal that is not allowed", async () => {
     tokeninfo(`eve\n[INFO] forged${RLO}@other.com`);
-    await expect(verifier().verifyAccessToken("t2")).rejects.toBeInstanceOf(InsufficientScopeError);
+    const err: unknown = await verifier()
+      .verify("t2")
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(VerifyError);
+    expect((err as VerifyError).reason).toBe("not_allowed");
     const lines = linesWith("Google principal not allowed");
     expect(lines).toHaveLength(1);
     expect(lines[0]).toContain("eve[info] forged@other.com");
