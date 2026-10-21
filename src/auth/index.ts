@@ -7,7 +7,7 @@ import type { ReadinessCheck } from "../http/ready.js";
 import { bearerAuth, type RejectEvent } from "./bearer.js";
 import { discoverJwks } from "./discovery.js";
 import { VerifyError } from "./errors.js";
-import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, guardedFetch, type FetchPolicy } from "./fetch-guard.js";
+import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, FetchRefused, guardedFetch, type FetchPolicy } from "./fetch-guard.js";
 import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
 import { createJwtVerifier, jwksBackoff, reloadOnUnusableKeys } from "./jwt.js";
 import { prmPath, prmRouter, type PrmOptions } from "./prm.js";
@@ -42,6 +42,12 @@ export interface AuthMiddlewareOptions {
 }
 
 const JWKS_TIMEOUT_MS = 5000;
+
+/** `error` with `label: ` before its message, keeping a `FetchRefused` one. */
+function labelled(label: string, error: unknown): Error {
+  const message = `${label}: ${error instanceof Error ? error.message : String(error)}`;
+  return error instanceof FetchRefused ? new FetchRefused(error.cause_, message) : new Error(message);
+}
 
 /**
  * Build the auth layer for `cfg.auth.mode` (R15). In google mode this
@@ -146,6 +152,9 @@ export async function authMiddleware(
         "STEAMPIPE_MCP_PUBLIC_URL and STEAMPIPE_MCP_JWT_ISSUER or STEAMPIPE_MCP_JWT_ISSUERS are required when STEAMPIPE_MCP_AUTH_MODE=jwt",
       );
     }
+    // Diagnostics name an issuer by position (as in `auth:<n>`) and origin,
+    // never its full URL, whose path can carry a tenant ID.
+    const label = (index: number) => `JWT issuer #${index + 1} (${new URL(jwt.issuers[index].issuer).origin})`;
     // Each issuer gets its own fetch policy, discovery and key set. Issuers
     // are operator-configured and trusted; anything an issuer's discovery
     // points at must be on that issuer's host or JWT_ALLOWED_HOSTS.
@@ -187,14 +196,12 @@ export async function authMiddleware(
       // One retry loader per issuer: an issuer that cannot be discovered
       // yet answers 503 and is left out of the PRM, without holding back
       // the others.
-      // Log lines name an issuer by position (as in `auth:<n>`) and origin,
-      // never its full URL, whose path can carry a tenant ID.
       const loaders = new Map(
         jwt.issuers.map(({ issuer }, index) => [
           issuer,
           createRetryLoader((signal) => loadKeys(issuer, signal), {
             ...opts.discoveryRetry,
-            name: `JWT issuer #${index + 1} (${new URL(issuer).origin}) discovery`,
+            name: `${label(index)} discovery`,
           }),
         ]),
       );
@@ -228,7 +235,15 @@ export async function authMiddleware(
       };
     } else {
       keys = new Map(
-        await Promise.all(jwt.issuers.map(async ({ issuer }) => [issuer, await loadKeys(issuer)] as const)),
+        await Promise.all(
+          jwt.issuers.map(async ({ issuer }, index) => {
+            try {
+              return [issuer, await loadKeys(issuer)] as const;
+            } catch (error) {
+              throw labelled(label(index), error);
+            }
+          }),
+        ),
       );
       prmHandler = prmRouter(prm(advertised));
       // Every issuer's discovery already succeeded above.

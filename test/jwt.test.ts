@@ -1278,6 +1278,38 @@ describe("discoverJwks", () => {
     expect(Object.keys(d).sort()).toEqual(["issuer", "jwksUri"]);
   });
 
+  it("names neither discovery URL's path nor query in its errors: status, refusal cause or mismatch only (Codex I-3)", async () => {
+    const issuer = "https://idp.example.com/tenant-secret";
+    const answering = (res: () => Response) => (async () => res()) as unknown as typeof fetch;
+    const cases: Array<[typeof fetch, RegExp]> = [
+      [answering(() => new Response("nope", { status: 404 })), /OpenID Connect metadata answered 404; RFC 8414 metadata answered 404/],
+      [answering(() => new Response("<html>", { status: 200 })), /did not return JSON/],
+      [answering(() => Response.json({ issuer: `${issuer}/other`, jwks_uri: "https://idp.example.com/jwks" })), /names a different issuer/],
+      [
+        (async () => {
+          throw new FetchRefused("network", "request to https://idp.example.com failed");
+        }) as unknown as typeof fetch,
+        /OpenID Connect metadata refused \(network\); RFC 8414 metadata refused \(network\)/,
+      ],
+    ];
+    for (const [fetchImpl, expected] of cases) {
+      const failure = await discoverJwks(issuer, fetchImpl, policyFor(issuer)).catch((e: Error) => e);
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toMatch(/^Issuer discovery failed: /);
+      expect((failure as Error).message).toMatch(expected);
+      expect((failure as Error).message).not.toContain("tenant-secret");
+      expect((failure as Error).message).not.toContain("/.well-known");
+    }
+    // A jwks_uri refusal names its host at most, never the path.
+    const refused = await discoverJwks(
+      issuer,
+      answering(() => Response.json({ issuer, jwks_uri: "https://evil.example/tenant-secret/jwks" })),
+      policyFor(issuer),
+    ).catch((e: Error) => e);
+    expect(refused).toBeInstanceOf(FetchRefused);
+    expect((refused as Error).message).not.toContain("tenant-secret");
+  });
+
   it("rejects when neither discovery document is served", async () => {
     const iss = await issuerFor();
     iss.setDiscoveryFailing(true);

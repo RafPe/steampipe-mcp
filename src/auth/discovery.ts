@@ -14,29 +14,38 @@ export interface JwksDiscovery {
  *   path, so `https://h/tenant` becomes
  *   `https://h/.well-known/oauth-authorization-server/tenant`.
  */
-function discoveryUrls(issuer: string): URL[] {
+function discoveryUrls(issuer: string): Array<{ name: string; url: URL }> {
   const url = new URL(issuer);
   const path = url.pathname.replace(/\/$/, "");
   return [
-    new URL(`${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`),
-    new URL(`${url.origin}/.well-known/oauth-authorization-server${path}`),
+    { name: "OpenID Connect metadata", url: new URL(`${issuer.replace(/\/$/, "")}/.well-known/openid-configuration`) },
+    { name: "RFC 8414 metadata", url: new URL(`${url.origin}/.well-known/oauth-authorization-server${path}`) },
   ];
 }
 
-async function fetchDocument(url: URL, fetchImpl: typeof fetch): Promise<Record<string, unknown>> {
-  const where = `${url.origin}${url.pathname}`;
-  const res = await fetchImpl(url, { headers: { Accept: "application/json" } });
+/**
+ * Fetch one metadata document. Failures name the document by `name` and the
+ * cause by a status, a `FetchRefused` cause or a fixed phrase: never the
+ * URL, whose path can carry a tenant ID.
+ */
+async function fetchDocument(name: string, url: URL, fetchImpl: typeof fetch): Promise<Record<string, unknown>> {
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { headers: { Accept: "application/json" } });
+  } catch (error) {
+    throw new Error(`${name} refused (${error instanceof FetchRefused ? error.cause_ : "fetch error"})`);
+  }
   if (res.status !== 200) {
-    throw new Error(`${where} answered ${res.status}`);
+    throw new Error(`${name} answered ${res.status}`);
   }
   let body: unknown;
   try {
     body = await res.json();
   } catch {
-    throw new Error(`${where} did not return JSON`);
+    throw new Error(`${name} did not return JSON`);
   }
   if (typeof body !== "object" || body === null || Array.isArray(body)) {
-    throw new Error(`${where} did not return a JSON object`);
+    throw new Error(`${name} did not return a JSON object`);
   }
   return body as Record<string, unknown>;
 }
@@ -46,6 +55,9 @@ async function fetchDocument(url: URL, fetchImpl: typeof fetch): Promise<Record<
  * both locations in order (see `discoveryUrls`). A document is used only
  * when its `issuer` equals the configured string exactly; only `issuer` and
  * `jwks_uri` are read, so M2M issuers without interactive endpoints work.
+ *
+ * Errors never contain a URL path or query (see `fetchDocument`); a
+ * `jwks_uri` refusal names its host at most. Callers add which issuer.
  *
  * `jwks_uri` comes from the network and is untrusted: it must parse, use
  * https unless the configured issuer is itself plain http (R15: config only
@@ -62,17 +74,17 @@ export async function discoverJwks(
 ): Promise<JwksDiscovery> {
   const failures: string[] = [];
   let doc: Record<string, unknown> | undefined;
-  for (const url of discoveryUrls(issuer)) {
+  for (const { name, url } of discoveryUrls(issuer)) {
     try {
-      const candidate = await fetchDocument(url, fetchImpl);
+      const candidate = await fetchDocument(name, url, fetchImpl);
       if (candidate.issuer !== issuer) {
-        failures.push(`${url.origin}${url.pathname} names a different issuer`);
+        failures.push(`${name} names a different issuer`);
         continue;
       }
       doc = candidate;
       break;
     } catch (error) {
-      failures.push(error instanceof Error ? error.message : "unknown error");
+      failures.push(error instanceof Error ? error.message : `${name} failed`);
     }
   }
   if (!doc) {
