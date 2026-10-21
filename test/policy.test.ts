@@ -206,9 +206,6 @@ describe("parsePolicyConfig", () => {
   });
 
   it.each<[string, string, string]>([
-    ["invalid JSON in REQUIRED_CLAIMS", RC, `{"hd": ${SENTINEL}`],
-    ["invalid JSON in ALLOWED_SUBJECTS", AS, `[${SENTINEL}`],
-    ["invalid JSON in SUBJECT_PREFIXES", SP, `${SENTINEL}]`],
     ["non-array ALLOWED_SUBJECTS (string)", AS, `"${SENTINEL}"`],
     ["non-array ALLOWED_SUBJECTS (object)", AS, `{"${SENTINEL}":1}`],
     ["non-array SUBJECT_PREFIXES", SP, `{"${SENTINEL}":1}`],
@@ -228,6 +225,19 @@ describe("parsePolicyConfig", () => {
     const err = parseError({ [name]: value });
     expect(err.message).toContain(name);
     expect(err.message).not.toContain(SENTINEL);
+  });
+
+  // V8's JSON.parse message quotes only the first few characters of the
+  // input, so the sentinel here is short enough to appear in full if the
+  // parser's message were ever echoed.
+  it.each<[string, string, string]>([
+    ["REQUIRED_CLAIMS", RC, "{\"a\":ZQX}"],
+    ["ALLOWED_SUBJECTS", AS, "[ZQX"],
+    ["SUBJECT_PREFIXES", SP, "ZQX]"],
+  ])("invalid JSON in %s throws naming the variable without echoing the value", (_name, name, value) => {
+    const err = parseError({ [name]: value });
+    expect(err.message).toContain(name);
+    expect(err.message).not.toContain("ZQX");
   });
 
   describe("length and count limits", () => {
