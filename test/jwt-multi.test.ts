@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { authMiddleware } from "../src/auth/index.js";
 import type { RejectEvent } from "../src/auth/bearer.js";
 import type { Reason } from "../src/auth/errors.js";
 import { peekIssuer } from "../src/auth/issuer-peek.js";
+import { FetchRefused } from "../src/auth/fetch-guard.js";
 import { ConfigError, loadConfig, type ServerConfig } from "../src/config.js";
 import type { DatabaseService } from "../src/services/database.js";
 import { buildHttpApp } from "../src/http/app.js";
@@ -285,6 +286,54 @@ describe("jwt multi-issuer: routing by iss", () => {
     const b = await issuerFor();
     b.setDiscoveryFailing(true);
     await expect(startMulti([{ issuer: a.issuer }, { issuer: b.issuer }])).rejects.toThrow(/discovery/);
+  });
+});
+
+describe("jwt multi-issuer: per-issuer fetch policy", () => {
+  // Two distinct https hosts. The fetch guard admits loopback http whatever
+  // the allowlist, so the 127.0.0.1 test issuers cannot show this; here the
+  // global fetch behind guardedFetch is stubbed, so the real per-issuer
+  // policy is applied to https URLs with no TLS or DNS.
+  const A = "https://a.example";
+  const B = "https://b.example";
+  let fetched: string[] = [];
+
+  beforeEach(() => {
+    fetched = [];
+    vi.stubGlobal("fetch", async (input: string | URL | Request) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      fetched.push(url.href);
+      const issuer = url.origin;
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+      if (url.pathname === "/.well-known/openid-configuration") {
+        // A's discovery points its keys at B's host; B's points at its own.
+        return json({ issuer, jwks_uri: issuer === A ? `${B}/keys` : `${B}/keys-b` });
+      }
+      return json({ keys: [] });
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  async function start(env: Record<string, string> = {}): Promise<void> {
+    const cfg = loadConfig(multiEnv([{ issuer: A }, { issuer: B }], env), ["node", "index.js"]);
+    await authMiddleware(cfg, { now: () => NOW_MS, onReject: () => {} });
+  }
+
+  it("refuses an issuer's jwks_uri on another configured issuer's host, with zero requests to it", async () => {
+    await expect(start()).rejects.toThrow(FetchRefused);
+    await expect(start()).rejects.toThrow(/b\.example/);
+    expect(fetched).toContain(`${A}/.well-known/openid-configuration`);
+    expect(fetched.filter((u) => u.startsWith(`${B}/keys`))).toEqual([]);
+  });
+
+  it("allows it once JWT_ALLOWED_HOSTS lists that host", async () => {
+    await expect(start({ STEAMPIPE_MCP_JWT_ALLOWED_HOSTS: "b.example" })).resolves.toBeUndefined();
+    // Startup validates jwks_uri without fetching keys (they load on first use).
+    expect(fetched.filter((u) => u.startsWith(`${B}/keys`))).toEqual([]);
   });
 });
 
