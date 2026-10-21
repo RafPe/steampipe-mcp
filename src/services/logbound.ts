@@ -37,3 +37,8 @@ export function boundForLog(value: unknown, max = 256): string {
   }
   return `${chars.slice(0, max).join("")}…(+${chars.length - max})`;
 }
+
+/** An error's message (or the value itself), bounded and sanitised for a log line. */
+export function errorText(error: unknown): string {
+  return boundForLog(error instanceof Error ? error.message : error);
+}

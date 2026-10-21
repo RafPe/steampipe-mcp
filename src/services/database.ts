@@ -1,4 +1,4 @@
-import { boundForLog } from "./logbound.js";
+import { errorText } from "./logbound.js";
 import { logger } from "./logger.js";
 import { resolveSsl } from "./ssl.js";
 import { readFileSync } from 'fs';
@@ -87,13 +87,12 @@ export interface UserQueryResult {
   truncated: boolean;
 }
 
+// Connection-string parameters that would override the readiness ping's own
+// timeouts (see ping)
+const PING_TIMEOUT_PARAMS = ['connect_timeout', 'connectionTimeoutMillis', 'query_timeout', 'statement_timeout'];
+
 // Rows fetched per cursor read when reading without a row cap
 const CURSOR_BATCH_SIZE = 1000;
-
-/** Driver error text can echo server- or query-supplied strings, so bound it before logging. */
-function errorText(error: unknown): string {
-  return boundForLog(error instanceof Error ? error.message : error);
-}
 
 export class DatabaseService {
   private pool: PoolType | null = null;
@@ -359,34 +358,62 @@ export class DatabaseService {
    * Readiness probe: connect and run `select 1` on a dedicated, short-lived
    * client - never the pool - so a wedged database cannot hold a pooled
    * connection hostage or queue behind user queries. Connect, query and
-   * statement are each bounded by `timeoutMs`; `end()` is too, after which
-   * the socket is destroyed outright.
+   * statement are each bounded by `timeoutMs`, and connect plus query
+   * together by an independent `timeoutMs` deadline that destroys the
+   * socket; `end()` is bounded too, after which the socket is destroyed
+   * outright.
    */
   async ping(timeoutMs: number): Promise<void> {
     const { max: _max, idleTimeoutMillis: _idle, maxLifetimeSeconds: _life, ...base } = buildPoolConfig(this.opts);
+    // node-postgres merges connection-string parameters over explicit
+    // options, so a URI timeout would silently replace the ones below.
+    const url = new URL(base.connectionString!);
+    for (const param of PING_TIMEOUT_PARAMS) {
+      url.searchParams.delete(param);
+    }
     const client: ClientType = new Client({
       ...base,
+      connectionString: url.toString(),
       connectionTimeoutMillis: timeoutMs,
       query_timeout: timeoutMs,
       statement_timeout: timeoutMs,
     });
+    const destroy = () =>
+      (client as unknown as { connection: { stream: { destroy(): void } } }).connection.stream.destroy();
     // An unhandled 'error' event (e.g. the backend dying mid-ping) would
     // otherwise crash the process; the awaited calls below already reject.
     client.on('error', (err) => logger.debug('Readiness ping client error:', errorText(err)));
+    let deadline: NodeJS.Timeout | undefined;
+    let expired = false;
     try {
-      await client.connect();
-      await client.query('select 1');
+      await Promise.race([
+        (async () => {
+          await client.connect();
+          await client.query('select 1');
+        })(),
+        new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => {
+            expired = true;
+            destroy();
+            reject(new Error('readiness ping timeout expired'));
+          }, timeoutMs);
+        }),
+      ]);
     } catch (error) {
       throw this.connectionError(error);
     } finally {
-      let timer: NodeJS.Timeout | undefined;
-      const ended = await Promise.race([
-        client.end().then(() => true, () => true),
-        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
-      ]);
-      clearTimeout(timer);
-      if (!ended) {
-        (client as unknown as { connection: { stream: { destroy(): void } } }).connection.stream.destroy();
+      clearTimeout(deadline);
+      // Past the deadline the socket is already gone; nothing to end.
+      if (!expired) {
+        let timer: NodeJS.Timeout | undefined;
+        const ended = await Promise.race([
+          client.end().then(() => true, () => true),
+          new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+        ]);
+        clearTimeout(timer);
+        if (!ended) {
+          destroy();
+        }
       }
     }
   }

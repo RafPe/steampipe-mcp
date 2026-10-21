@@ -302,6 +302,53 @@ describe("DatabaseService.ping", () => {
     expect(await settles(closed, 1000)).toBe(true);
   });
 
+  // Final review 0.3.0 #2: pg merges URI params over explicit options, so
+  // long URI timeouts must not stretch the readiness deadline.
+  const LONG_URI_TIMEOUTS = "query_timeout=600000&statement_timeout=600000&connect_timeout=600&connectionTimeoutMillis=600000";
+
+  it("ignores long URI timeouts when the database wedges after connecting, and closes the socket", async () => {
+    const { port, closed } = await fakePg(false);
+    const db = newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable&${LONG_URI_TIMEOUTS}`);
+    const t0 = Date.now();
+    await expect(db.ping(100)).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(await settles(closed, 500)).toBe(true);
+  });
+
+  it("ignores long URI timeouts against a black-hole server, and closes the socket", async () => {
+    let onClose!: () => void;
+    const closed = new Promise<void>((resolve) => (onClose = resolve));
+    const server = createTcpServer((socket) => {
+      heldSockets.push(socket);
+      socket.on("error", () => {});
+      socket.on("close", () => onClose());
+      socket.resume();
+    });
+    tcpServers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const { port } = server.address() as AddressInfo;
+    const db = newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable&${LONG_URI_TIMEOUTS}`);
+    const t0 = Date.now();
+    await expect(db.ping(100)).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(await settles(closed, 500)).toBe(true);
+  });
+
+  it("enforces its own deadline even if the driver's query timeout never fires, and closes the socket", async () => {
+    const { port, closed } = await fakePg(true);
+    vi.spyOn(pg.Client.prototype, "query").mockImplementation(() => new Promise(() => {}));
+    const db = newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable`);
+    const t0 = Date.now();
+    await expect(db.ping(100)).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(await settles(closed, 500)).toBe(true);
+  });
+
+  it("still resolves against an answering database when the URI carries long timeouts", async () => {
+    const { port } = await fakePg(true);
+    await expect(newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable&${LONG_URI_TIMEOUTS}`).ping(500)).resolves.toBeUndefined();
+  });
+
   it("resolves against a database that answers (fake server sanity check)", async () => {
     const { port } = await fakePg(true);
     await expect(newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable`).ping(500)).resolves.toBeUndefined();
