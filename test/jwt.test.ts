@@ -185,6 +185,16 @@ describe("jwt: acceptance and audience", () => {
   });
 });
 
+describe("jwt: readiness and dispose", () => {
+  it("reports an always-ready auth check and a no-op dispose once discovery has succeeded", async () => {
+    const iss = await issuerFor();
+    const mw = await authMiddleware(jwtConfig(iss.issuer), { now: () => NOW_MS });
+    expect(mw.readiness.map((c) => c.name)).toEqual(["auth"]);
+    await expect(mw.readiness[0].check(new AbortController().signal)).resolves.toBe("ready");
+    expect(() => mw.dispose()).not.toThrow();
+  });
+});
+
 describe("jwt: auth_reject audit", () => {
   it("writes an auth_reject line for a refused token by default", async () => {
     const iss = await issuerFor();
