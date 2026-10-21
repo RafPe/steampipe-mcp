@@ -3,6 +3,7 @@
 _What's new_
 
 * Declarative identity policy (`STEAMPIPE_MCP_REQUIRED_CLAIMS`, `STEAMPIPE_MCP_ALLOWED_SUBJECTS`, `STEAMPIPE_MCP_SUBJECT_PREFIXES`): required claim values, an exact subject allowlist, and subject prefixes, parsed and validated at startup in `http` mode. All default to empty (no policy). This release adds the policy core and its configuration only; the verifiers enforce it in a later change.
+* `GET /readyz` readiness probe for HTTP mode, separate from `/healthz` (which still never touches the database). It returns `200 {"status":"ready","checks":{...}}` or `503 {"status":"not_ready","checks":{...}}` with check names and statuses only, answers within about 2 s even when the database is wedged, and coalesces concurrent probes into one evaluation cached for 1 s. The `db` check runs `select 1` on a dedicated short-lived connection bounded at 2 s, never a pooled one. Like `/healthz`, it is exempt from Host/Origin validation so Kubernetes probes work.
 
 _Security_
 

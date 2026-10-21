@@ -13,6 +13,7 @@ import { isLoopback } from "../services/ssl.js";
 import { auditMiddleware } from "./audit.js";
 import { createPreAuthIpLimiter, createRateLimiter, rejectBatch } from "./guards.js";
 import { originValidation } from "./origin.js";
+import { Readiness, readyHandler } from "./ready.js";
 
 function jsonRpcError(status: number, code: number, message: string): { status: number; body: object } {
   return { status, body: { jsonrpc: "2.0", error: { code, message }, id: null } };
@@ -86,7 +87,9 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * shared between requests except the `db` pool.
  *
  * Middleware order: `GET /healthz` first (R14: static, no DB, so probes
- * that send a pod IP or `localhost` as Host still pass), then Host
+ * that send a pod IP or `localhost` as Host still pass), then `GET /readyz`
+ * (bounded and coalesced by `readiness`; reports check names and statuses
+ * only, so it is exempt from Host/Origin checks for the same reason), then Host
  * validation, Origin validation, JSON body parsing (capped at
  * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
  * `/.well-known/*` metadata, still Host/Origin-checked), then on
@@ -104,6 +107,7 @@ export function buildHttpApp(
   db: DatabaseService,
   extraMiddleware: RequestHandler[] = [],
   rootRouters: RequestHandler[] = [],
+  readiness: Readiness = new Readiness(),
 ): Express {
   const { http } = cfg;
   const app = express();
@@ -117,6 +121,7 @@ export function buildHttpApp(
   app.get("/healthz", (_req, res) => {
     res.status(200).json({ status: "ok" });
   });
+  app.get("/readyz", readyHandler(readiness));
 
   const hostCheck = hostValidation(http);
   if (hostCheck) {

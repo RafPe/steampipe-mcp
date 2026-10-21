@@ -80,7 +80,7 @@ STEAMPIPE_MCP_TRANSPORT=http node dist/index.js
 
 Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.2.1` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
 
-The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string, and `steampipe_query` returns at most `STEAMPIPE_MCP_MAX_ROWS` rows (default `10000`).
+The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. `GET /readyz` is the readiness probe: it answers `200 {"status":"ready","checks":{"db":"ready"}}` or `503 {"status":"not_ready","checks":{"db":"failing"}}` (check names and statuses only, never error details), is exempt from the same checks, and always answers within about 2 s. The `db` check runs `select 1` on a dedicated short-lived connection (never one from the query pool), bounded at 2 s; concurrent probes share one evaluation and a result is reused for 1 s. In HTTP mode the `steampipe://status` resource never includes the connection string, and `steampipe_query` returns at most `STEAMPIPE_MCP_MAX_ROWS` rows (default `10000`).
 
 Built-in protections:
 
@@ -148,6 +148,22 @@ Stop the container with a grace period longer than its 10s forced-close
 shutdown timeout, e.g. `docker stop -t 15 steampipe-mcp` (the compose example
 sets `stop_grace_period: 15s` for the same reason; docker/compose's own
 default stop grace period is 10s).
+
+On Kubernetes, use `/healthz` for liveness (it never touches the database,
+so a Steampipe outage does not restart the pod) and `/readyz` for readiness
+(it takes the pod out of the Service while the database is unreachable).
+`/readyz` answers within about 2 s, so keep `timeoutSeconds` at 3 or more:
+
+```yaml
+livenessProbe:
+  httpGet: { path: /healthz, port: 27123 }
+  periodSeconds: 10
+readinessProbe:
+  httpGet: { path: /readyz, port: 27123 }
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+```
 
 See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
 mode, the threat model, and reverse-proxy/TLS guidance (the server itself

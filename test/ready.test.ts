@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import pg from "pg";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import { createServer as createTcpServer, type AddressInfo, type Server as TcpServer, type Socket } from "node:net";
 import { loadConfig, type ServerConfig } from "../src/config.js";
@@ -32,6 +33,7 @@ afterEach(async () => {
   await Promise.all(tcpServers.map((s) => new Promise((resolve) => s.close(resolve))));
   servers = [];
   tcpServers = [];
+  vi.restoreAllMocks();
 });
 
 async function start(readiness: Readiness, cfg: ServerConfig = httpConfig()): Promise<number> {
@@ -233,7 +235,8 @@ describe("DatabaseService.ping", () => {
       heldSockets.push(socket);
       closed.push(new Promise((resolve) => socket.on("close", () => resolve())));
       socket.on("error", () => {});
-      // Hold the socket open and never reply.
+      // Read (so EOF is observed) but hold the socket open and never reply.
+      socket.resume();
     });
     tcpServers.push(server);
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -244,11 +247,71 @@ describe("DatabaseService.ping", () => {
     await expect(db.ping(500)).rejects.toThrow();
     expect(Date.now() - t0).toBeLessThan(1500);
     expect(accepted.length).toBe(1);
-    await Promise.race([
-      Promise.all(closed),
-      delay(1000).then(() => { throw new Error("server never saw its socket closed"); }),
-    ]);
+    const sawClose = await Promise.race([Promise.all(closed).then(() => true), delay(1000).then(() => false)]);
+    expect(sawClose).toBe(true);
     await db.close();
+  });
+
+  /**
+   * Minimal Postgres wire-protocol server: accepts the startup message with
+   * AuthenticationOk + ReadyForQuery, then either answers every query with
+   * an empty result or (`answerQueries: false`) never answers.
+   */
+  async function fakePg(answerQueries: boolean): Promise<{ port: number; closed: Promise<void> }> {
+    let onClose!: () => void;
+    const closed = new Promise<void>((resolve) => (onClose = resolve));
+    const msg = (type: string, body: Buffer) => {
+      const len = Buffer.alloc(4);
+      len.writeInt32BE(body.length + 4);
+      return Buffer.concat([Buffer.from(type), len, body]);
+    };
+    const authOk = msg("R", Buffer.from([0, 0, 0, 0]));
+    const ready = msg("Z", Buffer.from("I"));
+    const server = createTcpServer((socket) => {
+      heldSockets.push(socket);
+      socket.on("error", () => {});
+      socket.on("close", () => onClose());
+      let started = false;
+      socket.on("data", (chunk) => {
+        if (!started) {
+          started = true;
+          socket.write(Buffer.concat([authOk, ready]));
+        } else if (answerQueries && chunk[0] === "Q".charCodeAt(0)) {
+          socket.write(Buffer.concat([msg("C", Buffer.from("SELECT 0\0")), ready]));
+        }
+      });
+    });
+    tcpServers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return { port: (server.address() as AddressInfo).port, closed };
+  }
+
+  const settles = (p: Promise<unknown>, ms: number) =>
+    Promise.race([p.then(() => true), delay(ms).then(() => false)]);
+
+  // Review Focus 5: connected, but the query never comes back.
+  it("rejects within the timeout when the database wedges after connecting, and closes the socket", async () => {
+    const { port, closed } = await fakePg(false);
+    const db = newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable`);
+    const t0 = Date.now();
+    await expect(db.ping(500)).rejects.toThrow();
+    expect(Date.now() - t0).toBeLessThan(1500);
+    expect(await settles(closed, 1000)).toBe(true);
+  });
+
+  it("resolves against a database that answers (fake server sanity check)", async () => {
+    const { port } = await fakePg(true);
+    await expect(newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable`).ping(500)).resolves.toBeUndefined();
+  });
+
+  it("destroys the socket when client.end() does not resolve within the timeout", async () => {
+    const { port, closed } = await fakePg(true);
+    vi.spyOn(pg.Client.prototype, "end").mockImplementation(() => new Promise<void>(() => {}));
+    const db = newDb(`postgresql://u@127.0.0.1:${port}/d?sslmode=disable`);
+    const t0 = Date.now();
+    await expect(db.ping(300)).resolves.toBeUndefined();
+    expect(Date.now() - t0).toBeLessThan(1000);
+    expect(await settles(closed, 1000)).toBe(true);
   });
 
   it("does not create the query pool", async () => {
@@ -257,6 +320,16 @@ describe("DatabaseService.ping", () => {
     expect((db as unknown as { pool: unknown }).pool).toBeNull();
   });
 });
+
+// The local test Postgres has no TLS, and node-postgres does not fall back to
+// plaintext (see test/database.test.ts), so force sslmode=disable.
+function noTlsUrl(): string {
+  const url = new URL(testDbUrl()!);
+  if (!url.searchParams.has("sslmode")) {
+    url.searchParams.set("sslmode", "disable");
+  }
+  return url.toString();
+}
 
 describeDb("DatabaseService.ping (real database)", () => {
   function dbCheck(db: DatabaseService) {
@@ -274,14 +347,14 @@ describeDb("DatabaseService.ping (real database)", () => {
   }
 
   it("resolves against the test database without using the pool", async () => {
-    const db = newDb();
+    const db = newDb(noTlsUrl());
     await expect(db.ping(2000)).resolves.toBeUndefined();
     expect((db as unknown as { pool: unknown }).pool).toBeNull();
     await db.close();
   });
 
   it("reports db ready against the test database", async () => {
-    const db = newDb();
+    const db = newDb(noTlsUrl());
     const r = new Readiness();
     r.register(dbCheck(db));
     const port = await start(r);

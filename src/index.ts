@@ -8,6 +8,7 @@ import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
 import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
 import { buildHttpApp } from "./http/app.js";
+import { Readiness } from "./http/ready.js";
 import { authMiddleware, type AuthMiddleware } from "./auth/index.js";
 import { closeHttpServerGracefully } from "./shutdown.js";
 
@@ -124,7 +125,10 @@ async function startHttp(cfg: ServerConfig, db: DatabaseService) {
   }
   logger.info(`HTTP auth mode: ${cfg.auth.mode}`);
   const { host, port, path } = cfg.http;
-  const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters);
+  const readiness = new Readiness();
+  // A dedicated short-lived client, never the pool (see DatabaseService.ping).
+  readiness.register({ name: "db", check: async () => (await db.ping(2000), "ready") });
+  const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters, readiness);
   const httpServer = await new Promise<HttpServer>((resolve, reject) => {
     const s = app.listen(port, host, (error?: Error) => (error ? reject(error) : resolve(s)));
   });
