@@ -78,7 +78,7 @@ STEAMPIPE_MCP_TRANSPORT=http node dist/index.js
 # Streamable HTTP server listening on http://127.0.0.1:27123/mcp
 ```
 
-Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.3.0` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
+Or run the Docker image `ghcr.io/rafpe/steampipe-mcp:0.3.1` (see [Run as a remote MCP (Docker)](#run-as-a-remote-mcp-docker)). The upstream `npx -y @turbot/steampipe-mcp` package has no HTTP mode.
 
 The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. `GET /readyz` is the readiness probe: it answers `200 {"status":"ready","checks":{"db":"ready"}}` or `503 {"status":"not_ready","checks":{"db":"failing"}}` (check names and statuses only, never error details), is exempt from the same checks, and always answers within about 2 s. The `db` check runs `select 1` on a dedicated short-lived connection (never one from the query pool) with connect and query together bounded by an independent 2 s deadline that destroys the socket and a further 2 s for cleanup, so that connection lives at most about 4 s even when the probe has already answered `failing` (timeout parameters in the database URL, such as `query_timeout` or `statement_timeout`, are stripped from it and cannot extend this); concurrent probes share one evaluation and a result is reused for 1 s. In `google` auth mode `checks` also has an `auth` entry: always `ready`, unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true` and Google's discovery document has not been fetched yet (`pending`). In HTTP mode the `steampipe://status` resource never includes the connection string, and `steampipe_query` returns at most `STEAMPIPE_MCP_MAX_ROWS` rows (default `10000`).
 
@@ -118,7 +118,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_AUTH_MODE=token \
   -e STEAMPIPE_MCP_AUTH_TOKEN="$TOKEN" \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.3.0
+  ghcr.io/rafpe/steampipe-mcp:0.3.1
 echo "Token: $TOKEN"   # save this - you'll need it below
 ```
 

@@ -11,6 +11,12 @@ _Behaviour changes_
 * The audit line gains an `iss` field when the principal has an issuer (jwt mode), bounded like the other token-derived fields.
 * Rejected auth attempts (`auth_reject` audit lines) are now also written in `jwt` mode.
 
+## 0.3.1 [2026-10-21]
+
+_Fixes_
+
+* The multi-arch Docker image builds again. Node no longer runs under QEMU emulation during the build: the TypeScript build and the production `npm ci` run on the build host's own platform, and the per-architecture runtime stage only upgrades Alpine packages, removes npm/corepack/yarn and copies the result in. The build now fails if a production dependency ever gains an install script, a gyp file or a `cpu`/`os`/`libc` restriction, since that output would no longer be the same on every architecture. The release workflow pins the QEMU image (`tonistiigi/binfmt:qemu-v10.0.4`) instead of using `latest`, and CI builds `linux/amd64` and `linux/arm64` on every push and pull request. 0.3.0 was tagged but never published: the release workflow's `linux/arm64` build failed with `SIGILL` (exit 132) while running `npm ci` under QEMU.
+
 ## 0.3.0 [2026-10-21]
 
 _What's new_
