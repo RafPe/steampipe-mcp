@@ -3,8 +3,8 @@ import { logger } from "./logger.js";
 import { resolveSsl } from "./ssl.js";
 import { readFileSync } from 'fs';
 import pkg from 'pg';
-const { Pool } = pkg;
-import type { Pool as PoolType, PoolClient, PoolConfig } from 'pg';
+const { Client, Pool } = pkg;
+import type { Client as ClientType, Pool as PoolType, PoolClient, PoolConfig } from 'pg';
 import Cursor from 'pg-cursor';
 
 export interface DatabaseOptions {
@@ -352,6 +352,42 @@ export class DatabaseService {
       });
     } catch (error) {
       throw this.queryError(error);
+    }
+  }
+
+  /**
+   * Readiness probe: connect and run `select 1` on a dedicated, short-lived
+   * client - never the pool - so a wedged database cannot hold a pooled
+   * connection hostage or queue behind user queries. Connect, query and
+   * statement are each bounded by `timeoutMs`; `end()` is too, after which
+   * the socket is destroyed outright.
+   */
+  async ping(timeoutMs: number): Promise<void> {
+    const { max: _max, idleTimeoutMillis: _idle, maxLifetimeSeconds: _life, ...base } = buildPoolConfig(this.opts);
+    const client: ClientType = new Client({
+      ...base,
+      connectionTimeoutMillis: timeoutMs,
+      query_timeout: timeoutMs,
+      statement_timeout: timeoutMs,
+    });
+    // An unhandled 'error' event (e.g. the backend dying mid-ping) would
+    // otherwise crash the process; the awaited calls below already reject.
+    client.on('error', (err) => logger.debug('Readiness ping client error:', errorText(err)));
+    try {
+      await client.connect();
+      await client.query('select 1');
+    } catch (error) {
+      throw this.connectionError(error);
+    } finally {
+      let timer: NodeJS.Timeout | undefined;
+      const ended = await Promise.race([
+        client.end().then(() => true, () => true),
+        new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+      ]);
+      clearTimeout(timer);
+      if (!ended) {
+        (client as unknown as { connection: { stream: { destroy(): void } } }).connection.stream.destroy();
+      }
     }
   }
 
