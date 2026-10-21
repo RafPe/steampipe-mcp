@@ -19,10 +19,12 @@
     "prepare": "npm run build",
     "prepublishOnly": "npm run clean && npm run build",
     "watch": "tsc --watch",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:db": "node -e \"if(!process.env.TEST_DATABASE_URL){console.error('TEST_DATABASE_URL is required for test:db');process.exit(1)}\" && vitest run"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20"
   },
   "publishConfig": {
     "access": "public"
@@ -44,9 +46,10 @@
     "pg-types": "^4.0.2"
   },
   "devDependencies": {
-    "@types/node": "^20.11.5",
+    "@types/node": "22.20.5",
     "@types/pg": "^8.11.2",
     "shx": "^0.3.4",
-    "typescript": "^5.6.2"
+    "typescript": "^5.6.2",
+    "vitest": "5.0.5"
   }
 }
