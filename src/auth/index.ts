@@ -2,9 +2,11 @@ import type { RequestHandler } from "express";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import type { ServerConfig } from "../config.js";
 import { auditAuthReject } from "../http/audit.js";
+import type { ReadinessCheck } from "../http/ready.js";
 import { bearerAuth } from "./bearer.js";
 import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
-import { prmPath, prmRouter } from "./prm.js";
+import { prmPath, prmRouter, type PrmOptions } from "./prm.js";
+import { createRetryLoader, type RetryLoaderOptions } from "./retry-loader.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
 
 export interface AuthMiddleware {
@@ -12,11 +14,17 @@ export interface AuthMiddleware {
   rootRouters: RequestHandler[];
   /** Guards mounted on `POST {path}` only. */
   mcpMiddleware: RequestHandler[];
+  /** Checks for `GET /readyz` (google mode: one named `auth`). */
+  readiness: ReadinessCheck[];
+  /** Stop background work (the degraded-start discovery retry). */
+  dispose(): void;
 }
 
 /** Test seams: tests never talk to Google. */
 export interface AuthMiddlewareOptions {
-  metadataFetcher?: () => Promise<OAuthMetadata>;
+  metadataFetcher?: (signal?: AbortSignal) => Promise<OAuthMetadata>;
+  /** Retry schedule for degraded start (`sleep` above all). */
+  discoveryRetry?: Omit<RetryLoaderOptions, "name">;
   tokeninfoUrl?: string;
   tokeninfoTimeoutMs?: number;
 }
@@ -26,6 +34,12 @@ export interface AuthMiddlewareOptions {
  * fetches Google's discovery document up front and rejects if that fails,
  * so the server refuses to start when Google is unreachable or answers as
  * another issuer.
+ *
+ * With `cfg.auth.allowDegradedStart` in google mode, discovery instead runs
+ * in the background through a retry loader: the PRM answers 503 with
+ * `Retry-After` and the `auth` readiness check reports `pending` until it
+ * succeeds. Bearer verification works throughout, since tokeninfo does not
+ * depend on discovery.
  */
 export async function authMiddleware(
   cfg: ServerConfig,
@@ -40,6 +54,8 @@ export async function authMiddleware(
     return {
       rootRouters: [],
       mcpMiddleware: [bearerAuth({ verifier: createStaticTokenVerifier(auth.token), onReject: auditAuthReject })],
+      readiness: [],
+      dispose: () => {},
     };
   }
 
@@ -50,7 +66,16 @@ export async function authMiddleware(
         "STEAMPIPE_MCP_PUBLIC_URL and STEAMPIPE_MCP_GOOGLE_CLIENT_ID are required when STEAMPIPE_MCP_AUTH_MODE=google",
       );
     }
-    await (opts.metadataFetcher ?? fetchGoogleMetadata)();
+    const fetchMetadata = opts.metadataFetcher ?? ((signal?: AbortSignal) => fetchGoogleMetadata(undefined, signal));
+    // The PRM resource, the expected token resource and AuthInfo.resource
+    // all use the same canonical href.
+    const resource = publicUrl.href;
+    const prm: PrmOptions = {
+      resource,
+      authorizationServers: [GOOGLE_ISSUER],
+      scopesSupported: ["openid", "email"],
+      resourceName: "Steampipe MCP",
+    };
     const verifier = createGoogleVerifier({
       clientId: auth.googleClientId,
       allowedEmails: auth.allowedEmails,
@@ -60,18 +85,21 @@ export async function authMiddleware(
       tokeninfoUrl: opts.tokeninfoUrl,
       timeoutMs: opts.tokeninfoTimeoutMs,
     });
-    // The PRM resource, the expected token resource and AuthInfo.resource
-    // all use the same canonical href.
-    const resource = publicUrl.href;
+    let prmHandler: RequestHandler;
+    let check: ReadinessCheck;
+    let dispose = () => {};
+    if (auth.allowDegradedStart) {
+      const loader = createRetryLoader(fetchMetadata, { ...opts.discoveryRetry, name: "Google discovery" });
+      prmHandler = prmRouter(() => (loader.current() ? prm : undefined));
+      check = { name: "auth", check: async () => loader.status() };
+      dispose = loader.dispose;
+    } else {
+      await fetchMetadata();
+      prmHandler = prmRouter(prm);
+      check = { name: "auth", check: async () => "ready" };
+    }
     return {
-      rootRouters: [
-        prmRouter({
-          resource,
-          authorizationServers: [GOOGLE_ISSUER],
-          scopesSupported: ["openid", "email"],
-          resourceName: "Steampipe MCP",
-        }),
-      ],
+      rootRouters: [prmHandler],
       mcpMiddleware: [
         bearerAuth({
           verifier,
@@ -81,8 +109,10 @@ export async function authMiddleware(
           onReject: auditAuthReject,
         }),
       ],
+      readiness: [check],
+      dispose,
     };
   }
 
-  return { rootRouters: [], mcpMiddleware: [] };
+  return { rootRouters: [], mcpMiddleware: [], readiness: [], dispose: () => {} };
 }

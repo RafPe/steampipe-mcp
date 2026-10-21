@@ -203,7 +203,8 @@ function tokeninfo(overrides: Record<string, unknown> = {}): { status: number; b
 
 describe("authMiddleware: none", () => {
   it("returns no routers and no MCP middleware", async () => {
-    expect(await authMiddleware(httpConfig())).toEqual({ rootRouters: [], mcpMiddleware: [] });
+    const auth = await authMiddleware(httpConfig());
+    expect(auth).toMatchObject({ rootRouters: [], mcpMiddleware: [], readiness: [] });
   });
 });
 

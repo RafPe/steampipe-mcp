@@ -72,7 +72,11 @@ Steampipe instances or workspaces.
   64 KiB, requests fail closed with `503` `temporarily_unavailable` and
   `Retry-After: 5`. They are never accepted.
   The server also refuses to start if it cannot fetch Google's discovery
-  document.
+  document, unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`. Then it starts
+  anyway and retries discovery in the background; until that succeeds the
+  Protected Resource Metadata answers `503` with `Retry-After: 5` and
+  `/readyz` reports `"auth":"pending"`, while bearer tokens are still
+  verified.
 
 The unauthenticated endpoints are `GET /healthz` (static `{"status":"ok"}`),
 `GET`/`DELETE /mcp` (always `405`), and in google mode the public metadata

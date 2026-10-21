@@ -32,3 +32,35 @@ export function closeHttpServerGracefully(
     });
   });
 }
+
+export interface ShutdownDeps {
+  httpServer?: ClosableHttpServer;
+  auth?: { dispose(): void };
+  db?: { close(): Promise<void> };
+}
+
+/**
+ * The graceful shutdown sequence, returning the process exit code. Auth's
+ * background work (the degraded-start discovery retry) is disposed first,
+ * then HTTP stops accepting requests, then the database pool closes. Only a
+ * failed `db.close()` gives exit code 1; a throwing `dispose()` is ignored
+ * so the rest of the sequence still runs.
+ */
+export async function gracefulShutdown(deps: ShutdownDeps): Promise<number> {
+  try {
+    deps.auth?.dispose();
+  } catch {
+    // Not actionable during shutdown.
+  }
+  if (deps.httpServer) {
+    await closeHttpServerGracefully(deps.httpServer);
+  }
+  if (deps.db) {
+    try {
+      await deps.db.close();
+    } catch {
+      return 1;
+    }
+  }
+  return 0;
+}

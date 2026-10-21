@@ -2,6 +2,7 @@ import { isLoopback } from "./services/ssl.js";
 import type { DatabaseOptions } from "./services/database.js";
 import { parsePolicyConfig, type PolicyConfig } from "./config/policy.js";
 import { isEmptyPolicy } from "./auth/policy.js";
+import { parseDegradedConfig } from "./config/degraded.js";
 
 const PREFIX = "STEAMPIPE_MCP_";
 
@@ -39,6 +40,10 @@ export interface ServerConfig {
     googleClientId?: string;
     allowedEmails: string[];
     allowedDomains: string[];
+    // Google mode: start even when discovery fails, retrying it in the
+    // background (STEAMPIPE_MCP_ALLOW_DEGRADED_START). Parsed in http mode
+    // only; unset means false.
+    allowDegradedStart?: boolean;
   };
   allowInsecureRemote: boolean;
   // Identity policy (REQUIRED_CLAIMS, ALLOWED_SUBJECTS, SUBJECT_PREFIXES),
@@ -309,6 +314,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
   const googleClientId = raw(env, "GOOGLE_CLIENT_ID");
   const allowInsecureRemote = parseBool(env, "ALLOW_INSECURE_REMOTE", false);
   let policy: PolicyConfig | undefined;
+  let allowDegradedStart: boolean | undefined;
 
   // R11: stdio never binds a port or serves auth/PUBLIC_URL, so none of
   // these settings can make stdio unsafe or unable to start. Scope all of
@@ -318,6 +324,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
     assertPublicUrlIsSecure(publicUrl);
     policy = parsePolicyConfig(env);
     assertPolicyEnforceable(policy, authMode);
+    allowDegradedStart = parseDegradedConfig(env).allowDegradedStart;
 
     if (authMode === "token") {
       if (!token || token.length < MIN_AUTH_TOKEN_LENGTH) {
@@ -359,6 +366,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, argv: string[]): ServerConfig
       googleClientId,
       allowedEmails,
       allowedDomains,
+      allowDegradedStart,
     },
     allowInsecureRemote,
     policy,

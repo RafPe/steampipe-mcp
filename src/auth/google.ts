@@ -210,13 +210,20 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): TokenVerifier {
  * policy, redirect, timeout, oversized body, network error) throws
  * `VerifyError("issuer_unavailable")`; otherwise throws unless the answer is
  * a 2xx that parses as RFC 8414 metadata naming Google as its issuer.
+ * `signal` aborts the request (the degraded-start loader's `dispose()`).
  */
-export async function fetchGoogleMetadata(discoveryUrl = DEFAULT_DISCOVERY_URL): Promise<OAuthMetadata> {
+export async function fetchGoogleMetadata(
+  discoveryUrl = DEFAULT_DISCOVERY_URL,
+  signal?: AbortSignal,
+): Promise<OAuthMetadata> {
   let res: Response;
   try {
-    res = await guardedFetch(GOOGLE_FETCH_POLICY)(discoveryUrl);
+    res = await guardedFetch(GOOGLE_FETCH_POLICY)(discoveryUrl, { signal });
   } catch (error) {
-    logger.error("Google discovery request failed", describeFailure(error));
+    // A caller abort (shutdown) is not a discovery failure worth an error line.
+    if (!signal?.aborted) {
+      logger.error("Google discovery request failed", describeFailure(error));
+    }
     throw new VerifyError("issuer_unavailable", "Google discovery document unavailable");
   }
   if (!res.ok) {
