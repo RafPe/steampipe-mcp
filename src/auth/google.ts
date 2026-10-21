@@ -7,6 +7,7 @@ import {
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { OAuthMetadataSchema, type OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { boundForLog } from "../services/logbound.js";
 import { logger } from "../services/logger.js";
 
 export const GOOGLE_ISSUER = "https://accounts.google.com";
@@ -130,10 +131,10 @@ export function createGoogleVerifier(o: GoogleVerifierOptions): OAuthTokenVerifi
       }
       const email = typeof info.email === "string" ? info.email.toLowerCase() : undefined;
       if (info.email_verified !== "true" || !email || !email.includes("@") || !isAllowed(email, info.hd)) {
-        logger.debug("Google principal not allowed", email ?? "(no email)");
+        logger.debug("Google principal not allowed", boundForLog(email ?? "(no email)"));
         throw new InsufficientScopeError("principal not allowed");
       }
-      logger.debug("Google principal authenticated", email);
+      logger.debug("Google principal authenticated", boundForLog(email));
 
       const authInfo: AuthInfo = {
         token,

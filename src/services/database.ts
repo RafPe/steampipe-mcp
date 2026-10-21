@@ -1,3 +1,4 @@
+import { boundForLog } from "./logbound.js";
 import { logger } from "./logger.js";
 import { resolveSsl } from "./ssl.js";
 import { readFileSync } from 'fs';
@@ -89,6 +90,11 @@ export interface UserQueryResult {
 // Rows fetched per cursor read when reading without a row cap
 const CURSOR_BATCH_SIZE = 1000;
 
+/** Driver error text can echo server- or query-supplied strings, so bound it before logging. */
+function errorText(error: unknown): string {
+  return boundForLog(error instanceof Error ? error.message : error);
+}
+
 export class DatabaseService {
   private pool: PoolType | null = null;
   private _isConnected = false;
@@ -149,7 +155,7 @@ export class DatabaseService {
     // restarted) are emitted here. The pool drops the broken client itself and
     // opens a fresh one on the next connect, so only record the state.
     this.pool.on('error', (err) => {
-      logger.error('Unexpected pool error:', err);
+      logger.error('Unexpected pool error:', errorText(err));
       this._isConnected = false;
     });
 
@@ -161,7 +167,7 @@ export class DatabaseService {
    */
   private connectionError(error: unknown): Error {
     // Log the raw error for debugging
-    logger.debug('Database connection error:', error);
+    logger.debug('Database connection error:', errorText(error));
 
     const target = this.target;
     // Raw driver messages can name the host (e.g. "getaddrinfo ENOTFOUND
@@ -232,7 +238,7 @@ export class DatabaseService {
     } catch (error) {
       // Rollback on error
       await client.query('ROLLBACK').catch(rollbackError => {
-        logger.error('Error rolling back transaction:', rollbackError);
+        logger.error('Error rolling back transaction:', errorText(rollbackError));
       });
       throw error;
     } finally {
@@ -240,7 +246,7 @@ export class DatabaseService {
         await client.query('DISCARD ALL');
       } catch (discardError) {
         // Destroy the connection rather than return a dirty session to the pool
-        logger.error('Error resetting session, discarding connection:', discardError);
+        logger.error('Error resetting session, discarding connection:', errorText(discardError));
         releaseError = discardError instanceof Error ? discardError : new Error(String(discardError));
       }
       client.release(releaseError);
@@ -272,7 +278,7 @@ export class DatabaseService {
           this._isConnected = false;
           throw this.connectionError(error);
         }
-        logger.debug('Stale database connection, retrying:', error);
+        logger.debug('Stale database connection, retrying:', errorText(error));
       }
     }
   }

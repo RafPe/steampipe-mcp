@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EventEmitter } from "node:events";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import type { Request, RequestHandler, Response } from "express";
+import type { Request, RequestHandler, Response as ExpressResponse } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { InsufficientScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { boundForLog } from "../src/services/logbound.js";
@@ -108,7 +108,7 @@ describe("boundForLog", () => {
 /** Run the audit middleware against a fake req/res and return the audit JSON. */
 function runAudit(body: unknown): { line: string; event: Record<string, unknown> } {
   const req = { body } as unknown as Request;
-  const res = Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as Response;
+  const res = Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as ExpressResponse;
   auditMiddleware()(req, res, () => {});
   logger.clearLogs();
   (res as unknown as EventEmitter).emit("finish");
