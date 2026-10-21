@@ -1,16 +1,24 @@
 #!/usr/bin/env node
 
+import type { Server as HttpServer } from "node:http";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { DatabaseService } from "./services/database.js";
 import { configureTypeParser } from "./services/database-config.js";
 import { createServer } from "./server.js";
 import { logger } from "./services/logger.js";
+import { ConfigError, loadConfig, type ServerConfig } from "./config.js";
+import { buildHttpApp } from "./http/app.js";
+import { authMiddleware, type AuthMiddleware } from "./auth/index.js";
 
 let serverStartTime: Date;
 
-// Handle graceful shutdown
-function setupShutdownHandlers(db: DatabaseService) {
+// Handle graceful shutdown: stop accepting HTTP requests first (when
+// serving HTTP), then close the database pool.
+function setupShutdownHandlers(db: DatabaseService, httpServer?: HttpServer) {
   const gracefulShutdown = async () => {
+    if (httpServer) {
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
     if (db) {
       try {
         await db.close();
@@ -29,28 +37,44 @@ export function getServerStartTime(): Date {
   return serverStartTime;
 }
 
-export async function startServer(port: number = 27123) {
+export async function startServer() {
   serverStartTime = new Date();
-  logger.info(`Starting server on port ${port}`);
+
+  let cfg: ServerConfig;
+  try {
+    cfg = loadConfig(process.env, process.argv);
+  } catch (error) {
+    if (error instanceof ConfigError) {
+      // Never let a ConfigError's stack or wrapping context leak a secret;
+      // its message alone names the offending env var.
+      console.error(error.message);
+      process.exit(1);
+    }
+    throw error;
+  }
+
+  logger.info(`Starting server (transport=${cfg.transport})`);
 
   try {
     // Configure global type parsers
     configureTypeParser();
 
     // Create the database service (it connects lazily on first query)
-    const argConnectionString = process.argv[2];
-    if (argConnectionString) {
+    if (process.argv[2]) {
       logger.info('Using connection string from command line argument');
     }
     const db = new DatabaseService({
-      connectionString: argConnectionString
-        || process.env.STEAMPIPE_MCP_WORKSPACE_DATABASE
-        || 'postgresql://steampipe@localhost:9193/steampipe',
-      maxRows: 0,
-      statementTimeoutMs: 120000,
-      poolMax: 20,
-      exposeConnectionDetails: true,
+      connectionString: cfg.db.connectionString,
+      maxRows: cfg.db.maxRows,
+      statementTimeoutMs: cfg.db.statementTimeoutMs,
+      poolMax: cfg.db.poolMax,
+      exposeConnectionDetails: cfg.transport === 'stdio',
     });
+
+    if (cfg.transport === 'http') {
+      await startHttp(cfg, db);
+      return;
+    }
 
     // Set up shutdown handlers
     setupShutdownHandlers(db);
@@ -70,12 +94,32 @@ export async function startServer(port: number = 27123) {
     logger.info(`Transport connected successfully (took ${Date.now() - transportStartTime}ms)`);
 
     const totalTime = Date.now() - serverStartTime;
-    logger.info(`Server started successfully on port ${port} (total initialization time: ${totalTime}ms)`);
+    logger.info(`Server started successfully (total initialization time: ${totalTime}ms)`);
   } catch (error) {
     logger.error('Failed to start server:', error);
     throw error;
   }
 }
 
+async function startHttp(cfg: ServerConfig, db: DatabaseService) {
+  let auth: AuthMiddleware;
+  try {
+    auth = await authMiddleware(cfg);
+  } catch (error) {
+    // Fail closed: never serve without the configured auth. The message
+    // names the failure (e.g. Google metadata unreachable), never a token.
+    logger.error(`Failed to initialise STEAMPIPE_MCP_AUTH_MODE=${cfg.auth.mode}:`, error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+  logger.info(`HTTP auth mode: ${cfg.auth.mode}`);
+  const { host, port, path } = cfg.http;
+  const app = buildHttpApp(cfg, db, auth.mcpMiddleware, auth.rootRouters);
+  const httpServer = await new Promise<HttpServer>((resolve, reject) => {
+    const s = app.listen(port, host, (error?: Error) => (error ? reject(error) : resolve(s)));
+  });
+  setupShutdownHandlers(db, httpServer);
+  logger.info(`Streamable HTTP server listening on http://${host.includes(':') ? `[${host}]` : host}:${port}${path}`);
+}
+
 // Start the server
-startServer();
+startServer().catch(() => process.exit(1));

@@ -14,7 +14,7 @@ Works with both local [Steampipe](https://steampipe.io/downloads) installations 
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) v16 or higher (includes `npx`)
+- [Node.js](https://nodejs.org/) v20 or higher (includes `npx`)
 - For local use: [Steampipe](https://steampipe.io/downloads) installed and running (`steampipe service start`)
 - For Turbot Pipes: A [Turbot Pipes](https://turbot.com/pipes) workspace and connection string
 
@@ -63,6 +63,36 @@ To connect to a [Turbot Pipes](https://turbot.com/pipes) workspace instead, add 
 | Cursor | `~/.cursor/mcp.json` | [Cursor MCP Guide →](https://docs.cursor.com/context/model-context-protocol) |
 
 Save the configuration file and restart your AI assistant for the changes to take effect.
+
+### Remote access over HTTP
+
+Besides stdio (the default), the server can serve [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) so clients can reach it over the network:
+
+```sh
+STEAMPIPE_MCP_TRANSPORT=http npx -y @turbot/steampipe-mcp
+# Streamable HTTP server listening on http://127.0.0.1:27123/mcp
+```
+
+The HTTP transport is **stateless**: every `POST /mcp` gets its own MCP server instance and there are no session IDs (no `Mcp-Session-Id` header). `GET` and `DELETE` on the MCP path return `405`, and `GET /healthz` returns `{"status":"ok"}` without touching the database; it is exempt from the Origin and Host checks below so container and Kubernetes health probes work. In HTTP mode the `steampipe://status` resource never includes the connection string.
+
+Built-in protections:
+
+- **Loopback by default.** The server binds `127.0.0.1`. Binding a non-loopback address without auth is refused unless `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE=true`.
+- **Origin validation (always on).** A request with an `Origin` header that is not exactly listed in `STEAMPIPE_MCP_ALLOWED_ORIGINS` gets `403`. Requests without an `Origin` header (non-browser clients) pass. `Origin: null` is rejected unless the literal `null` is listed.
+- **Host validation (DNS rebinding).** On a loopback bind only `localhost`, `127.0.0.1` and `[::1]` are accepted as `Host`. On a non-loopback bind the `Host` hostname must be in `STEAMPIPE_MCP_ALLOWED_HOSTS`, or else match the hostname of `STEAMPIPE_MCP_PUBLIC_URL`; if neither is set, Host validation is skipped and a warning is logged at startup.
+- **Body size cap.** Request bodies larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` get `413`; bodies that are not `application/json` get `415`.
+- **Authentication.** `STEAMPIPE_MCP_AUTH_MODE=token` requires a static bearer token; `STEAMPIPE_MCP_AUTH_MODE=google` accepts Google OAuth access tokens for allowlisted users. See [docs/remote-deployment.md](docs/remote-deployment.md).
+
+Quick check with curl (clients must accept both `application/json` and `text/event-stream`):
+
+```sh
+curl -s http://127.0.0.1:27123/mcp \
+  -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+```
+
+When connecting from a browser-based client such as the MCP Inspector in direct mode, add its origin to `STEAMPIPE_MCP_ALLOWED_ORIGINS` (or use the Inspector's proxy mode).
 
 ## Prompting Guide
 
@@ -206,6 +236,27 @@ The following environment variables can be used to configure the MCP server:
 
 - `STEAMPIPE_MCP_LOG_LEVEL`: Control server logging verbosity (default: `info`)
 - `STEAMPIPE_MCP_WORKSPACE_DATABASE`: Override the default Steampipe connection string (default: `postgresql://steampipe@localhost:9193/steampipe`)
+
+HTTP transport settings (only read when `STEAMPIPE_MCP_TRANSPORT=http`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `STEAMPIPE_MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
+| `STEAMPIPE_MCP_HTTP_HOST` | `127.0.0.1` | Address to bind |
+| `STEAMPIPE_MCP_HTTP_PORT` | `27123` | Port to bind |
+| `STEAMPIPE_MCP_HTTP_PATH` | `/mcp` | Path of the MCP endpoint |
+| `STEAMPIPE_MCP_PUBLIC_URL` | _(unset)_ | Public URL clients use (must be `https` unless loopback); its hostname is the Host-validation fallback |
+| `STEAMPIPE_MCP_ALLOWED_ORIGINS` | _(empty)_ | Comma-separated exact `Origin` values to accept; any other present `Origin` gets `403` |
+| `STEAMPIPE_MCP_ALLOWED_HOSTS` | _(empty)_ | Comma-separated hostnames accepted in the `Host` header on a non-loopback bind (ports and case are ignored) |
+| `STEAMPIPE_MCP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes; larger bodies get `413` |
+| `STEAMPIPE_MCP_RATE_LIMIT_PER_MIN` | `60` | Per-principal (authenticated `sub`, or client IP in `none` mode) requests per rolling 60s window; over-limit requests get `429`. A coarser, IP-only limit at 10x this value also applies ahead of auth, so an unauthenticated flood can't reach the token verifier |
+| `STEAMPIPE_MCP_TRUST_PROXY` | _(unset)_ | Passed to Express's `trust proxy` setting (a hop count, or `true`) so rate limiting sees the real client IP behind a reverse proxy. Only set this when every request actually goes through that trusted proxy: it makes `X-Forwarded-For` authoritative, so setting it without one lets a client spoof its own rate-limit key and bypass the limit |
+| `STEAMPIPE_MCP_ALLOW_INSECURE_REMOTE` | `false` | Allow a non-loopback bind without auth (not recommended) |
+| `STEAMPIPE_MCP_AUTH_MODE` | `none` | `none`, `token`, or `google` ([docs/remote-deployment.md](docs/remote-deployment.md)) |
+| `STEAMPIPE_MCP_AUTH_TOKEN` | _(unset)_ | Static bearer token, at least 32 characters (`token` mode) |
+| `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` | _(unset)_ | Google OAuth client ID that tokens must be issued to (`google` mode) |
+| `STEAMPIPE_MCP_ALLOWED_EMAILS` | _(empty)_ | Comma-separated emails allowed in `google` mode (case-insensitive) |
+| `STEAMPIPE_MCP_ALLOWED_DOMAINS` | _(empty)_ | Comma-separated email domains allowed in `google` mode (case-insensitive). Only a membership boundary with an Internal consent screen on Google Workspace; with External, use `ALLOWED_EMAILS` ([details](docs/remote-deployment.md#allowed_domains-is-only-a-boundary-with-an-internal-consent-screen)) |
 
 ## Open Source & Contributing
 
