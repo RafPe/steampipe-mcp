@@ -57,6 +57,7 @@ export async function authMiddleware(
       allowedEmails: auth.allowedEmails,
       allowedDomains: auth.allowedDomains,
       publicUrl,
+      policy: cfg.policy,
       tokeninfoUrl: opts.tokeninfoUrl,
       timeoutMs: opts.tokeninfoTimeoutMs,
     });
