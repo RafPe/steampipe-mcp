@@ -327,6 +327,10 @@ HTTP transport settings. Some are validated in every mode, so a malformed value 
 | `STEAMPIPE_MCP_ALLOWED_SUBJECTS` | _(empty)_ | Identity policy: a JSON array of exact subjects (`sub`) allowed, at most 1024 entries. Each entry must be 1 to 256 characters; an empty string `""` is rejected at startup |
 | `STEAMPIPE_MCP_SUBJECT_PREFIXES` | _(empty)_ | Identity policy: a JSON array of subject prefixes allowed, at most 64 entries (prefix `"platform-"` does not admit `"platform"`). A subject passes when it is on `ALLOWED_SUBJECTS` or starts with a prefix; when both are empty, any subject passes. No regex is supported. Each entry must be 1 to 256 characters; an empty string `""` is rejected at startup, since it would match every subject. All three policy variables default to empty, meaning no policy, and are read in `http` mode only |
 
+### Logging
+
+Logs go to stderr. Values in log lines that come from clients, tokens, or the database (the audit line's `sub`, `clientId`, `method` and `tool`, request and driver error messages, and the Google principal email at debug level) are sanitised: control, line-separator and bidi characters are stripped, and each value is capped at 256 characters, with a `…(+N)` suffix giving the number of characters cut. The debug-level SQL line is sanitised the same way, with a cap of 8192 characters.
+
 ## Open Source & Contributing
 
 This repository is published under the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0). Please see our [code of conduct](https://github.com/turbot/.github/blob/main/CODE_OF_CONDUCT.md). We look forward to collaborating with you!

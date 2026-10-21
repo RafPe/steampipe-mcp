@@ -6,6 +6,23 @@
 const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]/g;
 
 /**
+ * `String(value)`, falling back to `Object.prototype.toString` (e.g. for a
+ * null-prototype object) and then to a constant (e.g. for a revoked Proxy,
+ * on which both throw).
+ */
+function toText(value: unknown): string {
+  try {
+    return String(value);
+  } catch {
+    try {
+      return Object.prototype.toString.call(value);
+    } catch {
+      return "[unprintable]";
+    }
+  }
+}
+
+/**
  * Make untrusted text safe to put in a log line: non-strings go through
  * `String()`, unsafe characters are stripped, and the result is cut to `max`
  * code points (so a surrogate pair is never split), with `…(+N)` appended
@@ -14,13 +31,7 @@ const UNSAFE_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066
  * inside error handlers.
  */
 export function boundForLog(value: unknown, max = 256): string {
-  let text: string;
-  try {
-    text = String(value);
-  } catch {
-    text = Object.prototype.toString.call(value);
-  }
-  const chars = Array.from(text.replace(UNSAFE_CHARS, ""));
+  const chars = Array.from(toText(value).replace(UNSAFE_CHARS, ""));
   if (chars.length <= max) {
     return chars.join("");
   }

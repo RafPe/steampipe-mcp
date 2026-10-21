@@ -104,6 +104,13 @@ describe("boundForLog", () => {
   it("does not throw for a value String() cannot convert", () => {
     expect(() => boundForLog(Object.create(null))).not.toThrow();
   });
+
+  it("returns a constant fallback for a value no conversion can handle", () => {
+    // A revoked Proxy makes both String() and Object.prototype.toString throw.
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    expect(boundForLog(proxy)).toBe("[unprintable]");
+  });
 });
 
 /** Run the audit middleware against a fake req/res and return the audit JSON. */
