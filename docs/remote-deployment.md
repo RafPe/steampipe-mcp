@@ -399,7 +399,15 @@ A token is accepted only if all of these hold:
   present, with `sub` a string of 1 to 256 characters.
 
 A rejected token gets `401` with `error="invalid_token"`. If the JWKS cannot
-be fetched, requests get `503` with `Retry-After: 5`.
+be fetched, requests get `503` with `Retry-After: 5`. After a failed JWKS fetch
+(a connection error, a timeout, a non-`200` answer, or a `200` that is not a
+JSON key set) the server backs off for that issuer: for 1 s, doubling after each
+further failure up to 60 s, requests that would need a JWKS fetch get `503` at
+once without contacting the issuer, then the next such request tries again. A
+successful fetch ends the backoff. Tokens whose key is cached are not affected
+while the cached JWKS is fresh (10 minutes after the last successful fetch);
+once it is stale, every request needs a refetch and gets `503` until the JWKS
+is back.
 
 **Key rotation.** The JWKS is cached. A token whose `kid` is not in the cache
 triggers a refetch, at most once per `STEAMPIPE_MCP_JWT_JWKS_COOLDOWN_S`
@@ -434,6 +442,15 @@ token claiming one issuer but signed by another fails its signature check. A
 token whose `iss` matches no entry is refused (`401`) without any network call.
 Every issuer is discovered at startup, each with its own fetch policy (its own
 host plus `STEAMPIPE_MCP_JWT_ALLOWED_HOSTS`), and the server refuses to start if
-any discovery fails. `authorization_servers` lists the entries with
+any discovery fails, unless `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`. Then it
+starts anyway and retries each failed issuer's discovery in the background (1 s
+doubling to 60 s, ±20% jitter). Until an issuer has been discovered, its tokens
+get `503` with `Retry-After: 5`, it is left out of `authorization_servers` (the
+metadata answers `503` while no advertised issuer has been discovered), and
+`/readyz` reports `"auth:<n>":"pending"`; the other issuers are served
+meanwhile. `<n>` is the issuer's 1-based position in the array (`auth:1` is the
+first entry), never its URL, so the unauthenticated `/readyz` does not reveal
+`"advertise": false` issuers. With the flag on, `/readyz` has one `auth:<n>`
+entry per configured issuer instead of the single `auth` entry. `authorization_servers` lists the entries with
 `"advertise": true` (the default), in array order, so an issuer used only by
 machine clients can stay unlisted; at least one entry must be advertised.

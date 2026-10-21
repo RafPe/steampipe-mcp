@@ -1,14 +1,15 @@
 import type { RequestHandler } from "express";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { createRemoteJWKSet, customFetch } from "jose";
+import { createRemoteJWKSet, customFetch, type JWTVerifyGetKey } from "jose";
 import type { ServerConfig } from "../config.js";
 import { auditAuthReject } from "../http/audit.js";
 import type { ReadinessCheck } from "../http/ready.js";
 import { bearerAuth, type RejectEvent } from "./bearer.js";
 import { discoverJwks } from "./discovery.js";
+import { VerifyError } from "./errors.js";
 import { DEFAULT_MAX_BYTES, DEFAULT_TIMEOUT_MS, guardedFetch, type FetchPolicy } from "./fetch-guard.js";
 import { createGoogleVerifier, fetchGoogleMetadata, GOOGLE_ISSUER } from "./google.js";
-import { createJwtVerifier } from "./jwt.js";
+import { createJwtVerifier, jwksBackoff } from "./jwt.js";
 import { prmPath, prmRouter, type PrmOptions } from "./prm.js";
 import { createRetryLoader, type RetryLoaderOptions } from "./retry-loader.js";
 import { createStaticTokenVerifier } from "./verifiers.js";
@@ -18,9 +19,13 @@ export interface AuthMiddleware {
   rootRouters: RequestHandler[];
   /** Guards mounted on `POST {path}` only. */
   mcpMiddleware: RequestHandler[];
-  /** Checks for `GET /readyz` (google mode: one named `auth`). */
+  /**
+   * Checks for `GET /readyz`: one named `auth` in google and jwt mode, or
+   * one `auth:<n>` per issuer (1-based config position) in jwt mode with
+   * degraded start.
+   */
   readiness: ReadinessCheck[];
-  /** Stop background work (the degraded-start discovery retry). */
+  /** Stop background work (the degraded-start discovery retries). */
   dispose(): void;
 }
 
@@ -31,7 +36,7 @@ export interface AuthMiddlewareOptions {
   discoveryRetry?: Omit<RetryLoaderOptions, "name">;
   tokeninfoUrl?: string;
   tokeninfoTimeoutMs?: number;
-  /** Clock for JWT time checks (ms). Default `Date.now`. */
+  /** Clock for JWT time checks and the JWKS backoff (ms). Default `Date.now`. */
   now?: () => number;
   onReject?: (e: RejectEvent) => void;
 }
@@ -51,6 +56,12 @@ const JWKS_TIMEOUT_MS = 5000;
  * `Retry-After` and the `auth` readiness check reports `pending` until it
  * succeeds. Bearer verification works throughout, since tokeninfo does not
  * depend on discovery.
+ *
+ * In jwt mode the flag gives every issuer its own retry loader instead.
+ * Until an issuer's discovery succeeds, tokens routed to it get 503
+ * (`issuer_unavailable`), it is left out of the PRM (503 while no
+ * advertised issuer has resolved), and its `auth:<n>` readiness check (n is
+ * the issuer's 1-based position in the config) reports `pending`. The other issuers are served meanwhile.
  */
 export async function authMiddleware(
   cfg: ServerConfig,
@@ -138,40 +149,88 @@ export async function authMiddleware(
     // Each issuer gets its own fetch policy, discovery and key set. Issuers
     // are operator-configured and trusted; anything an issuer's discovery
     // points at must be on that issuer's host or JWT_ALLOWED_HOSTS.
-    const keys = new Map(
-      await Promise.all(
-        jwt.issuers.map(async ({ issuer }) => {
-          const policy: FetchPolicy = {
-            allowedHosts: [new URL(issuer).hostname, ...jwt.allowedHosts],
-            insecureAuthorities: [],
-            timeoutMs: DEFAULT_TIMEOUT_MS,
-            maxBytes: DEFAULT_MAX_BYTES,
-          };
-          const fetchImpl = guardedFetch(policy);
-          const { jwksUri } = await discoverJwks(issuer, fetchImpl, policy);
-          const getKey = createRemoteJWKSet(jwksUri, {
-            timeoutDuration: JWKS_TIMEOUT_MS,
-            cooldownDuration: jwt.jwksCooldownS * 1000,
-            [customFetch]: fetchImpl,
-          });
-          return [issuer, getKey] as const;
-        }),
-      ),
-    );
-    const verifier = createJwtVerifier({ issuers: jwt.issuers, policy: cfg.policy, publicUrl, keys, now: opts.now });
+    const loadKeys = async (issuer: string, signal?: AbortSignal): Promise<JWTVerifyGetKey> => {
+      const policy: FetchPolicy = {
+        allowedHosts: [new URL(issuer).hostname, ...jwt.allowedHosts],
+        insecureAuthorities: [],
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        maxBytes: DEFAULT_MAX_BYTES,
+      };
+      const fetchImpl = guardedFetch(policy);
+      const discoveryFetch: typeof fetch = signal ? (input, init) => fetchImpl(input, { ...init, signal }) : fetchImpl;
+      const { jwksUri } = await discoverJwks(issuer, discoveryFetch, policy);
+      return createRemoteJWKSet(jwksUri, {
+        timeoutDuration: JWKS_TIMEOUT_MS,
+        cooldownDuration: jwt.jwksCooldownS * 1000,
+        [customFetch]: jwksBackoff(fetchImpl, opts.now),
+      });
+    };
     // Same canonical href for the PRM resource, the expected token
     // resource and the default audience (R12).
     const resource = publicUrl.href;
+    const prm = (authorizationServers: string[]): PrmOptions => ({
+      resource,
+      authorizationServers,
+      ...(jwt.scopesSupported.length > 0 && { scopesSupported: jwt.scopesSupported }),
+      resourceName: "Steampipe MCP",
+    });
+    // Advertised issuers only, in config order (config guarantees one).
+    const advertised = jwt.issuers.filter((i) => i.advertise).map((i) => i.issuer);
+
+    let keys: Map<string, JWTVerifyGetKey>;
+    let prmHandler: RequestHandler;
+    let readiness: ReadinessCheck[];
+    let dispose = () => {};
+    if (auth.allowDegradedStart) {
+      // One retry loader per issuer: an issuer that cannot be discovered
+      // yet answers 503 and is left out of the PRM, without holding back
+      // the others.
+      const loaders = new Map(
+        jwt.issuers.map(({ issuer }) => [
+          issuer,
+          createRetryLoader((signal) => loadKeys(issuer, signal), {
+            ...opts.discoveryRetry,
+            name: `JWT issuer ${issuer} discovery`,
+          }),
+        ]),
+      );
+      keys = new Map(
+        [...loaders].map(([issuer, loader]) => [
+          issuer,
+          (header, token) => {
+            const getKey = loader.current();
+            if (!getKey) {
+              throw new VerifyError("issuer_unavailable", "Token validation unavailable");
+            }
+            return getKey(header, token);
+          },
+        ]),
+      );
+      prmHandler = prmRouter(() => {
+        const resolved = advertised.filter((issuer) => loaders.get(issuer)?.current());
+        return resolved.length > 0 ? prm(resolved) : undefined;
+      });
+      // Named by 1-based config position, never by URL: /readyz is
+      // unauthenticated and would otherwise reveal `advertise: false`
+      // issuers (R22).
+      readiness = [...loaders.values()].map((loader, index) => ({
+        name: `auth:${index + 1}`,
+        check: async () => loader.status(),
+      }));
+      dispose = () => {
+        for (const loader of loaders.values()) loader.dispose();
+      };
+    } else {
+      keys = new Map(
+        await Promise.all(jwt.issuers.map(async ({ issuer }) => [issuer, await loadKeys(issuer)] as const)),
+      );
+      prmHandler = prmRouter(prm(advertised));
+      // Every issuer's discovery already succeeded above.
+      readiness = [{ name: "auth", check: async () => "ready" }];
+    }
+    const verifier = createJwtVerifier({ issuers: jwt.issuers, policy: cfg.policy, publicUrl, keys, now: opts.now });
     return {
-      rootRouters: [
-        prmRouter({
-          resource,
-          // Advertised issuers only, in config order (config guarantees one).
-          authorizationServers: jwt.issuers.filter((i) => i.advertise).map((i) => i.issuer),
-          ...(jwt.scopesSupported.length > 0 && { scopesSupported: jwt.scopesSupported }),
-          resourceName: "Steampipe MCP",
-        }),
-      ],
+      rootRouters: [prmHandler],
       mcpMiddleware: [
         bearerAuth({
           verifier,
@@ -181,9 +240,8 @@ export async function authMiddleware(
           onReject: opts.onReject ?? auditAuthReject,
         }),
       ],
-      // Discovery already succeeded above; degraded start for jwt is T12.
-      readiness: [{ name: "auth", check: async () => "ready" }],
-      dispose: () => {},
+      readiness,
+      dispose,
     };
   }
 
