@@ -106,7 +106,7 @@ function guardKeys(getKey: JWTVerifyGetKey): JWTVerifyGetKey {
  * in a backoff (R16). jose retries a cold or stale cache on every request,
  * so without this each request during a JWKS outage would wait for its own
  * failing fetch. After a failure (a throw, a non-200 answer, or a 200 whose
- * body is not a JSON object with a `keys` array) every call is refused with
+ * body is not a JSON object with a `keys` array of objects) every call is refused with
  * `issuer_unavailable` and no network I/O until a window has passed: 1 s, doubling after each further failure up to 60 s (the retry
  * loader's schedule, without jitter). The first call after the window
  * fetches again (jose merges concurrent reloads into that one); a usable 200
@@ -145,15 +145,15 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
       failed(error instanceof FetchRefused ? error.cause_ : "fetch error");
       throw error;
     }
-    // A 200 counts only if jose can use it: a JSON object with a `keys`
-    // array. Anything else fails in jose as `issuer_unavailable` too, so it
-    // backs off like an error status. The guarded fetch buffers the body,
-    // so the clone costs no network I/O.
+    // A 200 counts only if jose can use it: a JSON object whose `keys` is an
+    // array of objects. Anything else fails in jose as `issuer_unavailable`
+    // too, so it backs off like an error status. The guarded fetch buffers
+    // the body, so the clone costs no network I/O.
     let usable = false;
     if (res.status === 200) {
       try {
         const body: unknown = await res.clone().json();
-        usable = typeof body === "object" && body !== null && Array.isArray((body as { keys?: unknown }).keys);
+        usable = isObject(body) && Array.isArray(body.keys) && body.keys.every(isObject);
       } catch {
         usable = false;
       }
@@ -168,6 +168,10 @@ export function jwksBackoff(fetchImpl: typeof fetch, origin: string, now: () => 
     }
     return res;
   };
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function plural(n: number, noun: string): string {

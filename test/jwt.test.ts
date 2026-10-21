@@ -716,7 +716,8 @@ describe("jwksBackoff", () => {
   });
 
   it("treats a 200 that is not a JSON key set as a failure", async () => {
-    for (const body of ["not json", "{}", '{"keys":{}}', "[]"]) {
+    // `keys` must be an array of objects (M-1): jose rejects any other entry.
+    for (const body of ["not json", "{}", '{"keys":{}}', "[]", '{"keys":[1]}', '{"keys":[null]}', '{"keys":[[]]}', '{"keys":["k"]}']) {
       let clock = 0;
       const f = fakeFetch([{ body }, 200]);
       const gated = jwksBackoff(f.impl, ORIGIN, () => clock);
@@ -1196,6 +1197,24 @@ describe("jwt config", () => {
         new RegExp(`STEAMPIPE_MCP_JWT_${name}`),
       );
     }
+  });
+
+  it("caps JWT_CLOCK_SKEW_S at 300 seconds (M-6)", () => {
+    expect(load({ STEAMPIPE_MCP_JWT_ISSUER: ISSUER, STEAMPIPE_MCP_JWT_CLOCK_SKEW_S: "300" }).auth.jwt?.issuers[0].clockSkewS).toBe(300);
+    const err = expectConfigError(
+      { STEAMPIPE_MCP_JWT_ISSUER: ISSUER, STEAMPIPE_MCP_JWT_CLOCK_SKEW_S: "301" },
+      /^STEAMPIPE_MCP_JWT_CLOCK_SKEW_S must be an integer between 0 and 300$/,
+    );
+    expect(err.message).not.toContain("301");
+  });
+
+  it("refuses an issuer containing '|', the principal separator, without echoing it (M-3)", () => {
+    for (const issuer of ["https://idp.example.com/t|x", "https://idp.example.com/|", "https://idp.example.com/t%7C|"]) {
+      const err = expectConfigError({ STEAMPIPE_MCP_JWT_ISSUER: issuer }, /^STEAMPIPE_MCP_JWT_ISSUER must not contain "\|"$/);
+      expect(err.message).not.toContain("idp.example.com");
+    }
+    // A host position '|' too, which would otherwise read as "not a valid URL".
+    expectConfigError({ STEAMPIPE_MCP_JWT_ISSUER: "https://idp|example.com" }, /^STEAMPIPE_MCP_JWT_ISSUER must not contain "\|"$/);
   });
 
   it("refuses scopes that are not RFC 6750 scope tokens", () => {

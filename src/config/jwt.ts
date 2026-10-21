@@ -40,6 +40,8 @@ const DEFAULT_ALGORITHMS = ["RS256", "ES256"];
 const DEFAULT_ACCEPTED_TYP = ["at+jwt", "application/at+jwt"];
 const DEFAULT_JWKS_COOLDOWN_S = 30;
 const MAX_JWKS_COOLDOWN_S = 3600;
+// More skew than this is a broken clock to fix (NTP), not leeway to grant (R26).
+const MAX_CLOCK_SKEW_S = 300;
 // Asymmetric JWS algorithms only. HMAC (HS*) would let anyone holding the
 // issuer's public key mint tokens, and `none` is no signature at all.
 const SUPPORTED_ALGORITHMS = new Set([
@@ -101,10 +103,15 @@ function int(env: NodeJS.ProcessEnv, name: string, defaultValue: number, min: nu
 
 /**
  * An issuer is an exact identifier string (RFC 8414 §2): https, or http on
- * a loopback host only, with no query or fragment. Errors name `name` and
- * never echo the value, which could carry userinfo.
+ * a loopback host only, with no query or fragment, and no `|`, which
+ * separates issuer and subject in the principal `iss|sub` (R26). Errors name
+ * `name` and never echo the value, which could carry userinfo.
  */
 function validateIssuer(value: string, name: string): string {
+  // Checked first: a `|` in the host would otherwise fail as an invalid URL.
+  if (value.includes("|")) {
+    throw new ConfigError(`${name} must not contain "|"`);
+  }
   let url: URL;
   try {
     url = new URL(value);
@@ -184,9 +191,10 @@ function stringList(value: unknown, name: string): string[] {
   return value as string[];
 }
 
-function seconds(value: unknown, name: string): number {
-  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-    throw new ConfigError(`${name} must be an integer >= 0`);
+function seconds(value: unknown, name: string, max?: number): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || (max !== undefined && value > max)) {
+    const range = max === undefined ? "an integer >= 0" : `an integer between 0 and ${max}`;
+    throw new ConfigError(`${name} must be ${range}`);
   }
   return value;
 }
@@ -251,7 +259,9 @@ function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefault
     acceptedTyp: has("acceptedTyp")
       ? stringList(fields.acceptedTyp, `${at}.acceptedTyp`).map((t) => t.toLowerCase())
       : defaults.acceptedTyp,
-    clockSkewS: has("clockSkewS") ? seconds(fields.clockSkewS, `${at}.clockSkewS`) : defaults.clockSkewS,
+    clockSkewS: has("clockSkewS")
+      ? seconds(fields.clockSkewS, `${at}.clockSkewS`, MAX_CLOCK_SKEW_S)
+      : defaults.clockSkewS,
     maxTokenAgeS: has("maxTokenAgeS") ? seconds(fields.maxTokenAgeS, `${at}.maxTokenAgeS`) : defaults.maxTokenAgeS,
     advertise: has("advertise") ? (fields.advertise as boolean) : true,
     ...(policy && { policy }),
@@ -312,7 +322,7 @@ export function parseJwtConfig(env: NodeJS.ProcessEnv, publicUrl: URL): JwtConfi
     audiences: nonEmptyCsv(env, "JWT_AUDIENCES", [publicUrl.href]),
     algorithms: validateAlgorithms(nonEmptyCsv(env, "JWT_ALGORITHMS", DEFAULT_ALGORITHMS), `${PREFIX}JWT_ALGORITHMS`),
     acceptedTyp: nonEmptyCsv(env, "JWT_ACCEPTED_TYP", DEFAULT_ACCEPTED_TYP).map((t) => t.toLowerCase()),
-    clockSkewS: int(env, "JWT_CLOCK_SKEW_S", 0, 0),
+    clockSkewS: int(env, "JWT_CLOCK_SKEW_S", 0, 0, MAX_CLOCK_SKEW_S),
     maxTokenAgeS: int(env, "JWT_MAX_TOKEN_AGE_S", 0, 0),
   };
   return {
