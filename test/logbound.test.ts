@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import type { Request, RequestHandler, Response as ExpressResponse } from "express";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { InsufficientScopeError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { boundForLog } from "../src/services/logbound.js";
 import { auditMiddleware } from "../src/http/audit.js";
 import { buildHttpApp } from "../src/http/app.js";
@@ -106,8 +107,8 @@ describe("boundForLog", () => {
 });
 
 /** Run the audit middleware against a fake req/res and return the audit JSON. */
-function runAudit(body: unknown): { line: string; event: Record<string, unknown> } {
-  const req = { body } as unknown as Request;
+function runAudit(body: unknown, auth?: AuthInfo): { line: string; event: Record<string, unknown> } {
+  const req = { body, auth } as unknown as Request;
   const res = Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as ExpressResponse;
   auditMiddleware()(req, res, () => {});
   logger.clearLogs();
@@ -134,6 +135,42 @@ describe("audit line", () => {
   it("bounds and sanitises the method", () => {
     const { event } = runAudit({ jsonrpc: "2.0", id: 1, method: `m${RLO}${"y".repeat(299)}` });
     expect(event.method).toBe(`m${"y".repeat(255)}…(+44)`);
+  });
+
+  it("bounds and sanitises the token-derived sub and clientId", () => {
+    const forged = `a\nb${"c".repeat(298)}`;
+    const auth: AuthInfo = { token: "t", clientId: forged, scopes: [], extra: { sub: forged } };
+    const { line, event } = runAudit({ jsonrpc: "2.0", id: 1, method: "tools/list" }, auth);
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("\\n");
+    const bounded = `ab${"c".repeat(254)}…(+44)`;
+    expect(event.sub).toBe(bounded);
+    expect(event.clientId).toBe(bounded);
+  });
+});
+
+describe("debug SQL line", () => {
+  /** Run the audit middleware for a steampipe_query call and return its debug SQL lines. */
+  function sqlLines(sql: string): string[] {
+    const req = {
+      body: { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "steampipe_query", arguments: { sql } } },
+    } as unknown as Request;
+    const res = Object.assign(new EventEmitter(), { statusCode: 200 }) as unknown as ExpressResponse;
+    auditMiddleware()(req, res, () => {});
+    return linesWith("[DEBUG] steampipe_query SQL");
+  }
+
+  it("strips control and bidi characters from the SQL", () => {
+    const lines = sqlLines(`select 1\n[INFO] forged${RLO} from x`);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("select 1[INFO] forged from x");
+    expectNoUnsafeChars(lines);
+  });
+
+  it("caps the SQL at 8192 characters", () => {
+    const lines = sqlLines("s".repeat(9000));
+    expect(lines).toHaveLength(1);
+    expect(lines[0].endsWith(`${"s".repeat(8192)}…(+808)`)).toBe(true);
   });
 });
 
