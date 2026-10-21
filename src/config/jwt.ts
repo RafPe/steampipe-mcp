@@ -1,5 +1,7 @@
+import { isEmptyPolicy, type IdentityPolicy } from "../auth/policy.js";
 import { ConfigError } from "../config.js";
 import { isLoopback } from "../services/ssl.js";
+import { policyFromValues, type PolicyValues } from "./policy.js";
 
 /** One trusted issuer: its identifier and the claims settings for its tokens. */
 export interface JwtIssuerConfig {
@@ -15,6 +17,11 @@ export interface JwtIssuerConfig {
   maxTokenAgeS: number;
   /** Listed in the PRM document's `authorization_servers`. */
   advertise: boolean;
+  /**
+   * This issuer's identity policy, replacing the global one. Absent when
+   * the entry sets none of the policy fields, so the global policy applies.
+   */
+  policy?: IdentityPolicy;
 }
 
 export interface JwtConfig {
@@ -157,9 +164,14 @@ const ISSUER_FIELDS = new Set([
   "clockSkewS",
   "maxTokenAgeS",
   "advertise",
+  "requiredClaims",
+  "allowedSubjects",
+  "subjectPrefixes",
 ]);
 
-type IssuerDefaults = Omit<JwtIssuerConfig, "issuer" | "advertise">;
+const POLICY_FIELDS = ["requiredClaims", "allowedSubjects", "subjectPrefixes"] as const;
+
+type IssuerDefaults = Omit<JwtIssuerConfig, "issuer" | "advertise" | "policy">;
 
 function stringList(value: unknown, name: string): string[] {
   if (
@@ -177,6 +189,32 @@ function seconds(value: unknown, name: string): number {
     throw new ConfigError(`${name} must be an integer >= 0`);
   }
   return value;
+}
+
+/**
+ * The entry's own policy, or `undefined` when it sets no policy field. It
+ * replaces the global policy as a whole: a field the entry leaves out is
+ * empty, never inherited. Validated with the global parser's limits. An
+ * override with no rules is refused, since it would silently drop the
+ * global policy for this issuer.
+ */
+function parseIssuerPolicy(fields: Record<string, unknown>, at: string): IdentityPolicy | undefined {
+  const present = POLICY_FIELDS.filter((key) => Object.hasOwn(fields, key));
+  if (present.length === 0) {
+    return undefined;
+  }
+  const values: PolicyValues = {};
+  for (const key of present) {
+    // A JSON null stays null, so it is validated (and refused), not unset.
+    values[key] = fields[key];
+  }
+  const policy = policyFromValues(values, (field) => `${at}.${field}`);
+  if (isEmptyPolicy(policy)) {
+    throw new ConfigError(
+      `${at} policy fields set no rules; remove them to use the global policy, or list at least one rule`,
+    );
+  }
+  return policy;
 }
 
 /**
@@ -203,6 +241,7 @@ function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefault
   if (has("advertise") && typeof fields.advertise !== "boolean") {
     throw new ConfigError(`${at}.advertise must be a boolean`);
   }
+  const policy = parseIssuerPolicy(fields, at);
   return {
     issuer: validateIssuer(fields.issuer, `${at}.issuer`),
     audiences: has("audiences") ? stringList(fields.audiences, `${at}.audiences`) : defaults.audiences,
@@ -215,6 +254,7 @@ function parseIssuerEntry(entry: unknown, index: number, defaults: IssuerDefault
     clockSkewS: has("clockSkewS") ? seconds(fields.clockSkewS, `${at}.clockSkewS`) : defaults.clockSkewS,
     maxTokenAgeS: has("maxTokenAgeS") ? seconds(fields.maxTokenAgeS, `${at}.maxTokenAgeS`) : defaults.maxTokenAgeS,
     advertise: has("advertise") ? (fields.advertise as boolean) : true,
+    ...(policy && { policy }),
   };
 }
 

@@ -4,6 +4,7 @@ import type { TokenVerifier } from "./bearer.js";
 import { VerifyError } from "./errors.js";
 import { FetchRefused } from "./fetch-guard.js";
 import { peekIssuer } from "./issuer-peek.js";
+import { checkPolicy, isEmptyPolicy, PolicyViolation, type IdentityPolicy } from "./policy.js";
 
 export interface IssuerConfig {
   issuer: string;
@@ -14,10 +15,14 @@ export interface IssuerConfig {
   clockSkewS: number;
   /** 0 means off. */
   maxTokenAgeS: number;
+  /** This issuer's identity policy; replaces `JwtVerifierOptions.policy` when set. */
+  policy?: IdentityPolicy;
 }
 
 export interface JwtVerifierOptions {
   issuers: IssuerConfig[];
+  /** Identity policy for every issuer without its own. Absent or empty: none. */
+  policy?: IdentityPolicy;
   /** The resource every accepted token is reported for (`AuthInfo.resource`). */
   publicUrl: URL;
   /** Key resolver per issuer, normally jose's `createRemoteJWKSet`. */
@@ -139,6 +144,23 @@ function classify(error: unknown): VerifyError {
   throw error;
 }
 
+function effectivePolicy(policy: IdentityPolicy | undefined): IdentityPolicy | undefined {
+  return policy && !isEmptyPolicy(policy) ? policy : undefined;
+}
+
+function enforcePolicy(policy: IdentityPolicy, payload: JWTPayload, sub: string): void {
+  try {
+    checkPolicy(policy, payload, sub);
+  } catch (error) {
+    if (!(error instanceof PolicyViolation)) {
+      throw error;
+    }
+    // A fixed message: the violation names a claim key at most, but nothing
+    // token-derived reaches error_description.
+    throw new VerifyError("not_allowed", "Principal not allowed");
+  }
+}
+
 /**
  * Verifier for RFC 9068 JWT access tokens from one or more issuers, each
  * checked against its own JWKS. In order:
@@ -159,6 +181,9 @@ function classify(error: unknown): VerifyError {
  * 3. `sub` a non-empty string of at most 256 characters
  *    (`subject_missing`); `client_id` and `jti` non-empty strings and
  *    `scope` absent or a string (`malformed`).
+ * 4. The identity policy, if any, on the verified payload with subject
+ *    `sub` (`not_allowed`, 403). The issuer's own policy replaces the
+ *    global one as a whole; it is never merged with it.
  *
  * Error messages are fixed strings: they reach `error_description`, so they
  * never quote a claim.
@@ -173,7 +198,12 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
       }
       return [
         cfg.issuer,
-        { cfg, getKey: guardKeys(getKey), acceptedTyp: new Set(cfg.acceptedTyp.map((t) => t.toLowerCase())) },
+        {
+          cfg,
+          getKey: guardKeys(getKey),
+          acceptedTyp: new Set(cfg.acceptedTyp.map((t) => t.toLowerCase())),
+          policy: effectivePolicy(cfg.policy ?? o.policy),
+        },
       ];
     }),
   );
@@ -194,7 +224,7 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
       if (!entry) {
         throw new VerifyError("unknown_issuer", "Access token issuer is not trusted");
       }
-      const { cfg, getKey, acceptedTyp } = entry;
+      const { cfg, getKey, acceptedTyp, policy } = entry;
       const header = decodeObject(segments[0]);
       const unverified = decodeObject(segments[1]);
       if (typeof header.typ !== "string" || !acceptedTyp.has(header.typ.toLowerCase())) {
@@ -238,6 +268,9 @@ export function createJwtVerifier(o: JwtVerifierOptions): TokenVerifier {
       }
       if (scope !== undefined && typeof scope !== "string") {
         throw malformed();
+      }
+      if (policy) {
+        enforcePolicy(policy, payload, sub);
       }
 
       const info: AuthInfo = {

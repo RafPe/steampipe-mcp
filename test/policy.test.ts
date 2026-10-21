@@ -300,7 +300,7 @@ describe("parsePolicyConfig", () => {
 
 describe("loadConfig wiring", () => {
   const HTTP = { STEAMPIPE_MCP_TRANSPORT: "http" };
-  // A complete google config: the only mode that enforces a policy (R6).
+  // A complete google config; google and jwt are the modes that enforce a policy (R6).
   const GOOGLE = {
     ...HTTP,
     STEAMPIPE_MCP_AUTH_MODE: "google",
@@ -392,6 +392,28 @@ describe("loadConfig wiring", () => {
       );
       expect(cfg.auth.mode).toBe("google");
       expect(isEmptyPolicy(cfg.policy!)).toBe(false);
+    });
+
+    it("loads a jwt config with a policy", () => {
+      const cfg = loadConfig(
+        {
+          ...HTTP,
+          STEAMPIPE_MCP_AUTH_MODE: "jwt",
+          STEAMPIPE_MCP_PUBLIC_URL: "https://mcp.example.com/mcp",
+          STEAMPIPE_MCP_JWT_ISSUER: "https://idp.example.com",
+          STEAMPIPE_MCP_REQUIRED_CLAIMS: '{"groups":["platform"]}',
+          STEAMPIPE_MCP_ALLOWED_SUBJECTS: '["alice"]',
+          STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]',
+        },
+        EMPTY_ARGV,
+      );
+      expect(cfg.auth.mode).toBe("jwt");
+      expect(isEmptyPolicy(cfg.policy!)).toBe(false);
+    });
+
+    it("names both enforcing modes when refusing one that cannot", () => {
+      const err = configError({ ...TOKEN, STEAMPIPE_MCP_SUBJECT_PREFIXES: '["platform-"]' });
+      expect(err.message).toMatch(/AUTH_MODE=google or jwt/);
     });
 
     it("loads token and none modes with no policy set", () => {
