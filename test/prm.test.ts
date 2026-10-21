@@ -149,6 +149,39 @@ describe("prmRouter", () => {
     expect(JSON.parse(ready.body).authorization_servers).toEqual(["https://accounts.google.com"]);
   });
 
+  describe("while a thunk is pending, the method restriction still comes first", () => {
+    for (const [name, thunk] of [
+      ["undefined", () => undefined],
+      ["no authorization server", () => ({ ...GOOGLE, authorizationServers: [] })],
+    ] as Array<[string, () => PrmOptions | undefined]>) {
+      for (const method of ["OPTIONS", "POST"]) {
+        it(`answers ${method} with 405 and Allow: GET, HEAD (${name})`, async () => {
+          const port = await start(prmRouter(thunk));
+          const res = await send(port, method, PATH);
+          expect(res.status).toBe(405);
+          expect(res.headers.allow).toBe("GET, HEAD");
+          expect(res.headers["retry-after"]).toBeUndefined();
+        });
+      }
+
+      it(`answers GET with 503 and Retry-After (${name})`, async () => {
+        const port = await start(prmRouter(thunk));
+        const res = await send(port, "GET", PATH);
+        expect(res.status).toBe(503);
+        expect(res.headers["retry-after"]).toBe("5");
+        expect(res.headers.allow).toBeUndefined();
+      });
+
+      it(`answers HEAD with 503 and Retry-After (${name})`, async () => {
+        const port = await start(prmRouter(thunk));
+        const res = await send(port, "HEAD", PATH);
+        expect(res.status).toBe(503);
+        expect(res.headers["retry-after"]).toBe("5");
+        expect(res.body).toBe("");
+      });
+    }
+  });
+
   it("answers 503 when a thunk returns options with no authorization server", async () => {
     const port = await start(prmRouter(() => ({ ...GOOGLE, authorizationServers: [] })));
     const res = await send(port, "GET", PATH);

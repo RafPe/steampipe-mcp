@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import {
   createServer as createNodeServer,
   request as httpRequest,
@@ -18,6 +18,7 @@ import { createStaticTokenVerifier } from "../src/auth/verifiers.js";
 import { createGoogleVerifier, fetchGoogleMetadata } from "../src/auth/google.js";
 import { prmPath } from "../src/auth/prm.js";
 import { GOOGLE_FETCH_POLICY } from "../src/auth/fetch-guard.js";
+import { logger } from "../src/services/logger.js";
 import { testDbUrl } from "./helpers/db.js";
 
 // No test here talks to Google: tokeninfo and the discovery document are
@@ -821,6 +822,14 @@ async function countingServer(
 const UNAVAILABLE = { error: "temporarily_unavailable", error_description: "Token validation unavailable" };
 
 describe("Google identity calls go through the restricted fetch (R3)", () => {
+  // Each refusal is logged once at error level, by cause and scheme+host
+  // only. The spy keeps the test output clean; the global afterEach
+  // restores it.
+  let errorLog: MockInstance<typeof logger.error>;
+  beforeEach(() => {
+    errorLog = vi.spyOn(logger, "error").mockImplementation(() => {});
+  });
+
   it("refuses a tokeninfo URL on a non-allowlisted https host with 503, before connecting", async () => {
     const target = await countingServer((_req, res) => {
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -832,6 +841,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
     expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
     expect(target.connections()).toBe(0);
     expect(target.requests).toHaveLength(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google tokeninfo request failed", "policy: https host 127.0.0.1 is not in the allowed identity-provider hosts"],
+    ]);
   });
 
   for (const status of [302, 307]) {
@@ -850,6 +862,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
       expect(redirecting.requests).toEqual(["POST /tokeninfo"]);
       expect(valid.connections()).toBe(0);
+      expect(errorLog.mock.calls).toEqual([
+        ["Google tokeninfo request failed", `redirect: redirect from ${redirecting.base} refused`],
+      ]);
     });
   }
 
@@ -864,6 +879,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
     expect(res.status).toBe(503);
     expect(JSON.parse(res.body)).toEqual(UNAVAILABLE);
     expect(target.requests).toEqual(["POST /tokeninfo"]);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google tokeninfo request failed", `too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes`],
+    ]);
   });
 
   it("still classifies a well-formed but non-object 200 as malformed after the guard", async () => {
@@ -879,6 +897,7 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       tokeninfoUrl: `${target.base}/tokeninfo`,
     });
     await expect(reasonFrom(v.verify("t"))).resolves.toBe("malformed");
+    expect(errorLog).not.toHaveBeenCalled();
   });
 
   it("refuses a discovery URL on a non-allowlisted https host as issuer_unavailable, before connecting", async () => {
@@ -890,6 +909,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       "issuer_unavailable",
     );
     expect(target.connections()).toBe(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", "policy: https host 127.0.0.1 is not in the allowed identity-provider hosts"],
+    ]);
   });
 
   it("refuses a discovery redirect as issuer_unavailable without following it", async () => {
@@ -903,6 +925,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
     });
     await expect(reasonFrom(fetchGoogleMetadata(`${redirecting.base}/discovery`))).resolves.toBe("issuer_unavailable");
     expect(valid.connections()).toBe(0);
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", `redirect: redirect from ${redirecting.base} refused`],
+    ]);
   });
 
   it("refuses a discovery document larger than maxBytes as issuer_unavailable", async () => {
@@ -912,6 +937,9 @@ describe("Google identity calls go through the restricted fetch (R3)", () => {
       res.end(JSON.stringify(big));
     });
     await expect(reasonFrom(fetchGoogleMetadata(`${target.base}/discovery`))).resolves.toBe("issuer_unavailable");
+    expect(errorLog.mock.calls).toEqual([
+      ["Google discovery request failed", `too_large: response body exceeds ${GOOGLE_FETCH_POLICY.maxBytes} bytes`],
+    ]);
   });
 });
 

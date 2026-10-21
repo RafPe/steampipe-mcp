@@ -54,9 +54,10 @@ function isUnderWellKnown(path: string): boolean {
  *
  * Given options, an empty `authorizationServers` throws here. Given a
  * thunk, it is called on every request; while it returns `undefined` (or
- * options with no authorization server), any path under
- * `/.well-known/oauth-protected-resource` answers 503 with `Retry-After`,
- * since the resource path is not known yet.
+ * options with no authorization server), GET and HEAD on any path under
+ * `/.well-known/oauth-protected-resource` answer 503 with `Retry-After`,
+ * since the resource path is not known yet; other methods there still get
+ * 405.
  */
 export function prmRouter(o: PrmOptions | (() => PrmOptions | undefined)): RequestHandler {
   if (typeof o !== "function") {
@@ -70,18 +71,22 @@ export function prmRouter(o: PrmOptions | (() => PrmOptions | undefined)): Reque
       const current = o();
       if (current && current.authorizationServers.length > 0) {
         target = { path: prmPath(current.resource), body: document(current) };
-      } else if (isUnderWellKnown(req.path)) {
-        res.status(503).set({ "Retry-After": RETRY_AFTER_SECONDS, "Cache-Control": "no-store" });
-        res.json({ error: "temporarily_unavailable" });
-        return;
       }
     }
-    if (!target || req.path !== target.path) {
+    // While a thunk is pending the exact path is unknown, so the whole
+    // well-known prefix stands in for it.
+    if (target ? req.path !== target.path : !isUnderWellKnown(req.path)) {
       next();
       return;
     }
+    // The method restriction holds whether or not metadata is pending.
     if (req.method !== "GET" && req.method !== "HEAD") {
       res.status(405).set("Allow", ALLOW).json({ error: "method_not_allowed" });
+      return;
+    }
+    if (!target) {
+      res.status(503).set({ "Retry-After": RETRY_AFTER_SECONDS, "Cache-Control": "no-store" });
+      res.json({ error: "temporarily_unavailable" });
       return;
     }
     // Readable cross-origin by web-based MCP clients, as the SDK router was.
