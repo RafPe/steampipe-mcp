@@ -3,10 +3,23 @@
 _Security_
 
 * Fix an unauthenticated process crash ([GHSA-27r3-jxmh-p828](https://github.com/expressjs/body-parser/security/advisories/GHSA-27r3-jxmh-p828)): a request with `Content-Encoding: gzip` (or `deflate`/`br`) whose body was one valid compressed frame followed by trailing bytes made body-parser 2.3.0 throw an uncaught decompression error after the body was read, terminating the server. JSON parsing runs before authentication, so no token was needed. body-parser is now pinned to 2.4.0 through `overrides`, and as defence in depth the JSON parser no longer inflates request bodies at all (see below).
+* Bump `zod` `3.25.76` → `4.6.7` for [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), which clears the `npm audit` finding. zod 4.6.6 and later check an array, map or set whose schema leads with a maximum-size check (`.max()`/`.length()`/`.size()` before any refinement) on that size before parsing any element, so an oversized input raises one `too_big` issue instead of one issue per element. The MCP SDK validates requests with its `zod/v4` schemas, which now use the patched core. No request schema a client can send to this server has a size cap, so the patched code was not reachable here; an unconstrained array (for example `initialize` `params.clientInfo.icons`) still raises one issue per invalid element, after authentication. zod stays a direct, exact dependency so the lockfile cannot resolve the SDK's `^3.25 || ^4.0` range back to 3.x.
+* Fix an authenticated memory exhaustion: an `initialize` whose `params.clientInfo.icons` was a ~1 MiB array of invalid elements (~520 000 values) made the MCP SDK's zod validation return one issue per element, so a ~1 MB request produced a ~127 MB JSON-RPC error and peaked above 1.3 GB RSS. A request body may now hold at most 10000 JSON values (counted while parsing, before authentication); a larger one gets `413` with a JSON-RPC error (`-32000`, `Request body too large: more than 10000 JSON values`). The same request now gets a 115-byte reply.
 
 _Behaviour changes_
 
+* A request body with more than 10000 JSON values gets `413`, even when it is under `STEAMPIPE_MCP_MAX_BODY_BYTES`. MCP requests this server handles use tens of values.
 * Compressed request bodies are refused: any `Content-Encoding` other than `identity` now gets `415` with a JSON-RPC error (`-32000`, `Unsupported Media Type: Content-Encoding must be identity`) before a decompression stream is created. Previously a well-formed `gzip`, `deflate` or `br` JSON body was decompressed and served. `Content-Encoding: identity` and uncompressed bodies are unchanged.
+
+_Dependencies_
+
+* `@modelcontextprotocol/sdk` `1.32.1` → `1.32.2` (Transport typing fix and registering after `connect()`; no Streamable HTTP behaviour change).
+* `jose` `6.2.13` → `6.2.14` (`jwtVerify` type inference only; no claim validation or `createRemoteJWKSet` change).
+* `express-rate-limit` `8.7.1` → `8.7.2`. It fixes [GHSA-j3cq-92fq-qg5f](https://github.com/express-rate-limit/express-rate-limit/security/advisories/GHSA-j3cq-92fq-qg5f), which needs `skipFailedRequests` or `skipSuccessfulRequests`; this server sets neither, so it was not reachable here.
+* `ajv` `8.18.0` → `8.20.0`. 8.19.0 fixes a prototype pollution through the `format` keyword with a `$data` reference; this server does not enable `$data`, so it was not reachable here.
+* Removed the unused direct dependency `pg-types` (nothing imported it; `pg` keeps its own `pg-types` 2.x).
+* Dev: `typescript` `5.8.2` → `5.8.3`, `@types/pg` `8.11.12` → `8.23.1`.
+* Docker base image `node:22.22.0-alpine3.22` → `node:22.23.4-alpine3.23` (Node 22.23.4 is not published on Alpine 3.22). CI runs tests on Node `22.23.4` to match.
 
 ## 0.4.0 [2026-10-21]
 
