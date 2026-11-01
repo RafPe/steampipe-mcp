@@ -21,6 +21,10 @@ _Dependencies_
 * Dev: `typescript` `5.8.2` → `5.8.3`, `@types/pg` `8.11.12` → `8.23.1`.
 * Docker base image `node:22.22.0-alpine3.22` → `node:22.23.4-alpine3.23` (Node 22.23.4 is not published on Alpine 3.22). CI runs tests on Node `22.23.4` to match.
 
+_Documentation_
+
+* Operator docs: the deployment guide gains copy-paste `docker run` examples for `google` and `jwt` mode and a Kubernetes section (Deployment with `/healthz` liveness and `/readyz` readiness, a 15 s termination grace period, a non-root read-only `securityContext`, secrets via `secretKeyRef`, and Ingress Host/`PUBLIC_URL`/`TRUST_PROXY` notes); the README's environment-variable table now lists `STEAMPIPE_MCP_WORKSPACE_DATABASE` and `STEAMPIPE_MCP_LOG_LEVEL`, and "Get Involved" says this is a fork of turbot/steampipe-mcp and where to raise fork and upstream matters. An internal planning document was removed from `docs/`.
+
 ## 0.4.0 [2026-10-21]
 
 _What's new_
