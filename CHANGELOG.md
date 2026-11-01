@@ -8,6 +8,16 @@ _Behaviour changes_
 
 * Compressed request bodies are refused: any `Content-Encoding` other than `identity` now gets `415` with a JSON-RPC error (`-32000`, `Unsupported Media Type: Content-Encoding must be identity`) before a decompression stream is created. Previously a well-formed `gzip`, `deflate` or `br` JSON body was decompressed and served. `Content-Encoding: identity` and uncompressed bodies are unchanged.
 
+_Dependencies_
+
+* `@modelcontextprotocol/sdk` `1.32.1` → `1.32.2` (Transport typing fix and registering after `connect()`; no Streamable HTTP behaviour change).
+* `jose` `6.2.13` → `6.2.14` (`jwtVerify` type inference only; no claim validation or `createRemoteJWKSet` change).
+* `express-rate-limit` `8.7.1` → `8.7.2`. It fixes [GHSA-j3cq-92fq-qg5f](https://github.com/express-rate-limit/express-rate-limit/security/advisories/GHSA-j3cq-92fq-qg5f), which needs `skipFailedRequests` or `skipSuccessfulRequests`; this server sets neither, so it was not reachable here.
+* `ajv` `8.18.0` → `8.20.0`. 8.19.0 fixes a prototype pollution through the `format` keyword with a `$data` reference; this server does not enable `$data`, so it was not reachable here.
+* `pg-types` `4.0.2` → `4.1.0` (adds range and multirange type OIDs).
+* Dev: `typescript` `5.8.2` → `5.8.3`, `@types/pg` `8.11.12` → `8.23.1`.
+* Docker base image `node:22.22.0-alpine3.22` → `node:22.23.4-alpine3.23` (Node 22.23.4 is not published on Alpine 3.22). CI runs tests on Node `22.23.4` to match.
+
 ## 0.4.0 [2026-10-21]
 
 _What's new_
