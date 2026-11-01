@@ -679,7 +679,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_GOOGLE_CLIENT_ID="<client id>.apps.googleusercontent.com" \
   -e STEAMPIPE_MCP_ALLOWED_EMAILS=alice@example.com,bob@partner.example \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 Users then connect with the `claude mcp add ... --client-id ... --client-secret
@@ -693,7 +693,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
   -e STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 JWT mode with the interactive issuer plus GitHub Actions, using the
@@ -716,7 +716,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
   -e STEAMPIPE_MCP_JWT_ISSUERS="$ISSUERS" \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 In both modes the server discovers its authorization server at startup and,
@@ -759,7 +759,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: steampipe-mcp
-          image: ghcr.io/rafpe/steampipe-mcp:0.4.0
+          image: ghcr.io/rafpe/steampipe-mcp:0.4.1
           ports:
             - { name: http, containerPort: 27123 }
           env:
