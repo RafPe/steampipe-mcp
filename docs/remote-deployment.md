@@ -657,3 +657,182 @@ only fills `scopes_supported` in the Protected Resource Metadata, and
 require a scope, use `REQUIRED_CLAIMS`, but note that it compares the token's
 whole `scope` string: `{"scope":["mcp.read"]}` matches a token whose `scope` is
 exactly `mcp.read`, not one with `mcp.read mcp.write`.
+
+## Docker examples (google and jwt mode)
+
+These follow the token-mode `docker run` in the README
+([Run as a remote MCP (Docker)](../README.md#run-as-a-remote-mcp-docker)).
+Both modes require an `https` `STEAMPIPE_MCP_PUBLIC_URL`, so they assume a
+TLS-terminating proxy that serves `https://mcp.example.com` and forwards to
+port `27123` with the original `Host` header. Its hostname is the Host
+allowlist (unless `STEAMPIPE_MCP_ALLOWED_HOSTS` is set), so a request sent
+straight to `http://localhost:27123/mcp` gets `403`; clients use the public
+URL. Replace the connection string with your own, as in the token example.
+
+Google mode (the client ID and allowlist from
+[Option 2](#option-2-google-oauth)):
+
+```sh
+docker run -d --name steampipe-mcp -p 27123:27123 \
+  -e STEAMPIPE_MCP_AUTH_MODE=google \
+  -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
+  -e STEAMPIPE_MCP_GOOGLE_CLIENT_ID="<client id>.apps.googleusercontent.com" \
+  -e STEAMPIPE_MCP_ALLOWED_EMAILS=alice@example.com,bob@partner.example \
+  -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
+  ghcr.io/rafpe/steampipe-mcp:0.4.0
+```
+
+Users then connect with the `claude mcp add ... --client-id ... --client-secret
+--callback-port ...` command from [3. Claude Code client](#3-claude-code-client).
+
+JWT mode, one issuer ([Option 3](#option-3-jwt-access-tokens)):
+
+```sh
+docker run -d --name steampipe-mcp -p 27123:27123 \
+  -e STEAMPIPE_MCP_AUTH_MODE=jwt \
+  -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
+  -e STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform \
+  -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
+  ghcr.io/rafpe/steampipe-mcp:0.4.0
+```
+
+JWT mode with the interactive issuer plus GitHub Actions, using the
+illustrative `STEAMPIPE_MCP_JWT_ISSUERS` value from
+[Lenient profile](#lenient-profile-opt-in-per-issuer) (check it against a real
+token first, as described there). A multi-line JSON value cannot go in a
+`--env-file`, so pass it from a shell variable:
+
+```sh
+ISSUERS='[
+  {"issuer": "https://idp.example.com/realms/platform"},
+  {"issuer": "https://token.actions.githubusercontent.com",
+   "audiences": ["https://mcp.example.com/mcp"],
+   "profile": "lenient",
+   "requiredClaims": {"repository_owner": ["example-org"]},
+   "advertise": false}
+]'
+docker run -d --name steampipe-mcp -p 27123:27123 \
+  -e STEAMPIPE_MCP_AUTH_MODE=jwt \
+  -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
+  -e STEAMPIPE_MCP_JWT_ISSUERS="$ISSUERS" \
+  -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
+  ghcr.io/rafpe/steampipe-mcp:0.4.0
+```
+
+In both modes the server discovers its authorization server at startup and,
+by default, exits if that fails: check `docker logs steampipe-mcp`. Add
+`-e STEAMPIPE_MCP_ALLOW_DEGRADED_START=true` to start anyway and retry in the
+background (see the README). Stop the container with `docker stop -t 15
+steampipe-mcp`, as in the README.
+
+## Kubernetes
+
+A minimal Deployment and Service for token mode. For google or jwt mode,
+replace the auth variables with the ones above; everything else stays the
+same. Create the Secret first:
+
+```sh
+kubectl create secret generic steampipe-mcp \
+  --from-literal=auth-token="$(openssl rand -hex 32)" \
+  --from-literal=database-url='postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123'
+```
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: steampipe-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: steampipe-mcp }
+  template:
+    metadata:
+      labels: { app: steampipe-mcp }
+    spec:
+      # Longer than the server's 10 s forced-close shutdown timeout.
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000   # the image's "node" user
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: steampipe-mcp
+          image: ghcr.io/rafpe/steampipe-mcp:0.4.0
+          ports:
+            - { name: http, containerPort: 27123 }
+          env:
+            - name: STEAMPIPE_MCP_AUTH_MODE
+              value: token
+            - name: STEAMPIPE_MCP_AUTH_TOKEN
+              valueFrom: { secretKeyRef: { name: steampipe-mcp, key: auth-token } }
+            - name: STEAMPIPE_MCP_WORKSPACE_DATABASE
+              valueFrom: { secretKeyRef: { name: steampipe-mcp, key: database-url } }
+            - name: STEAMPIPE_MCP_PUBLIC_URL
+              value: https://mcp.example.com/mcp
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 27123 }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: 27123 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: steampipe-mcp
+spec:
+  selector: { app: steampipe-mcp }
+  ports:
+    - { name: http, port: 27123, targetPort: http }
+```
+
+- **Liveness on `/healthz`, never `/readyz`.** `/healthz` is static and never
+  touches the database. `/readyz` answers `503` while the database is
+  unreachable (and, with `STEAMPIPE_MCP_ALLOW_DEGRADED_START=true`, while no
+  JWT issuer has been discovered, or while Google discovery is pending).
+  A failed liveness probe restarts the container, which fixes neither, so a
+  Steampipe outage or a pending issuer would put every replica in a restart
+  loop. A failed readiness probe only takes the pod out of the Service until
+  the dependency is back. `/readyz` answers within about 2 s, so keep its
+  `timeoutSeconds` at 3 or more.
+- **`runAsUser: 1000` is required with `runAsNonRoot`.** The image runs as the
+  named user `node` (uid and gid 1000); the kubelet cannot verify a non-numeric
+  user is non-root and refuses to start the container without a numeric UID.
+- **Read-only root filesystem.** The server writes nothing to disk (logs go to
+  stderr), so no `emptyDir` volume is needed.
+- **Secrets.** The connection string carries the database password, so it
+  comes from the Secret along with the token. In google mode only
+  `STEAMPIPE_MCP_GOOGLE_CLIENT_ID` is needed (the server never uses the client
+  secret); jwt mode needs no secret besides the connection string.
+- **In-cluster Steampipe.** A database host that is not loopback gets verified
+  TLS by default, and Steampipe's embedded Postgres uses a self-signed
+  certificate, so append `?sslmode=disable` (or `sslmode=no-verify`) to the
+  URL, as [`docker-compose.example.yml`](../docker-compose.example.yml) does,
+  and set a database password on the Steampipe side.
+
+Behind an Ingress (the server speaks plain HTTP, so TLS terminates there):
+
+- Set `STEAMPIPE_MCP_PUBLIC_URL` to the `https` URL clients use, path
+  included. It is required in google and jwt mode, and its hostname is the
+  Host allowlist, so the Ingress must pass the client's `Host` header through.
+  To accept other hostnames, list every accepted hostname in
+  `STEAMPIPE_MCP_ALLOWED_HOSTS`, which then replaces the `PUBLIC_URL`
+  hostname. With neither set, Host validation is skipped and a warning is
+  logged. `/healthz` and `/readyz` are exempt, so kubelet probes by pod IP
+  still pass.
+- In google and jwt mode, route `/.well-known/oauth-protected-resource/mcp`
+  (the path follows `PUBLIC_URL`) to the pod as well as `/mcp`.
+- Set `STEAMPIPE_MCP_TRUST_PROXY` (a hop count such as `1`) only when every
+  request reaches the pod through the Ingress, so rate limiting keys on the
+  real client IP; otherwise clients can spoof `X-Forwarded-For`.
+- Set `STEAMPIPE_MCP_ALLOWED_ORIGINS` only for browser-based clients; any
+  request with an unlisted `Origin` gets `403`.
+- Consider blocking `/readyz` at the Ingress (see [Threat model](#threat-model)).

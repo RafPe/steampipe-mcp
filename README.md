@@ -152,7 +152,8 @@ default stop grace period is 10s).
 On Kubernetes, use `/healthz` for liveness (it never touches the database,
 so a Steampipe outage does not restart the pod) and `/readyz` for readiness
 (it takes the pod out of the Service while the database is unreachable).
-`/readyz` answers within about 2 s, so keep `timeoutSeconds` at 3 or more:
+`/readyz` answers within about 2 s, so keep `timeoutSeconds` at 3 or more
+(a full Deployment is in [Kubernetes](docs/remote-deployment.md#kubernetes)):
 
 ```yaml
 livenessProbe:
@@ -166,8 +167,9 @@ readinessProbe:
 ```
 
 See [docs/remote-deployment.md](docs/remote-deployment.md) for Google OAuth
-mode, the threat model, and reverse-proxy/TLS guidance (the server itself
-speaks plain HTTP).
+and JWT mode (with [Docker examples](docs/remote-deployment.md#docker-examples-google-and-jwt-mode)),
+the threat model, and reverse-proxy/TLS guidance (the server itself speaks
+plain HTTP).
 
 In google mode the only metadata the server publishes is its RFC 9728
 Protected Resource Metadata at `/.well-known/oauth-protected-resource/<path>`
@@ -317,15 +319,14 @@ npx @modelcontextprotocol/inspector dist/index.js
 
 ### Environment Variables
 
-The following environment variables can be used to configure the MCP server:
+The following environment variables configure the MCP server, whichever way you run it (from a clone, or the Docker image).
 
-- `STEAMPIPE_MCP_LOG_LEVEL`: Control server logging verbosity (default: `info`)
-- `STEAMPIPE_MCP_WORKSPACE_DATABASE`: Override the default Steampipe connection string (default: `postgresql://steampipe@localhost:9193/steampipe`)
-
-Query limits (both transports):
+General settings (both transports):
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `STEAMPIPE_MCP_WORKSPACE_DATABASE` | `postgresql://steampipe@localhost:9193/steampipe` | Steampipe or Turbot Pipes connection string. A first command-line argument (`node dist/index.js <connection string>`, or the extra `args` entry in the MCP client config above) takes precedence over it; an empty value counts as unset |
+| `STEAMPIPE_MCP_LOG_LEVEL` | `info` | Log verbosity: `debug`, `info`, `warn`, `error` or `silent` (case-insensitive). An unknown value is not a startup error: it silently falls back to `info` |
 | `STEAMPIPE_MCP_MAX_ROWS` | `0` on stdio, `10000` on http | Maximum rows `steampipe_query` returns; `0` means unlimited. When the cap cuts a result short, the tool returns `{"rows": [...], "truncated": true}` instead of a plain array |
 | `STEAMPIPE_MCP_STATEMENT_TIMEOUT_MS` | `120000` | Per-connection Postgres `statement_timeout` (and `idle_in_transaction_session_timeout`) in milliseconds; minimum `1` |
 
@@ -395,8 +396,10 @@ This repository is published under the [Apache 2.0 license](https://www.apache.o
 
 ## Get Involved
 
+This repository is a fork of [turbot/steampipe-mcp](https://github.com/turbot/steampipe-mcp). It adds the HTTP transport, the auth modes and the other hardening described above, and is not published to npm. Issues and Discussions are turned off on the fork: propose changes to the fork as a [pull request](https://github.com/RafPe/steampipe-mcp/pulls), and raise anything about upstream Steampipe MCP (the stdio server and the `@turbot/steampipe-mcp` npm package) in the [upstream repository](https://github.com/turbot/steampipe-mcp/issues).
+
 **[Join #steampipe on Slack →](https://turbot.com/community/join)**
 
-Want to help but don't know where to start? Pick up one of the `help wanted` issues:
+Want to help upstream but don't know where to start? Pick up one of the `help wanted` issues:
 * [Steampipe](https://github.com/turbot/steampipe/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22)
-* [Steampipe MCP](https://github.com/turbot/steampipe-mcp/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22)
+* [Steampipe MCP (upstream)](https://github.com/turbot/steampipe-mcp/issues?q=is%3Aopen+is%3Aissue+label%3A%22help+wanted%22)
