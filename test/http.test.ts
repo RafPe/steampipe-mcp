@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import { connect, type AddressInfo } from "node:net";
+import { gzipSync } from "node:zlib";
 import { loadConfig, type ServerConfig } from "../src/config.js";
 import { DatabaseService } from "../src/services/database.js";
 import { logger } from "../src/services/logger.js";
@@ -51,7 +52,7 @@ async function start(cfg: ServerConfig): Promise<number> {
 // node:http rather than fetch: undici does not let callers override `Host`.
 function send(
   port: number,
-  opts: { method?: string; path?: string; headers?: Record<string, string>; body?: string },
+  opts: { method?: string; path?: string; headers?: Record<string, string>; body?: string | Buffer },
 ): Promise<Response> {
   return new Promise((resolve, reject) => {
     const req = httpRequest(
@@ -359,6 +360,79 @@ describe("buildHttpApp: request body limits", () => {
     expect(res.status).toBe(400);
     expect(JSON.parse(res.body)).toMatchObject({ jsonrpc: "2.0", error: { code: -32700 } });
     expect(res.body).not.toContain("not json");
+  });
+});
+
+describe("buildHttpApp: compressed request bodies (GHSA-27r3-jxmh-p828)", () => {
+  const UNSUPPORTED_ENCODING = {
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Unsupported Media Type: Content-Encoding must be identity" },
+    id: null,
+  };
+
+  it("survives a gzip body followed by trailing garbage, with no uncaught exception", async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown): void => {
+      uncaught.push(err);
+    };
+    process.on("uncaughtException", onUncaught);
+    try {
+      const port = await start(httpConfig());
+      // The upstream reproducer: one valid gzip frame, a NUL, then 100 KiB of
+      // trailing bytes. The decoder finishes on the frame while the trailing
+      // bytes are still arriving; body-parser < 2.4.0 left it piped with no
+      // error listener, so their decode error was an uncaught exception that
+      // killed the process.
+      const body = Buffer.concat([
+        gzipSync(JSON.stringify(TOOLS_LIST)),
+        Buffer.from([0x00]),
+        Buffer.alloc(100 * 1024, 0x58),
+      ]);
+      const res = await send(port, {
+        headers: { ...MCP_HEADERS, "Content-Encoding": "gzip", "Content-Length": String(body.length) },
+        body,
+      }).catch((err: unknown) => ({ status: 0, headers: {}, body: String(err) }));
+      // Let the trailing bytes reach a finished decoder before asserting.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(uncaught).toEqual([]);
+      const health = await send(port, { method: "GET", path: "/healthz" });
+      expect(health.status).toBe(200);
+      expect(res.status).toBe(415);
+      expect(JSON.parse(res.body)).toEqual(UNSUPPORTED_ENCODING);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+  });
+
+  it("refuses a well-formed gzip-encoded JSON body with 415 and a JSON-RPC error", async () => {
+    const port = await start(httpConfig());
+    const body = gzipSync(JSON.stringify(TOOLS_LIST));
+    const res = await send(port, {
+      headers: { ...MCP_HEADERS, "Content-Encoding": "gzip", "Content-Length": String(body.length) },
+      body,
+    });
+    expect(res.status).toBe(415);
+    expect(JSON.parse(res.body)).toEqual(UNSUPPORTED_ENCODING);
+    expect(res.body).not.toContain("steampipe_query");
+  });
+
+  it("refuses deflate and br encodings with 415 too", async () => {
+    const port = await start(httpConfig());
+    for (const encoding of ["deflate", "br", "GZIP"]) {
+      const res = await send(port, {
+        headers: { ...MCP_HEADERS, "Content-Encoding": encoding },
+        body: "irrelevant",
+      });
+      expect(res.status).toBe(415);
+      expect(JSON.parse(res.body)).toEqual(UNSUPPORTED_ENCODING);
+    }
+  });
+
+  it("accepts Content-Encoding: identity normally", async () => {
+    const port = await start(httpConfig());
+    const res = await rpc(port, TOOLS_LIST, { "Content-Encoding": "identity" });
+    expect(res.status).toBe(200);
+    expect(res.body).toContain("steampipe_query");
   });
 });
 
