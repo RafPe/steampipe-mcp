@@ -1,3 +1,13 @@
+## 0.4.1 [Unreleased]
+
+_Security_
+
+* Fix an unauthenticated process crash ([GHSA-27r3-jxmh-p828](https://github.com/expressjs/body-parser/security/advisories/GHSA-27r3-jxmh-p828)): a request with `Content-Encoding: gzip` (or `deflate`/`br`) whose body was one valid compressed frame followed by trailing bytes made body-parser 2.3.0 throw an uncaught decompression error after the body was read, terminating the server. JSON parsing runs before authentication, so no token was needed. body-parser is now pinned to 2.4.0 through `overrides`, and as defence in depth the JSON parser no longer inflates request bodies at all (see below).
+
+_Behaviour changes_
+
+* Compressed request bodies are refused: any `Content-Encoding` other than `identity` now gets `415` with a JSON-RPC error (`-32000`, `Unsupported Media Type: Content-Encoding must be identity`) before a decompression stream is created. Previously a well-formed `gzip`, `deflate` or `br` JSON body was decompressed and served. `Content-Encoding: identity` and uncompressed bodies are unchanged.
+
 ## 0.4.0 [2026-10-21]
 
 _What's new_

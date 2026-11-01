@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import express from "express";
 import { request as httpRequest, type Server as HttpServer } from "node:http";
 import { connect, type AddressInfo } from "node:net";
 import { gzipSync } from "node:zlib";
@@ -399,6 +400,40 @@ describe("buildHttpApp: compressed request bodies (GHSA-27r3-jxmh-p828)", () => 
       expect(health.status).toBe(200);
       expect(res.status).toBe(415);
       expect(JSON.parse(res.body)).toEqual(UNSUPPORTED_ENCODING);
+    } finally {
+      process.off("uncaughtException", onUncaught);
+    }
+  });
+
+  // Guards the body-parser >= 2.4.0 override on its own: the app refuses
+  // encoded bodies before any decoder exists, so this mounts a bare
+  // express.json() with the default inflate: true.
+  it("the resolved body-parser survives the trailing-bytes payload with inflate enabled", async () => {
+    const uncaught: unknown[] = [];
+    const onUncaught = (err: unknown): void => {
+      uncaught.push(err);
+    };
+    process.on("uncaughtException", onUncaught);
+    try {
+      const app = express();
+      app.use(express.json());
+      app.post("/mcp", (req, res) => {
+        res.json(req.body);
+      });
+      const server = await new Promise<HttpServer>((resolve) => {
+        const s = app.listen(0, "127.0.0.1", () => resolve(s));
+      });
+      servers.push(server);
+      const port = (server.address() as AddressInfo).port;
+      const body = Buffer.concat([gzipSync('{"a":1}'), Buffer.from([0x00]), Buffer.alloc(100 * 1024, 0x58)]);
+      const res = await send(port, {
+        headers: { "Content-Type": "application/json", "Content-Encoding": "gzip", "Content-Length": String(body.length) },
+        body,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(uncaught).toEqual([]);
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ a: 1 });
     } finally {
       process.off("uncaughtException", onUncaught);
     }

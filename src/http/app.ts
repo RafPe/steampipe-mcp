@@ -67,6 +67,10 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   let reply;
   if (err?.type === "entity.too.large") {
     reply = jsonRpcError(413, -32000, "Request body too large");
+  } else if (err?.type === "encoding.unsupported") {
+    // express.json({ inflate: false }) refuses any Content-Encoding other
+    // than identity before a decompression stream exists.
+    reply = jsonRpcError(415, -32000, "Unsupported Media Type: Content-Encoding must be identity");
   } else if (err?.type === "entity.parse.failed") {
     reply = jsonRpcError(400, -32700, "Parse error: Invalid JSON");
   } else if (typeof err?.status === "number" && err.status >= 400 && err.status < 500) {
@@ -91,7 +95,7 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * (bounded and coalesced by `readiness`; reports check names and statuses
  * only, so it is exempt from Host/Origin checks for the same reason), then Host
  * validation, Origin validation, JSON body parsing (capped at
- * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
+ * `maxBodyBytes`; compressed bodies refused with 415), then `rootRouters` at the app root (R15: public
  * `/.well-known/*` metadata, still Host/Origin-checked), then on
  * `POST {path}` only, in order: a coarse pre-auth IP rate limit (R18: stops
  * an unauthenticated-request flood - and, in `google` mode, the uncached
@@ -133,7 +137,10 @@ export function buildHttpApp(
     );
   }
   app.use(originValidation(http.allowedOrigins));
-  app.use(express.json({ limit: http.maxBodyBytes }));
+  // inflate: false (R32): compressed bodies get 415 before any decoder is
+  // created, so a decompression bug (GHSA-27r3-jxmh-p828) or a compression
+  // bomb never runs ahead of auth.
+  app.use(express.json({ limit: http.maxBodyBytes, inflate: false }));
   for (const router of rootRouters) {
     app.use(router);
   }
