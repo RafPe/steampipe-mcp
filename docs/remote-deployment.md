@@ -120,6 +120,18 @@ path included. Its hostname is also used for Host validation unless
 path your proxy forwards to `STEAMPIPE_MCP_HTTP_PATH`, because the metadata URL
 is derived from it.
 
+Request bodies are checked before authentication, so these limits also apply
+to clients without a token:
+
+- a body larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` (default 1 MiB) gets `413`;
+- a body with more than 10000 JSON values gets `413`, even under the byte
+  limit (fixed, not configurable; MCP requests use tens of values);
+- a body with any `Content-Encoding` other than `identity` gets `415`, so do
+  not enable request compression at your proxy or client.
+
+See the body size cap under [Remote access over HTTP](../README.md#remote-access-over-http)
+in the README.
+
 ## Option 1: static token
 
 Generate a long random token (at least 32 characters; the server refuses
@@ -679,7 +691,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_GOOGLE_CLIENT_ID="<client id>.apps.googleusercontent.com" \
   -e STEAMPIPE_MCP_ALLOWED_EMAILS=alice@example.com,bob@partner.example \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 Users then connect with the `claude mcp add ... --client-id ... --client-secret
@@ -693,7 +705,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
   -e STEAMPIPE_MCP_JWT_ISSUER=https://idp.example.com/realms/platform \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 JWT mode with the interactive issuer plus GitHub Actions, using the
@@ -716,7 +728,7 @@ docker run -d --name steampipe-mcp -p 27123:27123 \
   -e STEAMPIPE_MCP_PUBLIC_URL=https://mcp.example.com/mcp \
   -e STEAMPIPE_MCP_JWT_ISSUERS="$ISSUERS" \
   -e STEAMPIPE_MCP_WORKSPACE_DATABASE="postgresql://my_name:my_pw@workspace-name.usea1.db.pipes.turbot.com:9193/abc123" \
-  ghcr.io/rafpe/steampipe-mcp:0.4.0
+  ghcr.io/rafpe/steampipe-mcp:0.4.1
 ```
 
 In both modes the server discovers its authorization server at startup and,
@@ -759,7 +771,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: steampipe-mcp
-          image: ghcr.io/rafpe/steampipe-mcp:0.4.0
+          image: ghcr.io/rafpe/steampipe-mcp:0.4.1
           ports:
             - { name: http, containerPort: 27123 }
           env:
