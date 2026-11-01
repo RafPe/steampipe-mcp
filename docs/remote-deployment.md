@@ -120,6 +120,18 @@ path included. Its hostname is also used for Host validation unless
 path your proxy forwards to `STEAMPIPE_MCP_HTTP_PATH`, because the metadata URL
 is derived from it.
 
+Request bodies are checked before authentication, so these limits also apply
+to clients without a token:
+
+- a body larger than `STEAMPIPE_MCP_MAX_BODY_BYTES` (default 1 MiB) gets `413`;
+- a body with more than 10000 JSON values gets `413`, even under the byte
+  limit (fixed, not configurable; MCP requests use tens of values);
+- a body with any `Content-Encoding` other than `identity` gets `415`, so do
+  not enable request compression at your proxy or client.
+
+See the body size cap under [Remote access over HTTP](../README.md#remote-access-over-http)
+in the README.
+
 ## Option 1: static token
 
 Generate a long random token (at least 32 characters; the server refuses
