@@ -12,6 +12,7 @@ import { logger } from "../services/logger.js";
 import { isLoopback } from "../services/ssl.js";
 import { auditMiddleware } from "./audit.js";
 import { createPreAuthIpLimiter, createRateLimiter, rejectBatch } from "./guards.js";
+import { JsonValueLimitError, MAX_JSON_VALUES, valueCountingReviver } from "./json-limit.js";
 import { originValidation } from "./origin.js";
 import { Readiness, readyHandler } from "./ready.js";
 
@@ -67,6 +68,14 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
   let reply;
   if (err?.type === "entity.too.large") {
     reply = jsonRpcError(413, -32000, "Request body too large");
+  } else if (err instanceof JsonValueLimitError) {
+    // Checked before entity.parse.failed: body-parser reports a reviver
+    // throw as a 400 parse failure. Built from the constant, not from err.
+    reply = jsonRpcError(413, -32000, `Request body too large: more than ${MAX_JSON_VALUES} JSON values`);
+  } else if (err?.type === "encoding.unsupported") {
+    // express.json({ inflate: false }) refuses any Content-Encoding other
+    // than identity before a decompression stream exists.
+    reply = jsonRpcError(415, -32000, "Unsupported Media Type: Content-Encoding must be identity");
   } else if (err?.type === "entity.parse.failed") {
     reply = jsonRpcError(400, -32700, "Parse error: Invalid JSON");
   } else if (typeof err?.status === "number" && err.status >= 400 && err.status < 500) {
@@ -91,7 +100,8 @@ const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
  * (bounded and coalesced by `readiness`; reports check names and statuses
  * only, so it is exempt from Host/Origin checks for the same reason), then Host
  * validation, Origin validation, JSON body parsing (capped at
- * `maxBodyBytes`), then `rootRouters` at the app root (R15: public
+ * `maxBodyBytes` and at `MAX_JSON_VALUES` values, both 413; compressed
+ * bodies refused with 415), then `rootRouters` at the app root (R15: public
  * `/.well-known/*` metadata, still Host/Origin-checked), then on
  * `POST {path}` only, in order: a coarse pre-auth IP rate limit (R18: stops
  * an unauthenticated-request flood - and, in `google` mode, the uncached
@@ -133,7 +143,18 @@ export function buildHttpApp(
     );
   }
   app.use(originValidation(http.allowedOrigins));
-  app.use(express.json({ limit: http.maxBodyBytes }));
+  // inflate: false (R32): compressed bodies get 415 before any decoder is
+  // created, so a decompression bug (GHSA-27r3-jxmh-p828) or a compression
+  // bomb never runs ahead of auth.
+  // reviver (R38): at most MAX_JSON_VALUES values per body, else 413. The
+  // parser is built per request so each request gets its own counter.
+  app.use((req, res, next) => {
+    express.json({
+      limit: http.maxBodyBytes,
+      inflate: false,
+      reviver: valueCountingReviver(MAX_JSON_VALUES),
+    })(req, res, next);
+  });
   for (const router of rootRouters) {
     app.use(router);
   }

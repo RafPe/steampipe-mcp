@@ -2,7 +2,7 @@
 #
 # Multi-stage build for the steampipe-mcp Streamable HTTP server (Task 9).
 # Base image is pinned to an exact patch tag, verified with
-# `docker manifest inspect node:22.22.0-alpine3.22`.
+# `docker manifest inspect node:22.23.4-alpine3.23`.
 
 # Node never runs under emulation (0.3.1). The 0.3.0 release failed because
 # `npm ci && npm run build` died with SIGILL (exit 132) in the linux/arm64
@@ -11,7 +11,7 @@
 # production node_modules are plain JS, the same for every architecture. The
 # target-platform runtime stage only runs apk/rm and copies files in.
 
-FROM --platform=$BUILDPLATFORM node:22.22.0-alpine3.22 AS builder
+FROM --platform=$BUILDPLATFORM node:22.23.4-alpine3.23 AS builder
 
 WORKDIR /app
 
@@ -21,7 +21,7 @@ COPY package.json package-lock.json tsconfig.json ./
 COPY src ./src
 RUN npm ci && npm run build
 
-FROM --platform=$BUILDPLATFORM node:22.22.0-alpine3.22 AS deps
+FROM --platform=$BUILDPLATFORM node:22.23.4-alpine3.23 AS deps
 
 WORKDIR /app
 
@@ -58,7 +58,7 @@ RUN node -e ' \
 # hadolint ignore=DL3059
 RUN npm ci --omit=dev --ignore-scripts
 
-FROM node:22.22.0-alpine3.22 AS runtime
+FROM node:22.23.4-alpine3.23 AS runtime
 
 ENV NODE_ENV=production
 
