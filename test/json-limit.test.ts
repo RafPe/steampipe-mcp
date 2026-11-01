@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { isDeepStrictEqual } from "node:util";
 import { JsonValueLimitError, MAX_JSON_VALUES, valueCountingReviver } from "../src/http/json-limit.js";
 
 describe("valueCountingReviver", () => {
@@ -7,10 +8,10 @@ describe("valueCountingReviver", () => {
   });
 
   it("counts every value, the root included, and throws on the one past the limit", () => {
-    // root + a + b + [1,2] + 1 + 2 = 6 values
+    // root object, 1 (a), the array (b), 1 and 2 inside it = 5 values
     const text = '{"a":1,"b":[1,2]}';
-    expect(() => JSON.parse(text, valueCountingReviver(6))).not.toThrow();
-    expect(() => JSON.parse(text, valueCountingReviver(5))).toThrow(JsonValueLimitError);
+    expect(() => JSON.parse(text, valueCountingReviver(5))).not.toThrow();
+    expect(() => JSON.parse(text, valueCountingReviver(4))).toThrow(JsonValueLimitError);
   });
 
   it("keeps a separate count per reviver, so one parse cannot use up another's budget", () => {
@@ -25,7 +26,11 @@ describe("valueCountingReviver", () => {
       '{"__proto__":{"polluted":true},"n":[1,2.5,-0,null,true,"s"],"o":{"constructor":{"prototype":{"x":1}},"":{}}}';
     const plain = JSON.parse(text);
     const revived = JSON.parse(text, valueCountingReviver(1000));
-    expect(revived).toStrictEqual(plain);
+    // node:util rather than toStrictEqual: vitest's strict equality reads
+    // `.constructor`, so an own "constructor" key fails it even for two
+    // plain parses of the same text.
+    expect(isDeepStrictEqual(revived, plain)).toBe(true);
+    expect(JSON.stringify(revived)).toBe(JSON.stringify(plain));
     expect(Object.getPrototypeOf(revived)).toBe(Object.prototype);
     expect(Object.prototype.hasOwnProperty.call(revived, "__proto__")).toBe(true);
     expect(({} as { polluted?: boolean }).polluted).toBeUndefined();

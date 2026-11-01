@@ -174,6 +174,21 @@ describe("JSON value-count limit (R38)", () => {
     expect(res.body).not.toMatch(/at .*\.(js|ts):\d+/);
   });
 
+  it("cannot be reset mid-parse by nested empty-string keys", async () => {
+    const port = await start();
+    // The root's reviver key is "" too; a counter that reset on key "" would
+    // let this body through.
+    const body = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 5,
+      method: "tools/list",
+      params: { _meta: { pad: Array.from({ length: LIMIT }, () => ({ "": 0 })) } },
+    });
+    const res = await post(port, body);
+    expect(res.status).toBe(413);
+    expect(JSON.parse(res.body)).toEqual(TOO_MANY);
+  });
+
   it("counts per request: concurrent bodies just under the limit pass while oversized ones fail", async () => {
     const port = await start();
     const ok = toolsListWithValues(LIMIT);
